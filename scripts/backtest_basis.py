@@ -152,8 +152,17 @@ def run_backtest(
     aligned: list[tuple[Candle, Candle]],
     pair: PairMap,
     breakeven_bps: float,
+    confirm_minutes: int = 3,
 ) -> tuple[list[float], list[Trade]]:
-    """Compute basis series and simulate trades entering above breakeven."""
+    """Compute basis series and simulate trades entering above breakeven.
+
+    Anti-noise rules (1m closes are last-trade prints; on thin names they
+    bounce between bid and ask, manufacturing phantom convergence):
+    - entry requires the basis to hold above breakeven for ``confirm_minutes``
+      consecutive bars, and executes on the NEXT bar at that bar's basis;
+    - exit signals when the basis prints below breakeven, but executes on the
+      next bar at that bar's basis (you can't trade the signal print).
+    """
     mult = float(pair.qty_multiplier)
     basis_series: list[float] = []
     for perp_c, spot_c in aligned:
@@ -165,35 +174,45 @@ def run_backtest(
         basis_series.append(basis)
 
     trades: list[Trade] = []
-    cooldown_until = -1  # don't re-enter until the previous trade exits
-
-    for i, bps in enumerate(basis_series):
-        if i <= cooldown_until:
+    n = len(basis_series)
+    i = confirm_minutes
+    while i < n - 1:
+        window = basis_series[i - confirm_minutes : i]
+        if not all(b >= breakeven_bps for b in window):
+            i += 1
             continue
-        if bps < breakeven_bps:
+        # confirmed: enter at bar i (the bar after the confirmation window)
+        entry_idx = i
+        entry_bps = basis_series[entry_idx]
+        if entry_bps < breakeven_bps:
+            # signal decayed before we could trade it — realistic miss
+            i += 1
             continue
-        # Entry: basis is above breakeven at minute i
         exit_idx = None
         exit_bps = None
-        for j in range(i + 1, len(basis_series)):
+        for j in range(entry_idx + 1, n):
             if basis_series[j] <= breakeven_bps:
-                exit_idx = j
-                exit_bps = basis_series[j]
+                # exit executes on the next bar after the signal print
+                fill = min(j + 1, n - 1)
+                if fill == j:  # signal on the last bar: no bar left to fill
+                    break
+                exit_idx = fill
+                exit_bps = basis_series[fill]
                 break
         if exit_idx is not None:
             trades.append(Trade(
-                entry_minute=i,
-                entry_basis_bps=bps,
+                entry_minute=entry_idx,
+                entry_basis_bps=entry_bps,
                 exit_minute=exit_idx,
                 exit_basis_bps=exit_bps,
-                converge_minutes=exit_idx - i,
-                basis_captured_bps=bps - exit_bps,
+                converge_minutes=exit_idx - entry_idx,
+                basis_captured_bps=entry_bps - exit_bps,
             ))
-            cooldown_until = exit_idx
+            i = exit_idx + 1
         else:
             trades.append(Trade(
-                entry_minute=i,
-                entry_basis_bps=bps,
+                entry_minute=entry_idx,
+                entry_basis_bps=entry_bps,
                 exit_minute=None,
                 exit_basis_bps=None,
                 converge_minutes=None,
@@ -293,6 +312,9 @@ async def main():
                         help="Show top N results (default: 30)")
     parser.add_argument("--breakeven-override", type=float, default=None,
                         help="Override breakeven bps (default: computed from fees)")
+    parser.add_argument("--confirm", type=int, default=3,
+                        help="Consecutive minutes above breakeven required before"
+                             " entry; entry/exit execute on the next bar (default: 3)")
     args = parser.parse_args()
 
     # Compute breakeven: maker entry + passive exit (maker + taker spot both legs)
@@ -356,7 +378,9 @@ async def main():
                 log.info("  skip %s: only %d aligned candles", sym, len(aligned))
                 continue
 
-            basis_series, trades = run_backtest(aligned, pair, breakeven_bps)
+            basis_series, trades = run_backtest(
+                aligned, pair, breakeven_bps, confirm_minutes=args.confirm
+            )
             result = summarize_symbol(sym, pair, aligned, basis_series, trades, breakeven_bps)
             results.append(result)
             log.info("  %s: %d candles, %d trades, %d wins, mean basis %.1f bps",
