@@ -191,12 +191,17 @@ class ControlBot:
         rows = snap["rows"][:n]
         if not rows:
             return "no screener data (engine running?)"
-        lines = [f"screener ({age_s:.0f}s old)  bps: entry/net/fund8h  depth$"]
+        hdr = f"{'symbol':<16}{'entry':>6}{'net':>6}{'fund':>6}{'depth$':>8}"
+        sep = "-" * len(hdr)
+        lines = [f"screener ({age_s:.0f}s old, {len(snap['rows'])} pairs)", hdr, sep]
         for r in rows:
+            sym = r["symbol"][:15]
             lines.append(
-                f"{r['symbol']:<14}{r['entry_bps']:>7.1f}{r['net_edge_bps']:>7.1f}"
-                f"{r['funding_8h_bps']:>7.2f}  {r['max_notional_usd']:>9,.0f}"
+                f"{sym:<16}{r['entry_bps']:>6.1f}{r['net_edge_bps']:>6.1f}"
+                f"{r['funding_8h_bps']:>6.2f}{r['max_notional_usd']:>8,.0f}"
             )
+        lines.append(sep)
+        lines.append("bps: entry=raw basis, net=after fees, fund=8h rate")
         return "\n".join(lines)
 
     def _cmd_status(self) -> str:
