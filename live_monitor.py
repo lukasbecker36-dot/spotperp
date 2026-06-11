@@ -126,6 +126,7 @@ class Engine:
                     last_slow = time.monotonic()
                     await self._refresh_funding()
                     self._write_screener_snapshot()
+                    self._write_funding_snapshot()
                     self._write_heartbeat()
             except Exception:
                 log.exception("market loop error")
@@ -180,7 +181,6 @@ class Engine:
                     sym, hist, current, now_ms=now
                 )
             await asyncio.sleep(0.25)
-        self._write_funding_snapshot()
         log.info("funding stats refreshed for %d symbols", len(self.md.funding_stats))
 
     def _write_screener_snapshot(self) -> None:
