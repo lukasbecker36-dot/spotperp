@@ -231,6 +231,22 @@ class AsterClient(_BaseClient):
             venue=self.VENUE,
         )
 
+    async def klines(
+        self, symbol: str, interval: str = "1m",
+        start_ms: int | None = None, end_ms: int | None = None,
+        limit: int = 1500,
+    ) -> list[list]:
+        params: dict[str, str] = {
+            "symbol": symbol, "interval": interval, "limit": str(limit),
+        }
+        if start_ms is not None:
+            params["startTime"] = str(start_ms)
+        if end_ms is not None:
+            params["endTime"] = str(end_ms)
+        return await self._request(
+            "GET", "/fapi/v1/klines", params=params, venue=self.VENUE,
+        )
+
     async def funding_rate_history(
         self, symbol: str, limit: int = 10
     ) -> list[tuple[int, Decimal]]:
@@ -447,6 +463,22 @@ class MexcClient(_BaseClient):
             "/api/v3/depth",
             params={"symbol": symbol, "limit": str(limit)},
             venue=self.VENUE,
+        )
+
+    async def klines(
+        self, symbol: str, interval: str = "1m",
+        start_ms: int | None = None, end_ms: int | None = None,
+        limit: int = 1000,
+    ) -> list[list]:
+        params: dict[str, str] = {
+            "symbol": symbol, "interval": interval, "limit": str(limit),
+        }
+        if start_ms is not None:
+            params["startTime"] = str(start_ms)
+        if end_ms is not None:
+            params["endTime"] = str(end_ms)
+        return await self._request(
+            "GET", "/api/v3/klines", params=params, venue=self.VENUE,
         )
 
     # ── trading (signed) ──
