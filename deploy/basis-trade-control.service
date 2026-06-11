@@ -1,0 +1,15 @@
+[Unit]
+Description=Basis Trade Telegram Control Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/basis-trade
+EnvironmentFile=-/opt/basis-trade/.env
+ExecStart=/opt/basis-trade/.venv/bin/python control_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

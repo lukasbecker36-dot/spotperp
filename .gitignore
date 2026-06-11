@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/mode.env
+data/screener_snapshot.json
+data/heartbeat.json
+output/

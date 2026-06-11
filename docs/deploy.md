@@ -1,0 +1,64 @@
+# Deploying to the Hetzner server
+
+Target layout: `/opt/basis-trade/` (same pattern as hyperaster).
+
+## First-time setup
+
+```bash
+# as root or with sudo
+mkdir -p /opt/basis-trade
+cd /opt/basis-trade
+git clone https://github.com/lukasbecker36-dot/spotperp.git .
+
+python3.11 -m venv .venv
+.venv/bin/pip install -e .
+
+cp .env.example .env
+chmod 600 .env
+# edit .env with real keys
+
+mkdir -p data output
+echo "TRADING_MODE=paper" > data/mode.env
+
+cp deploy/basis-trade.service /etc/systemd/system/
+cp deploy/basis-trade-control.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now basis-trade.service basis-trade-control.service
+```
+
+If the bot runs as a non-root user, allow it to control the engine service
+without a password (needed for `/start`, `/stop`, `/restart`, `/paper`, `/live`):
+
+```
+# /etc/sudoers.d/basis-trade
+botuser ALL=(root) NOPASSWD: /usr/bin/systemctl start basis-trade.service, \
+    /usr/bin/systemctl stop basis-trade.service, \
+    /usr/bin/systemctl restart basis-trade.service
+```
+
+## Verifying the install
+
+```bash
+cd /opt/basis-trade
+.venv/bin/python scripts/probe_mexc.py     # auth + market data + balances
+.venv/bin/python scripts/probe_aster.py    # auth + market data + positions
+journalctl -u basis-trade -f               # engine logs
+```
+
+Then from Telegram: `/status`, `/screen`.
+
+## Updating
+
+```bash
+cd /opt/basis-trade
+git pull
+.venv/bin/pip install -e .
+systemctl restart basis-trade.service basis-trade-control.service
+```
+
+## Going live
+
+1. Run paper mode for several days; compare `/screen` edges with paper `/pnl`.
+2. Verify probe scripts can place + cancel a far-from-market order on both venues.
+3. `/live YES` from Telegram (writes `data/mode.env`, restarts the engine).
+4. Start with small notional, e.g. `/enter BTC 100`.

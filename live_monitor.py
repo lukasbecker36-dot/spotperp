@@ -1,0 +1,316 @@
+"""Main engine process: market data loop, screener, command poller, executor
+tasks and safety stops. Controlled via the commands table written by the
+Telegram bot (control_bot.py).
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from decimal import Decimal
+
+import aiohttp
+
+import config
+import database
+import position_manager as pm
+import recovery
+import screener
+from auth import (
+    load_aster_credentials,
+    load_env,
+    load_mexc_credentials,
+)
+from database import journal, pending_commands, resolve_command
+from exchange_client import AsterClient, ExchangeError, MexcClient
+from executor import Executor, LiveTrader, MarketData, PaperTrader
+from notify import Notifier
+
+log = logging.getLogger("live_monitor")
+
+
+class Engine:
+    def __init__(self, session: aiohttp.ClientSession):
+        self.paper = config.paper_mode()
+        self.session = session
+        self.conn = database.init_db()
+        self.md = MarketData()
+        self.notifier = Notifier(session)
+        self.positions = pm.PositionManager(self.conn)
+
+        aster_creds = mexc_creds = None
+        try:
+            aster_creds = load_aster_credentials()
+        except RuntimeError as exc:
+            if not self.paper:
+                raise
+            log.warning("paper mode without Aster creds: %s", exc)
+        try:
+            mexc_creds = load_mexc_credentials()
+        except RuntimeError as exc:
+            if not self.paper:
+                raise
+            log.warning("paper mode without MEXC creds: %s", exc)
+
+        self.aster = AsterClient(session, aster_creds)
+        self.mexc = MexcClient(session, mexc_creds)
+        trader = (
+            PaperTrader(self.md)
+            if self.paper
+            else LiveTrader(self.aster, self.mexc, self.conn)
+        )
+        self.executor = Executor(
+            self.md, trader, self.positions, self.notifier, self.conn,
+            paper=self.paper,
+        )
+
+    # ── startup ──
+
+    async def start(self) -> None:
+        mode = "paper" if self.paper else "LIVE"
+        journal(self.conn, f"engine starting in {mode} mode")
+        await self._load_symbol_maps()
+        await recovery.reconcile(
+            self.conn, self.positions, self.aster, self.mexc, self.notifier,
+            paper=self.paper,
+        )
+        await self._refresh_books()
+        await self._refresh_funding()
+        self._resume_positions()
+        await self.notifier.alert(f"basis-trade engine started ({mode})")
+        await asyncio.gather(
+            self._market_loop(),
+            self._command_loop(),
+            self._safety_loop(),
+        )
+
+    async def _load_symbol_maps(self) -> None:
+        aster_info, mexc_info = await asyncio.gather(
+            self.aster.exchange_info(), self.mexc.exchange_info()
+        )
+        self.md.aster_info = aster_info
+        self.md.mexc_info = mexc_info
+        self.md.pair_maps = screener.build_pair_maps(
+            set(aster_info), set(mexc_info)
+        )
+        log.info(
+            "symbol maps: %d aster, %d mexc, %d tradeable pairs",
+            len(aster_info), len(mexc_info), len(self.md.pair_maps),
+        )
+        journal(self.conn, f"{len(self.md.pair_maps)} cross-listed USDT pairs")
+
+    def _resume_positions(self) -> None:
+        for pos in self.positions.active():
+            if pos.state == pm.EXITING:
+                log.info("resuming exit for position %s", pos.id)
+                self.executor.start_exit(pos)
+            elif pos.state == pm.UNWINDING:
+                journal(
+                    self.conn,
+                    f"position {pos.id} stuck UNWINDING at startup — manual check",
+                    "ERROR",
+                )
+
+    # ── loops ──
+
+    async def _market_loop(self) -> None:
+        last_slow = 0.0
+        while True:
+            try:
+                await self._refresh_books()
+                if time.monotonic() - last_slow >= config.SLOW_SCAN_SECONDS:
+                    last_slow = time.monotonic()
+                    await self._refresh_funding()
+                    self._write_screener_snapshot()
+                    self._write_heartbeat()
+            except Exception:
+                log.exception("market loop error")
+            await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+
+    async def _refresh_books(self) -> None:
+        aster_books, mexc_books = await asyncio.gather(
+            self.aster.book_tickers(), self.mexc.book_tickers(),
+            return_exceptions=True,
+        )
+        if isinstance(aster_books, dict):
+            self.md.aster_books = aster_books
+        else:
+            log.warning("aster book refresh failed: %r", aster_books)
+        if isinstance(mexc_books, dict):
+            self.md.mexc_books = mexc_books
+        else:
+            log.warning("mexc book refresh failed: %r", mexc_books)
+
+    async def _refresh_funding(self) -> None:
+        try:
+            self.md.funding = await self.aster.premium_index()
+        except ExchangeError:
+            log.exception("funding refresh failed")
+
+    def _write_screener_snapshot(self) -> None:
+        now = int(time.time() * 1000)
+        rows = []
+        for sym, pair in self.md.pair_maps.items():
+            aster = self.md.aster_books.get(pair.aster_symbol)
+            mexc = self.md.mexc_books.get(pair.mexc_symbol)
+            if aster is None or mexc is None:
+                continue
+            funding = (self.md.funding.get(pair.aster_symbol) or {}).get("funding_rate")
+            row = screener.compute_row(pair, aster, mexc, funding, now_ms=now)
+            if row is not None:
+                rows.append(row)
+        screener.write_snapshot(screener.rank_rows(rows))
+
+    def _write_heartbeat(self) -> None:
+        config.HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        active = self.positions.active()
+        payload = {
+            "ts_ms": int(time.time() * 1000),
+            "mode": "paper" if self.paper else "live",
+            "pairs": len(self.md.pair_maps),
+            "active_positions": len(active),
+            "states": {str(p.id): p.state for p in active},
+        }
+        tmp = config.HEARTBEAT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(config.HEARTBEAT_FILE)
+
+    async def _command_loop(self) -> None:
+        while True:
+            try:
+                for row in pending_commands(self.conn):
+                    response = await self._handle_command(
+                        row["command"], json.loads(row["args"])
+                    )
+                    resolve_command(self.conn, row["id"], "done", response)
+            except Exception:
+                log.exception("command loop error")
+            await asyncio.sleep(config.COMMAND_POLL_SECONDS)
+
+    async def _handle_command(self, command: str, args: dict) -> str:
+        try:
+            if command == "enter":
+                return self._cmd_enter(args)
+            if command == "exit":
+                return self._cmd_exit(args)
+            if command == "cancel":
+                return self._cmd_cancel(args)
+            if command == "flatten":
+                return self._cmd_flatten()
+            return f"unknown command: {command}"
+        except Exception as exc:
+            log.exception("command %s failed", command)
+            return f"error: {exc}"
+
+    def _cmd_enter(self, args: dict) -> str:
+        symbol = args["symbol"].upper()
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        notional = Decimal(str(args["notional"]))
+        if symbol not in self.md.pair_maps:
+            return f"{symbol} is not cross-listed (no Aster perp + MEXC spot pair)"
+        if notional <= 0 or notional > config.MAX_NOTIONAL_PER_LEG_USD:
+            return f"notional must be in (0, {config.MAX_NOTIONAL_PER_LEG_USD}]"
+        active = [p for p in self.positions.active() if p.state != pm.UNWINDING]
+        if len(active) >= config.MAX_CONCURRENT_POSITIONS:
+            return f"max concurrent positions reached ({config.MAX_CONCURRENT_POSITIONS})"
+        if any(p.symbol == symbol for p in active):
+            return f"already have an active position in {symbol}"
+        pos = self.positions.create(symbol, notional, paper=self.paper)
+        self.executor.start_entry(pos)
+        return (
+            f"entry #{pos.id} started: SELL {symbol} perp (maker) /"
+            f" BUY spot on fill, notional ${notional}"
+        )
+
+    def _cmd_exit(self, args: dict) -> str:
+        pos = self.positions.get(int(args["position_id"]))
+        if pos.state not in (pm.OPEN, pm.EXITING):
+            return f"position {pos.id} is {pos.state}, cannot exit"
+        mode = args.get("mode", "now")
+        if mode == "cancel":
+            task = self.executor._tasks.get(pos.id)
+            if task and not task.done():
+                task.cancel()
+            self.positions.set_exit_request(pos.id, None, None)
+            self.positions.set_state(pos.id, pm.OPEN, "exit cancelled by operator")
+            return f"position {pos.id}: exit cancelled, back to OPEN"
+        target = args.get("target_bps")
+        target_dec = Decimal(str(target)) if target is not None else (
+            config.EXIT_BASIS_BPS if mode == "passive" else None
+        )
+        self.positions.set_exit_request(pos.id, mode, target_dec)
+        self.executor.start_exit(self.positions.get(pos.id))
+        desc = "aggressive (taker both legs)" if mode == "now" else (
+            f"passive maker, target {target_dec}bps"
+        )
+        return f"position {pos.id}: exit started — {desc}"
+
+    def _cmd_cancel(self, args: dict) -> str:
+        position_id = int(args["position_id"])
+        if self.executor.request_cancel(position_id):
+            return f"position {position_id}: entry cancel requested"
+        return f"position {position_id}: no working entry task"
+
+    def _cmd_flatten(self) -> str:
+        count = 0
+        for pos in self.positions.active():
+            if pos.state in (pm.PENDING_ENTRY, pm.ENTERING):
+                self.executor.request_cancel(pos.id)
+                count += 1
+            elif pos.state == pm.OPEN:
+                self.positions.set_exit_request(pos.id, "now", None)
+                self.executor.start_exit(self.positions.get(pos.id))
+                count += 1
+        return f"flatten: {count} positions being closed/cancelled"
+
+    async def _safety_loop(self) -> None:
+        while True:
+            try:
+                for pos in self.positions.active():
+                    if pos.state != pm.OPEN:
+                        continue
+                    await self._check_safety(pos)
+            except Exception:
+                log.exception("safety loop error")
+            await asyncio.sleep(config.POLL_INTERVAL_SECONDS * 5)
+
+    async def _check_safety(self, pos: pm.Position) -> None:
+        close = self.executor._close_basis_bps(pos.symbol)
+        if close is not None and close <= config.ADVERSE_STOP_BPS:
+            journal(
+                self.conn,
+                f"position {pos.id}: ADVERSE STOP basis={close:.1f}bps", "ERROR",
+            )
+            await self.notifier.alert(
+                f"🛑 position {pos.id} {pos.symbol}: adverse stop triggered"
+                f" (close basis {float(close):.1f}bps) — force closing"
+            )
+            self.positions.set_exit_request(pos.id, "now", None)
+            self.executor.start_exit(self.positions.get(pos.id))
+            return
+        if pos.opened_ms is not None:
+            hold_hours = (time.time() * 1000 - pos.opened_ms) / 3_600_000
+            if hold_hours > config.MAX_HOLD_HOURS:
+                await self.notifier.alert(
+                    f"⏰ position {pos.id} {pos.symbol}: max hold"
+                    f" ({config.MAX_HOLD_HOURS}h) reached — force closing"
+                )
+                self.positions.set_exit_request(pos.id, "now", None)
+                self.executor.start_exit(self.positions.get(pos.id))
+
+
+async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    load_env()
+    async with aiohttp.ClientSession() as session:
+        engine = Engine(session)
+        await engine.start()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

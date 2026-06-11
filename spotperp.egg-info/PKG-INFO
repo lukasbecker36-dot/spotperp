@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: spotperp
+Version: 0.1.0
+Summary: Perp-spot basis trades: Aster DEX perps vs MEXC spot
+Requires-Python: >=3.11
+Requires-Dist: aiohttp>=3.9
+Requires-Dist: eth-account>=0.10
+Requires-Dist: python-dotenv>=1.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"

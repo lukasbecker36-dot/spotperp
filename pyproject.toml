@@ -1,0 +1,27 @@
+[project]
+name = "spotperp"
+version = "0.1.0"
+description = "Perp-spot basis trades: Aster DEX perps vs MEXC spot"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+    "eth-account>=0.10",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools]
+py-modules = [
+    "config", "auth", "exchange_client", "screener", "executor",
+    "position_manager", "database", "intents", "recovery",
+    "live_monitor", "control_bot", "notify",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

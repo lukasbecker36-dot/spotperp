@@ -1,0 +1,337 @@
+"""Telegram control bot: long-polls getUpdates, no third-party bot framework.
+
+Auth: only chat IDs in CONTROL_TELEGRAM_CHAT_IDS may issue commands.
+Destructive commands (/stop, /flatten, /live) require the literal word YES
+within the same message (e.g. "/flatten YES").
+
+The bot never trades directly: trading commands are queued in the commands
+table and executed by the engine process; service control shells out to
+systemctl; read commands hit the DB / snapshot files.
+"""
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import logging
+import subprocess
+import time
+from decimal import Decimal, InvalidOperation
+
+import aiohttp
+
+import config
+import database
+import screener
+from auth import load_env, load_telegram_credentials
+from database import enqueue_command
+from position_manager import PositionManager
+
+log = logging.getLogger("control_bot")
+
+ENGINE_SERVICE = "basis-trade.service"
+COMMAND_WAIT_SECONDS = 10
+
+HELP = """Commands:
+/screen [n] — top basis opportunities
+/status — engine heartbeat + open positions
+/positions — active positions detail
+/enter SYMBOL NOTIONAL — start maker entry (e.g. /enter BTC 1000)
+/cancel ID — abort a working entry
+/exit ID now — aggressive close (taker both legs)
+/exit ID passive [target_bps] — work maker close
+/exit ID cancel — stop a working exit, back to OPEN
+/trades [n] — last closed trades
+/pnl — realised P&L summary
+/log [n] — last journal lines
+/mode — show paper/live
+/paper — switch to paper (restarts engine)
+/live YES — switch to LIVE (restarts engine)
+/start /stop YES /restart — engine service control
+/flatten YES — emergency close everything
+"""
+
+
+class ControlBot:
+    def __init__(self, session: aiohttp.ClientSession):
+        creds = load_telegram_credentials()
+        if not creds.bot_token:
+            raise RuntimeError("ALERT_TELEGRAM_BOT_TOKEN not set")
+        if not creds.control_chat_ids:
+            raise RuntimeError("CONTROL_TELEGRAM_CHAT_IDS not set")
+        self._token = creds.bot_token
+        self._allowed = set(creds.control_chat_ids)
+        self._session = session
+        self._conn = database.init_db()
+        self._positions = PositionManager(self._conn)
+        self._offset = 0
+
+    # ── telegram plumbing ──
+
+    async def run(self) -> None:
+        log.info("control bot started, allowed chats: %s", self._allowed)
+        while True:
+            try:
+                updates = await self._get_updates()
+                for update in updates:
+                    await self._handle_update(update)
+            except Exception:
+                log.exception("update loop error")
+                await asyncio.sleep(5)
+
+    async def _get_updates(self) -> list[dict]:
+        url = f"https://api.telegram.org/bot{self._token}/getUpdates"
+        async with self._session.get(
+            url,
+            params={"timeout": 50, "offset": self._offset + 1},
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            payload = await resp.json()
+        if not payload.get("ok"):
+            log.warning("getUpdates failed: %s", payload)
+            await asyncio.sleep(5)
+            return []
+        updates = payload.get("result", [])
+        if updates:
+            self._offset = max(u["update_id"] for u in updates)
+        return updates
+
+    async def _send(self, chat_id: str, text: str) -> None:
+        url = f"https://api.telegram.org/bot{self._token}/sendMessage"
+        for chunk_start in range(0, len(text), 3800):
+            chunk = text[chunk_start : chunk_start + 3800]
+            async with self._session.post(
+                url,
+                json={
+                    "chat_id": chat_id,
+                    "text": f"<pre>{html.escape(chunk)}</pre>",
+                    "parse_mode": "HTML",
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    log.warning("sendMessage failed: %s", await resp.text())
+
+    async def _handle_update(self, update: dict) -> None:
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        text = (message.get("text") or "").strip()
+        if not text.startswith("/"):
+            return
+        if chat_id not in self._allowed:
+            log.warning("unauthorised chat %s: %s", chat_id, text)
+            return
+        parts = text.split()
+        command = parts[0].lstrip("/").split("@")[0].lower()
+        args = parts[1:]
+        try:
+            reply = await self._dispatch(command, args)
+        except Exception as exc:
+            log.exception("command %s failed", command)
+            reply = f"error: {exc}"
+        if reply:
+            await self._send(chat_id, reply)
+
+    # ── command dispatch ──
+
+    async def _dispatch(self, command: str, args: list[str]) -> str:
+        confirmed = bool(args) and args[-1] == "YES"
+        if command in ("help", "start_help"):
+            return HELP
+        if command == "screen":
+            return self._cmd_screen(args)
+        if command == "status":
+            return self._cmd_status()
+        if command == "positions":
+            return self._cmd_positions()
+        if command == "trades":
+            return self._cmd_trades(args)
+        if command == "pnl":
+            return self._cmd_pnl()
+        if command == "log":
+            return self._cmd_log(args)
+        if command == "mode":
+            return f"mode: {'paper' if config.paper_mode() else 'LIVE'}"
+        if command == "enter":
+            return await self._cmd_enter(args)
+        if command == "cancel":
+            return await self._queue_and_wait("cancel", {"position_id": args[0]})
+        if command == "exit":
+            return await self._cmd_exit(args)
+        if command == "flatten":
+            if not confirmed:
+                return "this closes ALL positions — repeat as: /flatten YES"
+            return await self._queue_and_wait("flatten", {})
+        if command == "paper":
+            config.set_mode(live=False)
+            return self._systemctl("restart") + "\nmode set to paper, engine restarting"
+        if command == "live":
+            if not confirmed:
+                return "this enables REAL trading — repeat as: /live YES"
+            config.set_mode(live=True)
+            return self._systemctl("restart") + "\nmode set to LIVE, engine restarting"
+        if command == "start":
+            return self._systemctl("start")
+        if command == "stop":
+            if not confirmed:
+                return "this stops the engine — repeat as: /stop YES"
+            return self._systemctl("stop")
+        if command == "restart":
+            return self._systemctl("restart")
+        return f"unknown command /{command}\n\n{HELP}"
+
+    # ── read commands ──
+
+    def _cmd_screen(self, args: list[str]) -> str:
+        n = int(args[0]) if args else 10
+        snap = screener.read_snapshot()
+        age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
+        rows = snap["rows"][:n]
+        if not rows:
+            return "no screener data (engine running?)"
+        lines = [f"screener ({age_s:.0f}s old)  bps: entry/net/fund8h  depth$"]
+        for r in rows:
+            lines.append(
+                f"{r['symbol']:<14}{r['entry_bps']:>7.1f}{r['net_edge_bps']:>7.1f}"
+                f"{r['funding_8h_bps']:>7.2f}  {r['max_notional_usd']:>9,.0f}"
+            )
+        return "\n".join(lines)
+
+    def _cmd_status(self) -> str:
+        try:
+            hb = json.loads(config.HEARTBEAT_FILE.read_text())
+            age = (time.time() * 1000 - hb["ts_ms"]) / 1000
+            engine = (
+                f"engine: {'OK' if age < 60 else 'STALE'} (heartbeat {age:.0f}s ago)\n"
+                f"mode: {hb['mode']}, pairs: {hb['pairs']},"
+                f" active positions: {hb['active_positions']}"
+            )
+        except (FileNotFoundError, json.JSONDecodeError):
+            engine = "engine: NO HEARTBEAT (not running?)"
+        service = subprocess.run(
+            ["systemctl", "is-active", ENGINE_SERVICE],
+            capture_output=True, text=True,
+        ).stdout.strip() or "unknown"
+        return f"{engine}\nservice: {service}\n\n{self._cmd_positions()}"
+
+    def _cmd_positions(self) -> str:
+        active = self._positions.active()
+        if not active:
+            return "no active positions"
+        lines = ["active positions:"]
+        for p in active:
+            entry = (
+                f"{float(p.entry_basis_bps):.1f}bps" if p.entry_basis_bps else "-"
+            )
+            held = (
+                f"{(time.time() * 1000 - p.opened_ms) / 3600000:.1f}h"
+                if p.opened_ms
+                else "-"
+            )
+            lines.append(
+                f"#{p.id} {p.symbol} [{p.state}] perp={p.perp_qty} spot={p.spot_qty}"
+                f" entry={entry} held={held}"
+                f"{' exit=' + p.exit_mode if p.exit_mode else ''}"
+                f"{' (paper)' if p.paper else ''}"
+            )
+        return "\n".join(lines)
+
+    def _cmd_trades(self, args: list[str]) -> str:
+        n = int(args[0]) if args else 10
+        closed = self._positions.closed(n)
+        if not closed:
+            return "no closed trades"
+        lines = ["last trades:"]
+        for p in closed:
+            pnl = f"${float(p.realized_pnl_usd):.2f}" if p.realized_pnl_usd is not None else "-"
+            lines.append(
+                f"#{p.id} {p.symbol} {p.state} pnl={pnl}"
+                f" fees=${float(p.fees_usd):.2f} funding=${float(p.funding_usd):.2f}"
+                f"{' (paper)' if p.paper else ''}"
+            )
+        return "\n".join(lines)
+
+    def _cmd_pnl(self) -> str:
+        s = self._positions.pnl_summary()
+        return (
+            f"realised P&L (USD)\n"
+            f"live:  today {float(s['live_today']):+.2f} | all-time {float(s['live_all_time']):+.2f}\n"
+            f"paper: today {float(s['paper_today']):+.2f} | all-time {float(s['paper_all_time']):+.2f}"
+        )
+
+    def _cmd_log(self, args: list[str]) -> str:
+        n = int(args[0]) if args else 20
+        rows = self._conn.execute(
+            "SELECT ts_ms, level, message FROM journal ORDER BY id DESC LIMIT ?", (n,)
+        ).fetchall()
+        if not rows:
+            return "journal empty"
+        lines = []
+        for r in reversed(rows):
+            ts = time.strftime("%m-%d %H:%M:%S", time.localtime(r["ts_ms"] / 1000))
+            lines.append(f"{ts} {r['level']:<5} {r['message']}")
+        return "\n".join(lines)
+
+    # ── trading commands (queued to the engine) ──
+
+    async def _cmd_enter(self, args: list[str]) -> str:
+        if len(args) != 2:
+            return "usage: /enter SYMBOL NOTIONAL  (e.g. /enter BTC 1000)"
+        try:
+            notional = Decimal(args[1])
+        except InvalidOperation:
+            return f"bad notional: {args[1]}"
+        return await self._queue_and_wait(
+            "enter", {"symbol": args[0], "notional": str(notional)}
+        )
+
+    async def _cmd_exit(self, args: list[str]) -> str:
+        if len(args) < 2 or args[1] not in ("now", "passive", "cancel"):
+            return "usage: /exit ID now | passive [target_bps] | cancel"
+        payload: dict = {"position_id": args[0], "mode": args[1]}
+        if args[1] == "passive" and len(args) > 2:
+            payload["target_bps"] = args[2]
+        return await self._queue_and_wait("exit", payload)
+
+    async def _queue_and_wait(self, command: str, args: dict) -> str:
+        command_id = enqueue_command(self._conn, command, args)
+        deadline = time.monotonic() + COMMAND_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            row = self._conn.execute(
+                "SELECT status, response FROM commands WHERE id=?", (command_id,)
+            ).fetchone()
+            if row and row["status"] != "pending":
+                return row["response"] or row["status"]
+            await asyncio.sleep(0.5)
+        return (
+            f"command queued (#{command_id}) but engine has not responded in"
+            f" {COMMAND_WAIT_SECONDS}s — is it running? check /status"
+        )
+
+    # ── service control ──
+
+    def _systemctl(self, action: str) -> str:
+        result = subprocess.run(
+            ["sudo", "systemctl", action, ENGINE_SERVICE],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return f"systemctl {action} failed: {result.stderr.strip()}"
+        return f"systemctl {action} {ENGINE_SERVICE}: ok"
+
+
+async def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    load_env()
+    async with aiohttp.ClientSession() as session:
+        bot = ControlBot(session)
+        await bot.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

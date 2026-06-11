@@ -1,0 +1,16 @@
+[Unit]
+Description=Basis Trade Monitor (Aster perp vs MEXC spot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/basis-trade
+EnvironmentFile=-/opt/basis-trade/.env
+EnvironmentFile=-/opt/basis-trade/data/mode.env
+ExecStart=/opt/basis-trade/.venv/bin/python live_monitor.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
