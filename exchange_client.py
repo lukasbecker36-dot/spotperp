@@ -366,10 +366,12 @@ class MexcClient(_BaseClient):
         return mexc_sign(signed, self._creds)
 
     def _auth_headers(self) -> dict[str, str]:
+        # MEXC rejects any other content type on signed endpoints (code 700013);
+        # all parameters go in the query string, never in a form body.
         assert self._creds is not None
         return {
             "X-MEXC-APIKEY": self._creds.api_key,
-            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Type": "application/json",
         }
 
     # ── market data (unsigned) ──
@@ -467,11 +469,10 @@ class MexcClient(_BaseClient):
             params["price"] = format(price, "f")
         if client_order_id:
             params["newClientOrderId"] = client_order_id
-        body = self._signed_query(params)
+        query = self._signed_query(params)
         payload = await self._request(
             "POST",
-            "/api/v3/order",
-            data=body,
+            f"/api/v3/order?{query}",
             headers=self._auth_headers(),
             venue=self.VENUE,
             order_endpoint=True,
