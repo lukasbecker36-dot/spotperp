@@ -68,8 +68,32 @@ class ControlBot:
 
     # ── telegram plumbing ──
 
+    async def _register_commands(self) -> None:
+        commands = [
+            {"command": "screen", "description": "Top basis opportunities"},
+            {"command": "enter", "description": "Enter position: SYMBOL NOTIONAL"},
+            {"command": "exit", "description": "Exit position: ID now|passive [bps]"},
+            {"command": "cancel", "description": "Cancel working entry: ID"},
+            {"command": "positions", "description": "Show open positions"},
+            {"command": "status", "description": "Engine status and heartbeat"},
+            {"command": "pnl", "description": "Realised P&L summary"},
+            {"command": "trades", "description": "Recent closed trades"},
+            {"command": "log", "description": "Recent journal entries"},
+            {"command": "mode", "description": "Show paper/live mode"},
+            {"command": "paper", "description": "Switch to paper mode"},
+            {"command": "live", "description": "Switch to live mode (YES)"},
+            {"command": "flatten", "description": "Close all positions (YES)"},
+        ]
+        url = f"https://api.telegram.org/bot{self._token}/setMyCommands"
+        async with self._session.post(url, json={"commands": commands}) as resp:
+            if resp.status == 200:
+                log.info("registered %d bot commands", len(commands))
+            else:
+                log.warning("setMyCommands failed: %s", await resp.text())
+
     async def run(self) -> None:
         log.info("control bot started, allowed chats: %s", self._allowed)
+        await self._register_commands()
         while True:
             try:
                 updates = await self._get_updates()
