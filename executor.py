@@ -832,8 +832,13 @@ class Executor:
         rate = (self._md.funding.get(pair.aster_symbol) or {}).get("funding_rate")
         if rate is None or pos.spot_entry_avg is None:
             return
+        stat = self._md.funding_stats.get(pair.aster_symbol)
+        interval_hours = (
+            Decimal(stat.interval_hours) if stat is not None
+            else Decimal(config.FUNDING_INTERVAL_HOURS)
+        )
         hold_hours = Decimal(end_ms - pos.opened_ms) / Decimal(3_600_000)
-        periods = hold_hours / config.FUNDING_INTERVAL_HOURS
+        periods = hold_hours / interval_hours
         entry_qty = self._positions._phase_qty(pos.id, "aster", "entry")
         notional = entry_qty * pos.spot_entry_avg * pair.qty_multiplier
         # Short perp receives funding when the rate is positive.

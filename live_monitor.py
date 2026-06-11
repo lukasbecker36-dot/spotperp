@@ -239,6 +239,57 @@ class Engine:
         tmp.write_text(json.dumps(payload, indent=1))
         tmp.replace(config.FUNDING_SNAPSHOT_FILE)
 
+    def _position_marks(self) -> dict[str, dict]:
+        """Live marks for open positions: closeable basis now, accrued-funding
+        estimate and unrealized P&L at passive-exit touch prices."""
+        now_ms = int(time.time() * 1000)
+        marks: dict[str, dict] = {}
+        for pos in self.positions.active():
+            if pos.perp_qty <= 0 or pos.perp_entry_avg is None:
+                continue
+            pair = self.md.pair_maps.get(pos.symbol)
+            if pair is None:
+                continue
+            aster = self.md.aster_books.get(pair.aster_symbol)
+            mexc = self.md.mexc_books.get(pair.mexc_symbol)
+            if aster is None or mexc is None or aster.bid <= 0 or mexc.bid <= 0:
+                continue
+            # Basis closeable right now: maker perp buy-back at the bid vs
+            # spot sell at the bid (same definition as the screener's close).
+            close_bps = (
+                (aster.bid / pair.qty_multiplier - mexc.bid) / mexc.bid
+                * Decimal(10000)
+            )
+            # Short perp marked at the bid, long spot at the bid.
+            perp_pnl = (pos.perp_entry_avg - aster.bid) * pos.perp_qty
+            spot_pnl = (
+                (mexc.bid - pos.spot_entry_avg) * pos.spot_qty
+                if pos.spot_entry_avg is not None else Decimal(0)
+            )
+            # Funding accrued so far (estimate from the current rate at the
+            # symbol's own interval; live exact amounts land at close).
+            funding_est = pos.funding_usd
+            rate = (self.md.funding.get(pair.aster_symbol) or {}).get("funding_rate")
+            if (funding_est == 0 and rate is not None and pos.opened_ms
+                    and pos.spot_entry_avg is not None):
+                stat = self.md.funding_stats.get(pair.aster_symbol)
+                interval = (
+                    Decimal(stat.interval_hours) if stat is not None
+                    else Decimal(config.FUNDING_INTERVAL_HOURS)
+                )
+                periods = (
+                    Decimal(now_ms - pos.opened_ms) / Decimal(3_600_000) / interval
+                )
+                notional = pos.perp_qty * pos.spot_entry_avg * pair.qty_multiplier
+                funding_est = rate * notional * periods
+            upnl = perp_pnl + spot_pnl + funding_est - pos.fees_usd
+            marks[str(pos.id)] = {
+                "close_bps": float(close_bps),
+                "funding_usd": float(funding_est),
+                "upnl_usd": float(upnl),
+            }
+        return marks
+
     def _write_heartbeat(self) -> None:
         config.HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
         active = self.positions.active()
@@ -248,6 +299,7 @@ class Engine:
             "pairs": len(self.md.pair_maps),
             "active_positions": len(active),
             "states": {str(p.id): p.state for p in active},
+            "marks": self._position_marks(),
         }
         tmp = config.HEARTBEAT_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload))

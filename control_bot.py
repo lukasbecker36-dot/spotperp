@@ -278,10 +278,16 @@ class ControlBot:
         active = self._positions.active()
         if not active:
             return "no active positions"
+        try:
+            hb = json.loads(config.HEARTBEAT_FILE.read_text())
+            marks = hb.get("marks", {})
+            marks_fresh = (time.time() * 1000 - hb["ts_ms"]) < 120_000
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            marks, marks_fresh = {}, False
         lines = ["active positions:"]
         for p in active:
             entry = (
-                f"{float(p.entry_basis_bps):.1f}bps" if p.entry_basis_bps else "-"
+                f"{float(p.entry_basis_bps):.1f}" if p.entry_basis_bps else "-"
             )
             held = (
                 f"{(time.time() * 1000 - p.opened_ms) / 3600000:.1f}h"
@@ -290,10 +296,20 @@ class ControlBot:
             )
             lines.append(
                 f"#{p.id} {p.symbol} [{p.state}] perp={p.perp_qty} spot={p.spot_qty}"
-                f" entry={entry} held={held}"
+                f" held={held}"
                 f"{' exit=' + p.exit_mode if p.exit_mode else ''}"
                 f"{' (paper)' if p.paper else ''}"
             )
+            m = marks.get(str(p.id)) if marks_fresh else None
+            if m:
+                lines.append(
+                    f"   basis {entry} -> {m['close_bps']:.1f}bps"
+                    f" | uPnL ${m['upnl_usd']:+.2f}"
+                    f" (funding ${m['funding_usd']:+.2f},"
+                    f" fees ${float(p.fees_usd):.2f})"
+                )
+            else:
+                lines.append(f"   basis {entry} -> ? (no live mark)")
         return "\n".join(lines)
 
     def _cmd_trades(self, args: list[str]) -> str:
