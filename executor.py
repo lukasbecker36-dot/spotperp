@@ -54,6 +54,7 @@ class MarketData:
     aster_books: dict[str, BookTicker] = field(default_factory=dict)
     mexc_books: dict[str, BookTicker] = field(default_factory=dict)
     funding: dict[str, dict] = field(default_factory=dict)
+    funding_stats: dict[str, object] = field(default_factory=dict)  # sym -> FundingStat
     pair_maps: dict[str, PairMap] = field(default_factory=dict)
     aster_info: dict[str, SymbolInfo] = field(default_factory=dict)
     mexc_info: dict[str, SymbolInfo] = field(default_factory=dict)

@@ -231,6 +231,27 @@ class AsterClient(_BaseClient):
             venue=self.VENUE,
         )
 
+    async def funding_rate_history(
+        self, symbol: str, limit: int = 10
+    ) -> list[tuple[int, Decimal]]:
+        """Recent funding prints as (funding_time_ms, funding_rate) ascending.
+
+        The spacing of the timestamps reveals the symbol's funding interval and
+        the rates give the realised funding for 24h averaging.
+        """
+        payload = await self._request(
+            "GET",
+            "/fapi/v1/fundingRate",
+            params={"symbol": symbol, "limit": str(limit)},
+            venue=self.VENUE,
+        )
+        rows = [
+            (int(r.get("fundingTime") or 0), _dec(r.get("fundingRate")))
+            for r in (payload if isinstance(payload, list) else [])
+        ]
+        rows.sort(key=lambda r: r[0])
+        return rows
+
     # ── trading (signed) ──
 
     @staticmethod

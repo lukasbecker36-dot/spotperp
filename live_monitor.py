@@ -14,6 +14,7 @@ import aiohttp
 
 import config
 import database
+import funding
 import position_manager as pm
 import recovery
 import screener
@@ -77,12 +78,14 @@ class Engine:
         )
         await self._refresh_books()
         await self._refresh_funding()
+        await self._refresh_funding_stats()
         self._resume_positions()
         await self.notifier.alert(f"basis-trade engine started ({mode})")
         await asyncio.gather(
             self._market_loop(),
             self._command_loop(),
             self._safety_loop(),
+            self._funding_loop(),
         )
 
     async def _load_symbol_maps(self) -> None:
@@ -148,6 +151,38 @@ class Engine:
         except ExchangeError:
             log.exception("funding refresh failed")
 
+    async def _funding_loop(self) -> None:
+        while True:
+            await asyncio.sleep(config.FUNDING_REFRESH_SECONDS)
+            try:
+                await self._refresh_funding_stats()
+            except Exception:
+                log.exception("funding stats sweep error")
+
+    async def _refresh_funding_stats(self) -> None:
+        """Sweep funding-rate history for every pair in rate-limited batches,
+        derive each symbol's interval and 24h-average carry, write a snapshot."""
+        symbols = list(self.md.pair_maps)
+        now = int(time.time() * 1000)
+        batch = max(1, config.FUNDING_FETCH_BATCH)
+        for i in range(0, len(symbols), batch):
+            chunk = symbols[i : i + batch]
+            histories = await asyncio.gather(
+                *(self.aster.funding_rate_history(s, config.FUNDING_HISTORY_LIMIT)
+                  for s in chunk),
+                return_exceptions=True,
+            )
+            for sym, hist in zip(chunk, histories):
+                if isinstance(hist, Exception):
+                    continue
+                current = (self.md.funding.get(sym) or {}).get("funding_rate")
+                self.md.funding_stats[sym] = funding.summarize(
+                    sym, hist, current, now_ms=now
+                )
+            await asyncio.sleep(0.25)
+        self._write_funding_snapshot()
+        log.info("funding stats refreshed for %d symbols", len(self.md.funding_stats))
+
     def _write_screener_snapshot(self) -> None:
         now = int(time.time() * 1000)
         rows = []
@@ -156,11 +191,53 @@ class Engine:
             mexc = self.md.mexc_books.get(pair.mexc_symbol)
             if aster is None or mexc is None:
                 continue
-            funding = (self.md.funding.get(pair.aster_symbol) or {}).get("funding_rate")
-            row = screener.compute_row(pair, aster, mexc, funding, now_ms=now)
+            funding_rate = (
+                self.md.funding.get(pair.aster_symbol) or {}
+            ).get("funding_rate")
+            stat = self.md.funding_stats.get(pair.aster_symbol)
+            interval = stat.interval_hours if stat else 8
+            row = screener.compute_row(
+                pair, aster, mexc, funding_rate, now_ms=now,
+                funding_interval_hours=interval,
+            )
             if row is not None:
                 rows.append(row)
         screener.write_snapshot(screener.rank_rows(rows))
+
+    def _write_funding_snapshot(self) -> None:
+        """Persist funding stats joined with live basis/depth, ranked by 24h
+        average carry, for the bot's /funding command."""
+        now = int(time.time() * 1000)
+        rows = []
+        for sym, stat in self.md.funding_stats.items():
+            pair = self.md.pair_maps.get(sym)
+            if pair is None:
+                continue
+            aster = self.md.aster_books.get(pair.aster_symbol)
+            mexc = self.md.mexc_books.get(pair.mexc_symbol)
+            screen = None
+            if aster is not None and mexc is not None:
+                screen = screener.compute_row(
+                    pair, aster, mexc,
+                    (self.md.funding.get(sym) or {}).get("funding_rate"),
+                    now_ms=now, funding_interval_hours=stat.interval_hours,
+                )
+            rows.append({
+                "symbol": sym,
+                "interval_hours": stat.interval_hours,
+                "current_8h_bps": stat.current_8h_bps,
+                "avg_24h_8h_bps": stat.avg_24h_8h_bps,
+                "realized_24h_bps": stat.realized_24h_bps,
+                "entry_bps": screen.entry_bps if screen else None,
+                "net_edge_bps": screen.net_edge_bps if screen else None,
+                "max_notional_usd": screen.max_notional_usd if screen else 0.0,
+            })
+        rows.sort(key=lambda r: r["avg_24h_8h_bps"], reverse=True)
+        config.FUNDING_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"ts_ms": now, "rows": rows[: config.SCREENER_TOP_N]}
+        tmp = config.FUNDING_SNAPSHOT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=1))
+        tmp.replace(config.FUNDING_SNAPSHOT_FILE)
 
     def _write_heartbeat(self) -> None:
         config.HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)

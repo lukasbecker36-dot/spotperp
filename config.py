@@ -15,6 +15,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 DB_PATH = DATA_DIR / "positions.db"
 MODE_FILE = DATA_DIR / "mode.env"
 SCREENER_SNAPSHOT_FILE = DATA_DIR / "screener_snapshot.json"
+FUNDING_SNAPSHOT_FILE = DATA_DIR / "funding_snapshot.json"
 HEARTBEAT_FILE = DATA_DIR / "heartbeat.json"
 
 # ── Exchange endpoints ──
@@ -51,6 +52,9 @@ MAX_NOTIONAL_PER_LEG_USD = Decimal("5000")
 # ── Execution ──
 POLL_INTERVAL_SECONDS = 1.0              # fast tick: book refresh + executor step
 SLOW_SCAN_SECONDS = 15.0                 # screener snapshot + funding refresh
+FUNDING_REFRESH_SECONDS = 900.0          # full funding-history sweep cadence
+FUNDING_FETCH_BATCH = 8                  # concurrent funding-history fetches
+FUNDING_HISTORY_LIMIT = 30               # prints per symbol (>= 24h on 1h funding)
 COMMAND_POLL_SECONDS = 1.0
 ORDER_STATUS_POLL_SECONDS = 2.0
 REPRICE_MIN_INTERVAL_SECONDS = 3.0       # don't cancel/replace faster than this

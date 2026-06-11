@@ -77,6 +77,7 @@ def compute_row(
     funding_rate: Decimal | None,
     *,
     now_ms: int,
+    funding_interval_hours: int = 8,
 ) -> ScreenerRow | None:
     stale_ms = config.QUOTE_STALE_SECONDS * 1000
     if now_ms - aster.ts_ms > stale_ms or now_ms - mexc.ts_ms > stale_ms:
@@ -113,7 +114,10 @@ def compute_row(
         close_bps=float(close_bps),
         spread_cost_bps=float(entry_bps - close_bps),
         fees_bps=float(fees_bps),
-        funding_8h_bps=float((funding_rate or Decimal(0)) * BPS),
+        funding_8h_bps=float(
+            (funding_rate or Decimal(0)) * BPS
+            * Decimal(8) / Decimal(funding_interval_hours)
+        ),
         net_edge_bps=float(net_edge_bps),
         max_notional_usd=float(max_notional),
         aster_ask=str(aster_ask),

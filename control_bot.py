@@ -34,6 +34,7 @@ COMMAND_WAIT_SECONDS = 10
 
 HELP = """Commands:
 /screen [n] — top basis opportunities
+/funding [n] — top funding carry (24h avg, 8h-equiv)
 /status — engine heartbeat + open positions
 /positions — active positions detail
 /enter SYMBOL NOTIONAL — start maker entry (e.g. /enter BTC 1000)
@@ -71,6 +72,7 @@ class ControlBot:
     async def _register_commands(self) -> None:
         commands = [
             {"command": "screen", "description": "Top basis opportunities"},
+            {"command": "funding", "description": "Top funding carry (24h avg)"},
             {"command": "enter", "description": "Enter position: SYMBOL NOTIONAL"},
             {"command": "exit", "description": "Exit position: ID now|passive [bps]"},
             {"command": "cancel", "description": "Cancel working entry: ID"},
@@ -166,6 +168,8 @@ class ControlBot:
             return HELP
         if command == "screen":
             return self._cmd_screen(args)
+        if command == "funding":
+            return self._cmd_funding(args)
         if command == "status":
             return self._cmd_status()
         if command == "positions":
@@ -226,6 +230,31 @@ class ControlBot:
             )
         lines.append(sep)
         lines.append("bps: entry=raw basis, net=after fees, fund=8h rate")
+        return "\n".join(lines)
+
+    def _cmd_funding(self, args: list[str]) -> str:
+        n = int(args[0]) if args else 10
+        try:
+            snap = json.loads(config.FUNDING_SNAPSHOT_FILE.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return "no funding data yet (first sweep runs at startup, ~1min)"
+        age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
+        rows = snap["rows"][:n]
+        if not rows:
+            return "no funding data yet"
+        hdr = f"{'symbol':<14}{'iv':>3}{'24h':>7}{'now':>7}{'entry':>7}{'net':>7}"
+        sep = "-" * len(hdr)
+        lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
+        for r in rows:
+            entry = f"{r['entry_bps']:>7.1f}" if r["entry_bps"] is not None else f"{'-':>7}"
+            net = f"{r['net_edge_bps']:>7.1f}" if r["net_edge_bps"] is not None else f"{'-':>7}"
+            lines.append(
+                f"{r['symbol'][:13]:<14}{r['interval_hours']:>2}h"
+                f"{r['avg_24h_8h_bps']:>7.1f}{r['current_8h_bps']:>7.1f}{entry}{net}"
+            )
+        lines.append(sep)
+        lines.append("iv=funding interval; 24h=avg carry/8h; now=latest/8h")
+        lines.append("all bps; short perp receives positive funding")
         return "\n".join(lines)
 
     def _cmd_status(self) -> str:
