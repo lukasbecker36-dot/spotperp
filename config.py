@@ -41,6 +41,7 @@ SCREENER_MIN_NET_EDGE_BPS = Decimal("0") # show rows above this net edge
 SLIPPAGE_BUFFER_BPS = Decimal("2.0")     # haircut for taker slippage per round trip
 QUOTE_STALE_SECONDS = 10                 # ignore quotes older than this
 MIN_DEPTH_NOTIONAL_USD = Decimal("200")  # min top-of-book notional on both sides
+BASIS_LOG_SECONDS = 60.0                 # touch-basis CSV sampling cadence
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

@@ -5,6 +5,7 @@ Telegram bot (control_bot.py).
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import logging
 import time
@@ -37,6 +38,7 @@ class Engine:
         self.session = session
         self.conn = database.init_db()
         self.md = MarketData()
+        self._last_basis_log = 0.0
         self.notifier = Notifier(session)
         self.positions = pm.PositionManager(self.conn)
 
@@ -203,6 +205,36 @@ class Engine:
             if row is not None:
                 rows.append(row)
         screener.write_snapshot(screener.rank_rows(rows))
+        self._log_basis_rows(rows)
+
+    def _log_basis_rows(self, rows: list[screener.ScreenerRow]) -> None:
+        """Append executable touch-basis rows for ALL pairs to a daily CSV so
+        convergence can be analysed on real quotes (scripts/analyze_basis_log.py),
+        not last-trade candle prints."""
+        now = time.time()
+        if now - self._last_basis_log < config.BASIS_LOG_SECONDS:
+            return
+        self._last_basis_log = now
+        day = time.strftime("%Y%m%d", time.gmtime(now))
+        path = config.OUTPUT_DIR / f"basis_log_{day}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not path.exists()
+        try:
+            with open(path, "a", newline="") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow([
+                        "ts_ms", "symbol", "entry_bps", "close_bps",
+                        "funding_8h_bps", "max_notional_usd",
+                    ])
+                for r in rows:
+                    w.writerow([
+                        r.ts_ms, r.symbol, f"{r.entry_bps:.2f}",
+                        f"{r.close_bps:.2f}", f"{r.funding_8h_bps:.2f}",
+                        f"{r.max_notional_usd:.0f}",
+                    ])
+        except OSError:
+            log.exception("basis log write failed")
 
     def _write_funding_snapshot(self) -> None:
         """Persist funding stats joined with live basis/depth, ranked by 24h
