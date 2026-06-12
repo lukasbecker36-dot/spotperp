@@ -38,10 +38,10 @@ HELP = """Commands:
 /status — engine heartbeat + open positions
 /positions — active positions detail
 /enter SYMBOL NOTIONAL [min_bps] — start maker entry (floor defaults to fee breakeven)
-/cancel ID — abort a working entry
-/exit ID now — aggressive close (taker both legs)
-/exit ID passive [target_bps] — work maker close
-/exit ID cancel — stop a working exit, back to OPEN
+/cancel ID|SYMBOL — abort a working entry
+/exit ID|SYMBOL now — aggressive close (taker both legs)
+/exit ID|SYMBOL passive [target_bps] — work maker close
+/exit ID|SYMBOL cancel — stop a working exit, back to OPEN
 /trades [n] — last closed trades
 /pnl — realised P&L summary
 /log [n] — last journal lines
@@ -74,8 +74,8 @@ class ControlBot:
             {"command": "screen", "description": "Top basis opportunities"},
             {"command": "funding", "description": "Top funding carry (24h avg)"},
             {"command": "enter", "description": "Enter: SYMBOL NOTIONAL [min_bps]"},
-            {"command": "exit", "description": "Exit position: ID now|passive [bps]"},
-            {"command": "cancel", "description": "Cancel working entry: ID"},
+            {"command": "exit", "description": "Exit: ID|SYMBOL now|passive [bps]"},
+            {"command": "cancel", "description": "Cancel working entry: ID|SYMBOL"},
             {"command": "positions", "description": "Show open positions"},
             {"command": "status", "description": "Engine status and heartbeat"},
             {"command": "pnl", "description": "Realised P&L summary"},
@@ -370,7 +370,7 @@ class ControlBot:
 
     async def _cmd_exit(self, args: list[str]) -> str:
         if len(args) < 2 or args[1] not in ("now", "passive", "cancel"):
-            return "usage: /exit ID now | passive [target_bps] | cancel"
+            return "usage: /exit ID|SYMBOL now | passive [target_bps] | cancel"
         payload: dict = {"position_id": args[0], "mode": args[1]}
         if args[1] == "passive" and len(args) > 2:
             payload["target_bps"] = args[2]

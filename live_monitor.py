@@ -392,8 +392,30 @@ class Engine:
             f" basis floor {float(floor):.1f}bps"
         )
 
+    def _resolve_position(self, ref: str) -> pm.Position | str:
+        """Resolve a position reference: numeric ID or symbol (BEAT, beatusdt).
+        Returns the Position, or an error string for the operator."""
+        ref = str(ref).strip()
+        if ref.isdigit():
+            try:
+                return self.positions.get(int(ref))
+            except KeyError:
+                return f"no position with id {ref}"
+        symbol = ref.upper()
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        matches = [p for p in self.positions.active() if p.symbol == symbol]
+        if not matches:
+            return f"no active position in {symbol}"
+        if len(matches) > 1:
+            ids = ", ".join(str(p.id) for p in matches)
+            return f"multiple active positions in {symbol} (ids {ids}) — use the ID"
+        return matches[0]
+
     def _cmd_exit(self, args: dict) -> str:
-        pos = self.positions.get(int(args["position_id"]))
+        pos = self._resolve_position(args["position_id"])
+        if isinstance(pos, str):
+            return pos
         if pos.state not in (pm.OPEN, pm.EXITING):
             return f"position {pos.id} is {pos.state}, cannot exit"
         mode = args.get("mode", "now")
@@ -416,10 +438,12 @@ class Engine:
         return f"position {pos.id}: exit started — {desc}"
 
     def _cmd_cancel(self, args: dict) -> str:
-        position_id = int(args["position_id"])
-        if self.executor.request_cancel(position_id):
-            return f"position {position_id}: entry cancel requested"
-        return f"position {position_id}: no working entry task"
+        pos = self._resolve_position(args["position_id"])
+        if isinstance(pos, str):
+            return pos
+        if self.executor.request_cancel(pos.id):
+            return f"position {pos.id}: entry cancel requested"
+        return f"position {pos.id}: no working entry task"
 
     def _cmd_flatten(self) -> str:
         count = 0
@@ -446,27 +470,70 @@ class Engine:
 
     async def _check_safety(self, pos: pm.Position) -> None:
         close = self.executor._close_basis_bps(pos.symbol)
-        if close is not None and close <= config.ADVERSE_STOP_BPS:
-            journal(
-                self.conn,
-                f"position {pos.id}: ADVERSE STOP basis={close:.1f}bps", "ERROR",
-            )
-            await self.notifier.alert(
-                f"🛑 position {pos.id} {pos.symbol}: adverse stop triggered"
-                f" (close basis {float(close):.1f}bps) — force closing"
-            )
-            self.positions.set_exit_request(pos.id, "now", None)
-            self.executor.start_exit(self.positions.get(pos.id))
-            return
-        if pos.opened_ms is not None:
-            hold_hours = (time.time() * 1000 - pos.opened_ms) / 3_600_000
-            if hold_hours > config.MAX_HOLD_HOURS:
+        if close is not None and pos.entry_basis_bps is not None:
+            widened = close - pos.entry_basis_bps
+            if widened >= config.ADVERSE_WIDEN_STOP_BPS:
+                journal(
+                    self.conn,
+                    f"position {pos.id}: ADVERSE STOP close={close:.1f}bps"
+                    f" entry={pos.entry_basis_bps:.1f}bps", "ERROR",
+                )
                 await self.notifier.alert(
-                    f"⏰ position {pos.id} {pos.symbol}: max hold"
-                    f" ({config.MAX_HOLD_HOURS}h) reached — force closing"
+                    f"🛑 position {pos.id} {pos.symbol}: adverse stop — basis"
+                    f" widened {float(widened):.1f}bps past entry"
+                    f" ({float(pos.entry_basis_bps):.1f} ->"
+                    f" {float(close):.1f}bps) — force closing"
                 )
                 self.positions.set_exit_request(pos.id, "now", None)
                 self.executor.start_exit(self.positions.get(pos.id))
+                return
+        if close is not None and close <= config.CONVERGED_TP_BPS:
+            pnl = self._aggressive_close_pnl(pos)
+            if pnl is not None and pnl > 0:
+                journal(
+                    self.conn,
+                    f"position {pos.id}: CONVERGED TP basis={close:.1f}bps"
+                    f" est_pnl={pnl:.2f}",
+                )
+                await self.notifier.alert(
+                    f"🎯 position {pos.id} {pos.symbol}: basis inverted to"
+                    f" {float(close):.1f}bps, taker close nets"
+                    f" ${float(pnl):+.2f} — taking profit"
+                )
+                self.positions.set_exit_request(pos.id, "now", None)
+                self.executor.start_exit(self.positions.get(pos.id))
+                return
+        if pos.opened_ms is not None:
+            hold_hours = (time.time() * 1000 - pos.opened_ms) / 3_600_000
+            if hold_hours > config.MAX_HOLD_HOURS:
+                await self._force_close_timeout(pos)
+
+    def _aggressive_close_pnl(self, pos: pm.Position) -> Decimal | None:
+        """Estimated net PnL of closing taker on both legs right now:
+        perp buy-back at the Aster ask, spot sell at the MEXC bid, taker
+        fees on both, plus funding accrued, minus fees already paid."""
+        pair = self.md.pair_maps.get(pos.symbol)
+        if pair is None or pos.perp_entry_avg is None or pos.spot_entry_avg is None:
+            return None
+        aster = self.md.aster_books.get(pair.aster_symbol)
+        mexc = self.md.mexc_books.get(pair.mexc_symbol)
+        if aster is None or mexc is None or aster.ask <= 0 or mexc.bid <= 0:
+            return None
+        perp_pnl = (pos.perp_entry_avg - aster.ask) * pos.perp_qty
+        spot_pnl = (mexc.bid - pos.spot_entry_avg) * pos.spot_qty
+        exit_fees = (
+            pos.perp_qty * aster.ask * config.ASTER_TAKER_FEE
+            + pos.spot_qty * mexc.bid * config.MEXC_TAKER_FEE
+        )
+        return perp_pnl + spot_pnl + pos.funding_usd - pos.fees_usd - exit_fees
+
+    async def _force_close_timeout(self, pos: pm.Position) -> None:
+        await self.notifier.alert(
+            f"⏰ position {pos.id} {pos.symbol}: max hold"
+            f" ({config.MAX_HOLD_HOURS}h) reached — force closing"
+        )
+        self.positions.set_exit_request(pos.id, "now", None)
+        self.executor.start_exit(self.positions.get(pos.id))
 
 
 async def main() -> None:

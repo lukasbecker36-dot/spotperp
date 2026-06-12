@@ -45,7 +45,14 @@ BASIS_LOG_SECONDS = 60.0                 # touch-basis CSV sampling cadence
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis
-ADVERSE_STOP_BPS = Decimal("-50.0")      # force-close if basis inverts below this
+# Adverse stop: force-close when the closeable basis has WIDENED this far
+# above the entry basis (the losing direction for short-perp/long-spot).
+ADVERSE_WIDEN_STOP_BPS = Decimal("100.0")
+# Convergence take-profit: when the closeable basis inverts below this level
+# AND an aggressive (taker both legs) close is net profitable, lock it in.
+# The PnL gate stops wide-spread names from being force-closed at a loss
+# right after entry just because their bid-side basis is structurally low.
+CONVERGED_TP_BPS = Decimal("-50.0")
 MAX_HOLD_HOURS = 168                     # 1 week max hold
 MAX_CONCURRENT_POSITIONS = 3
 MAX_NOTIONAL_PER_LEG_USD = Decimal("5000")
