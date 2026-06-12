@@ -57,6 +57,7 @@ class Position:
     opened_ms: int | None
     closed_ms: int | None
     created_ms: int
+    min_entry_bps: Decimal | None
     note: str | None
 
     @classmethod
@@ -87,6 +88,7 @@ class Position:
             opened_ms=row["opened_ms"],
             closed_ms=row["closed_ms"],
             created_ms=row["created_ms"],
+            min_entry_bps=opt("min_entry_bps"),
             note=row["note"],
         )
 
@@ -98,13 +100,15 @@ class PositionManager:
     # ── creation / lookup ──
 
     def create(
-        self, symbol: str, notional: Decimal, *, paper: bool, direction: str = "premium"
+        self, symbol: str, notional: Decimal, *, paper: bool,
+        direction: str = "premium", min_entry_bps: Decimal | None = None,
     ) -> Position:
         now = _now_ms()
         cur = self._conn.execute(
             "INSERT INTO positions (symbol, direction, state, paper, target_notional,"
-            " created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (symbol, direction, PENDING_ENTRY, int(paper), str(notional), now, now),
+            " min_entry_bps, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (symbol, direction, PENDING_ENTRY, int(paper), str(notional),
+             str(min_entry_bps) if min_entry_bps is not None else None, now, now),
         )
         self._conn.commit()
         return self.get(int(cur.lastrowid))

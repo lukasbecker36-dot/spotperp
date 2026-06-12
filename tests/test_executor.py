@@ -157,6 +157,27 @@ async def test_passive_exit_respects_target_gate(env):
     assert final.perp_qty == Decimal("9.95")  # nothing closed
 
 
+async def test_entry_floor_blocks_thin_basis(env):
+    """Entry with a min_bps floor above the current basis must not place
+    the maker order — no fills, no exposure."""
+    md, positions, executor, notifier, conn = env
+    # +50bps entry basis, but floor demands 80bps
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+    pos = positions.create(
+        "BTCUSDT", Decimal(1000), paper=True, min_entry_bps=Decimal(80)
+    )
+    executor.start_entry(pos)
+    await asyncio.sleep(0.2)
+    current = positions.get(pos.id)
+    assert current.state == pm.ENTERING
+    assert current.perp_qty == 0 and current.spot_qty == 0
+
+    # basis widens past the floor -> order placed and instant-filled
+    set_books(md, "100.4", "100.9", "99.9", "100.0")
+    await wait_for_state(positions, pos.id, pm.OPEN)
+    assert positions.get(pos.id).perp_entry_avg == Decimal("100.9")
+
+
 async def test_aggressive_exit_closes_immediately(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)

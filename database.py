@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS positions (
     opened_ms INTEGER, closed_ms INTEGER,
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL,
+    min_entry_bps TEXT,                 -- per-entry basis floor (stop chasing below)
     note TEXT
 );
 
@@ -97,9 +98,19 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+_MIGRATIONS = [
+    "ALTER TABLE positions ADD COLUMN min_entry_bps TEXT",
+]
+
+
 def init_db(db_path: Path | None = None) -> sqlite3.Connection:
     conn = get_connection(db_path)
     conn.executescript(_SCHEMA)
+    for stmt in _MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
     return conn
 

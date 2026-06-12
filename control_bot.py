@@ -37,7 +37,7 @@ HELP = """Commands:
 /funding [n] — top funding carry (24h avg, 8h-equiv)
 /status — engine heartbeat + open positions
 /positions — active positions detail
-/enter SYMBOL NOTIONAL — start maker entry (e.g. /enter BTC 1000)
+/enter SYMBOL NOTIONAL [min_bps] — start maker entry (floor defaults to fee breakeven)
 /cancel ID — abort a working entry
 /exit ID now — aggressive close (taker both legs)
 /exit ID passive [target_bps] — work maker close
@@ -73,7 +73,7 @@ class ControlBot:
         commands = [
             {"command": "screen", "description": "Top basis opportunities"},
             {"command": "funding", "description": "Top funding carry (24h avg)"},
-            {"command": "enter", "description": "Enter position: SYMBOL NOTIONAL"},
+            {"command": "enter", "description": "Enter: SYMBOL NOTIONAL [min_bps]"},
             {"command": "exit", "description": "Exit position: ID now|passive [bps]"},
             {"command": "cancel", "description": "Cancel working entry: ID"},
             {"command": "positions", "description": "Show open positions"},
@@ -352,15 +352,21 @@ class ControlBot:
     # ── trading commands (queued to the engine) ──
 
     async def _cmd_enter(self, args: list[str]) -> str:
-        if len(args) != 2:
-            return "usage: /enter SYMBOL NOTIONAL  (e.g. /enter BTC 1000)"
+        if len(args) not in (2, 3):
+            return ("usage: /enter SYMBOL NOTIONAL [min_bps]\n"
+                    "min_bps = basis floor while the entry works"
+                    " (default: fee breakeven)")
         try:
             notional = Decimal(args[1])
         except InvalidOperation:
             return f"bad notional: {args[1]}"
-        return await self._queue_and_wait(
-            "enter", {"symbol": args[0], "notional": str(notional)}
-        )
+        payload: dict = {"symbol": args[0], "notional": str(notional)}
+        if len(args) == 3:
+            try:
+                payload["min_bps"] = str(Decimal(args[2]))
+            except InvalidOperation:
+                return f"bad min_bps: {args[2]}"
+        return await self._queue_and_wait("enter", payload)
 
     async def _cmd_exit(self, args: list[str]) -> str:
         if len(args) < 2 or args[1] not in ("now", "passive", "cancel"):

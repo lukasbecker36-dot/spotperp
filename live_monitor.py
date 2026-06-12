@@ -378,11 +378,18 @@ class Engine:
             return f"max concurrent positions reached ({config.MAX_CONCURRENT_POSITIONS})"
         if any(p.symbol == symbol for p in active):
             return f"already have an active position in {symbol}"
-        pos = self.positions.create(symbol, notional, paper=self.paper)
+        min_bps = (
+            Decimal(str(args["min_bps"])) if args.get("min_bps") is not None else None
+        )
+        pos = self.positions.create(
+            symbol, notional, paper=self.paper, min_entry_bps=min_bps
+        )
         self.executor.start_entry(pos)
+        floor = min_bps if min_bps is not None else config.ENTRY_MIN_EDGE_FLOOR_BPS
         return (
             f"entry #{pos.id} started: SELL {symbol} perp (maker) /"
-            f" BUY spot on fill, notional ${notional}"
+            f" BUY spot on fill, notional ${notional},"
+            f" basis floor {float(floor):.1f}bps"
         )
 
     def _cmd_exit(self, args: dict) -> str:

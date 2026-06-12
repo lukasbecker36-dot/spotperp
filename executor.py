@@ -461,6 +461,10 @@ class Executor:
             self._positions.set_state(position.id, pm.CANCELLED, "notional below lot size")
             return
 
+        entry_floor = (
+            position.min_entry_bps if position.min_entry_bps is not None
+            else config.ENTRY_MIN_EDGE_FLOOR_BPS
+        )
         deadline = time.monotonic() + config.ENTRY_TIMEOUT_MINUTES * 60
         remaining = total_qty
         unhedged = Decimal(0)          # perp filled, spot not yet bought
@@ -525,7 +529,7 @@ class Executor:
                     continue
 
                 edge = self._entry_basis_bps(symbol)
-                edge_ok = edge is not None and edge >= config.ENTRY_MIN_EDGE_FLOOR_BPS
+                edge_ok = edge is not None and edge >= entry_floor
                 desired = book.ask  # join the best ask
 
                 if order_id is None:

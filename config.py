@@ -59,7 +59,14 @@ FUNDING_HISTORY_LIMIT = 30               # prints per symbol (>= 24h on 1h fundi
 COMMAND_POLL_SECONDS = 1.0
 ORDER_STATUS_POLL_SECONDS = 2.0
 REPRICE_MIN_INTERVAL_SECONDS = 3.0       # don't cancel/replace faster than this
-ENTRY_MIN_EDGE_FLOOR_BPS = Decimal("0.0")  # stop chasing entry below this net edge
+# Default basis floor while an entry works: stop resting/repricing when the
+# executable basis decays below cost breakeven (fees + slippage buffer), so a
+# falling perp ask can't walk the order down into an unprofitable entry.
+# Overridable per entry: /enter SYMBOL NOTIONAL [min_bps].
+ENTRY_MIN_EDGE_FLOOR_BPS = Decimal(os.environ.get(
+    "ENTRY_MIN_EDGE_FLOOR_BPS",
+    str((ENTRY_FEE + EXIT_FEE_PASSIVE) * 10000 + SLIPPAGE_BUFFER_BPS),
+))
 ENTRY_TIMEOUT_MINUTES = 60
 EXIT_TIMEOUT_MINUTES = 30
 UNWIND_TIMEOUT_SECONDS = 60              # hard limit to flatten a naked leg
