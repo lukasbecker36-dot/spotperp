@@ -1,5 +1,8 @@
-"""End-to-end paper-mode executor tests: entry fill -> hedge -> OPEN,
-passive exit -> CLOSED with P&L.
+"""End-to-end paper-mode executor tests.
+
+Paper fills are instant (maker orders fill immediately at their resting
+price, spot takers fill at the touch), so entries go ENTERING -> OPEN in
+a single tick and exits close within one poll cycle.
 """
 import asyncio
 from decimal import Decimal
@@ -65,12 +68,10 @@ def env(tmp_path, monkeypatch):
 
 
 async def open_position(md, positions, executor) -> int:
-    """Drive a position to OPEN: rest the maker order, then cross the book."""
+    """Drive a position to OPEN: paper fills instantly at the ask/ask."""
     set_books(md, "100.4", "100.5", "99.9", "100.0")
     pos = positions.create("BTCUSDT", Decimal(1000), paper=True)
     executor.start_entry(pos)
-    await asyncio.sleep(0.1)  # let the GTX order rest at 100.5
-    set_books(md, "100.6", "100.7", "99.9", "100.0")
     await wait_for_state(positions, pos.id, pm.OPEN)
     return pos.id
 
@@ -94,55 +95,51 @@ async def test_entry_fills_and_hedges(env):
     pos = positions.create("BTCUSDT", Decimal(1000), paper=True)
     executor.start_entry(pos)
 
-    await asyncio.sleep(0.1)  # maker order resting at 100.5, not crossed
-    assert positions.get(pos.id).state == pm.ENTERING
-
-    # market lifts through our ask -> maker fill -> spot hedge
-    set_books(md, "100.6", "100.7", "99.9", "100.0")
+    # Paper fills instantly: maker SELL at 100.5, spot BUY at 100.0
     await wait_for_state(positions, pos.id, pm.OPEN)
 
     final = positions.get(pos.id)
     assert final.perp_qty == Decimal("9.95")        # 1000 / 100.5 rounded to step
     assert final.spot_qty == final.perp_qty         # fully hedged
-    assert final.perp_entry_avg == Decimal("100.5")
+    assert final.perp_entry_avg == Decimal("100.5") # paper maker at the ask
     assert final.spot_entry_avg == Decimal("100.0") # paper taker at the ask
     assert final.entry_basis_bps == pytest.approx(Decimal(50), abs=Decimal("0.5"))
 
 
-async def test_entry_cancel_leaves_no_exposure(env):
+async def test_entry_cancel_on_already_filled(env):
+    """Cancel request on an instant-filled paper entry: position is already
+    OPEN (fully hedged), so cancel has no effect."""
     md, positions, executor, notifier, conn = env
     set_books(md, "100.4", "100.5", "99.9", "100.0")
     pos = positions.create("BTCUSDT", Decimal(1000), paper=True)
     executor.start_entry(pos)
-    await asyncio.sleep(0.1)
+    await wait_for_state(positions, pos.id, pm.OPEN)
 
-    executor.request_cancel(pos.id)
-    await wait_for_state(positions, pos.id, pm.CANCELLED)
+    # Cancel after the fact — position is already OPEN and fully hedged
+    result = executor.request_cancel(pos.id)
+    assert not result  # task already done
     final = positions.get(pos.id)
-    assert final.perp_qty == 0 and final.spot_qty == 0
+    assert final.state == pm.OPEN
 
 
 async def test_passive_exit_closes_with_pnl(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)
-    pos = positions.get(pos_id)
 
     # basis converged: perp 100.0/100.1 vs spot 99.9/100.0 -> close ~10bps
+    # passive exit with target 15bps: close basis is ~10bps < 15 -> not gated
     set_books(md, "100.0", "100.1", "99.9", "100.0")
-    positions.set_exit_request(pos.id, "passive", Decimal(15))
-    executor.start_exit(positions.get(pos.id))
-    await asyncio.sleep(0.1)
-    assert positions.get(pos.id).state == pm.EXITING
+    positions.set_exit_request(pos_id, "passive", Decimal(15))
+    executor.start_exit(positions.get(pos_id))
 
-    # market trades down through our resting buy at 100.0
-    set_books(md, "99.8", "100.0", "99.9", "100.0")
-    await wait_for_state(positions, pos.id, pm.CLOSED)
+    # Paper maker BUY fills instantly at the bid (100.0); spot sells at bid (99.9)
+    await wait_for_state(positions, pos_id, pm.CLOSED)
 
-    final = positions.get(pos.id)
+    final = positions.get(pos_id)
     assert final.perp_qty == 0 and final.spot_qty == 0
-    # short perp 100.5 -> 100.0 (+0.5/unit), spot flat, minus taker fees
+    # short perp 100.5 -> buy back 100.0 (+0.5/unit), spot 100.0 -> sell 99.9 (-0.1/unit)
     assert final.realized_pnl_usd is not None
-    gross = Decimal("0.5") * Decimal("9.95")
+    gross = (Decimal("0.5") - Decimal("0.1")) * Decimal("9.95")
     assert final.realized_pnl_usd <= gross
     assert final.realized_pnl_usd > gross - Decimal("2")
 
@@ -150,13 +147,12 @@ async def test_passive_exit_closes_with_pnl(env):
 async def test_passive_exit_respects_target_gate(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)
-    pos = positions.get(pos_id)
 
-    # close basis is ~70bps, target 5bps -> no order should rest, no fills
-    positions.set_exit_request(pos.id, "passive", Decimal(5))
-    executor.start_exit(positions.get(pos.id))
+    # close basis is ~50bps (same as entry), target 5bps -> gated, no order
+    positions.set_exit_request(pos_id, "passive", Decimal(5))
+    executor.start_exit(positions.get(pos_id))
     await asyncio.sleep(0.2)
-    final = positions.get(pos.id)
+    final = positions.get(pos_id)
     assert final.state == pm.EXITING
     assert final.perp_qty == Decimal("9.95")  # nothing closed
 
@@ -164,10 +160,9 @@ async def test_passive_exit_respects_target_gate(env):
 async def test_aggressive_exit_closes_immediately(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)
-    pos = positions.get(pos_id)
 
-    positions.set_exit_request(pos.id, "now", None)
-    executor.start_exit(positions.get(pos.id))
-    await wait_for_state(positions, pos.id, pm.CLOSED)
-    final = positions.get(pos.id)
+    positions.set_exit_request(pos_id, "now", None)
+    executor.start_exit(positions.get(pos_id))
+    await wait_for_state(positions, pos_id, pm.CLOSED)
+    final = positions.get(pos_id)
     assert final.perp_qty == 0 and final.spot_qty == 0

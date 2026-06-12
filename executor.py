@@ -208,24 +208,16 @@ class _PaperOrder:
 
 
 class PaperTrader(Trader):
-    """Simulated fills against the live quote cache."""
+    """Simulated fills against the live quote cache.
+
+    Maker orders fill immediately at their resting price (we assume the
+    market trades through our level). This lets paper mode test the full
+    entry/exit/hedge pipeline without waiting for a real book cross.
+    """
 
     def __init__(self, md: MarketData):
         self._md = md
         self._orders: dict[str, _PaperOrder] = {}
-
-    def _check_fill(self, order: _PaperOrder) -> None:
-        book = self._md.aster_books.get(order.symbol)
-        if book is None or not order.status == "NEW":
-            return
-        # A resting SELL fills when the best bid crosses up to our price;
-        # a resting BUY fills when the best ask crosses down to it.
-        crossed = (
-            book.bid >= order.price if order.side == "SELL" else book.ask <= order.price
-        )
-        if crossed:
-            order.executed = order.qty
-            order.status = "FILLED"
 
     def _to_result(self, order_id: str, order: _PaperOrder) -> OrderResult:
         return OrderResult(
@@ -243,20 +235,17 @@ class PaperTrader(Trader):
 
     async def place_perp_maker(self, symbol, side, qty, price, client_id) -> str:
         order_id = f"paper-{uuid.uuid4().hex[:10]}"
-        self._orders[order_id] = _PaperOrder(symbol, side, price, qty)
+        order = _PaperOrder(symbol, side, price, qty)
+        order.executed = qty
+        order.status = "FILLED"
+        self._orders[order_id] = order
         return order_id
 
     async def poll_perp_order(self, symbol, order_id) -> OrderResult:
-        order = self._orders[order_id]
-        self._check_fill(order)
-        return self._to_result(order_id, order)
+        return self._to_result(order_id, self._orders[order_id])
 
     async def cancel_perp_order(self, symbol, order_id) -> OrderResult:
-        order = self._orders[order_id]
-        self._check_fill(order)
-        if order.status == "NEW":
-            order.status = "CANCELED"
-        return self._to_result(order_id, order)
+        return self._to_result(order_id, self._orders[order_id])
 
     async def perp_taker(self, symbol, side, qty, cap_price, reduce_only) -> TakerFill:
         book = self._md.aster_books.get(symbol)
