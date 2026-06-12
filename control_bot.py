@@ -242,15 +242,16 @@ class ControlBot:
         rows = snap["rows"][:n]
         if not rows:
             return "no funding data yet"
-        hdr = f"{'symbol':<14}{'iv':>3}{'24h':>7}{'now':>7}{'entry':>7}{'net':>7}"
+        hdr = f"{'symbol':<14}{'iv':>3}{'24h':>7}{'now':>7}{'entry':>7}{'net':>7}{'depth$':>8}"
         sep = "-" * len(hdr)
         lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
         for r in rows:
             entry = f"{r['entry_bps']:>7.1f}" if r["entry_bps"] is not None else f"{'-':>7}"
             net = f"{r['net_edge_bps']:>7.1f}" if r["net_edge_bps"] is not None else f"{'-':>7}"
+            depth = f"{r['max_notional_usd']:>8,.0f}" if r.get("max_notional_usd") else f"{'-':>8}"
             lines.append(
                 f"{r['symbol'][:13]:<14}{r['interval_hours']:>2}h"
-                f"{r['avg_24h_8h_bps']:>7.1f}{r['current_8h_bps']:>7.1f}{entry}{net}"
+                f"{r['avg_24h_8h_bps']:>7.1f}{r['current_8h_bps']:>7.1f}{entry}{net}{depth}"
             )
         lines.append(sep)
         lines.append("iv=funding interval; 24h=avg carry/8h; now=latest/8h")
