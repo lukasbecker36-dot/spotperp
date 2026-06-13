@@ -90,6 +90,54 @@ class Trader:
     ) -> TakerFill:
         raise NotImplementedError
 
+    async def spot_depth(
+        self, symbol: str, side: str, limit: int = 20
+    ) -> list[tuple[Decimal, Decimal]]:
+        """Resting (price, qty) levels on the side a taker would hit:
+        BUY hits asks (ascending), SELL hits bids (descending)."""
+        raise NotImplementedError
+
+
+def max_hedgeable_qty(
+    perp_norm_price: Decimal,
+    asks: list[tuple[Decimal, Decimal]],
+    floor_bps: Decimal,
+) -> Decimal:
+    """Largest base quantity buyable across `asks` (ascending price) whose
+    volume-weighted fill price keeps the entry basis at or above floor_bps:
+
+        (perp_norm_price - vwap) / vwap * 1e4 >= floor_bps
+
+    The perp leg fills at one resting price (perp_norm_price, already
+    normalised to base units); the spot taker walks the book, so the VWAP
+    rises and the basis falls monotonically as size grows. Returns the base
+    quantity at the exact point the floor binds (partial of the breaking
+    level included). 0 if even the best ask fails the floor.
+    """
+    if perp_norm_price <= 0 or not asks:
+        return Decimal(0)
+    vwap_max = perp_norm_price / (1 + floor_bps / BPS)
+    if vwap_max <= 0:
+        return Decimal(0)
+    cum_qty = Decimal(0)
+    cum_cost = Decimal(0)
+    for price, qty in asks:
+        if qty <= 0:
+            continue
+        if price <= vwap_max:
+            cum_qty += qty
+            cum_cost += price * qty
+            continue
+        # This level breaks the floor: take the partial that lifts the VWAP
+        # to exactly vwap_max, then stop.
+        num = vwap_max * cum_qty - cum_cost
+        denom = price - vwap_max
+        if denom > 0 and num > 0:
+            cum_qty += min(num / denom, qty)
+        break
+    return cum_qty
+
+
 
 class LiveTrader(Trader):
     def __init__(self, aster: AsterClient, mexc: MexcClient, conn):
@@ -196,6 +244,13 @@ class LiveTrader(Trader):
         intents.resolve_intent(self._conn, intent_id, "done", result.raw)
         return TakerFill(qty=result.executed_qty, avg_price=result.avg_price)
 
+    async def spot_depth(self, symbol, side, limit=20):
+        data = await self._mexc.depth(symbol, limit)
+        key = "asks" if side == "BUY" else "bids"
+        return [
+            (Decimal(str(p)), Decimal(str(q))) for p, q in data.get(key, [])
+        ]
+
 
 @dataclass
 class _PaperOrder:
@@ -260,6 +315,16 @@ class PaperTrader(Trader):
             return TakerFill(Decimal(0), Decimal(0))
         price = book.ask if side == "BUY" else book.bid
         return TakerFill(qty=qty, avg_price=price)
+
+    async def spot_depth(self, symbol, side, limit=20):
+        # Paper has only top-of-book; expose it as a single level so the
+        # hedgeable-size cap behaves the same way live does at the touch.
+        book = self._md.mexc_books.get(symbol)
+        if book is None:
+            return []
+        return [(book.ask, book.ask_qty)] if side == "BUY" else [
+            (book.bid, book.bid_qty)
+        ]
 
 
 class Executor:
@@ -470,6 +535,7 @@ class Executor:
         unhedged = Decimal(0)          # perp filled, spot not yet bought
         order_id: str | None = None
         order_price = Decimal(0)
+        order_qty = Decimal(0)         # size the resting maker was placed with
         order_seen_executed = Decimal(0)
         last_reprice = 0.0
 
@@ -530,18 +596,35 @@ class Executor:
 
                 edge = self._entry_basis_bps(symbol)
                 edge_ok = edge is not None and edge >= entry_floor
-                desired = book.ask  # join the best ask
+                price = aster_info.round_price(book.ask, up=True)  # join best ask
+
+                # Cap the working maker to what MEXC can hedge (taker BUY,
+                # walking the ask book) at a VWAP that still clears the floor.
+                # Without this a fast/thin spot book leaves an over-filled
+                # perp leg to unwind. Depth unavailable -> fall back to the
+                # full remaining size (the per-fill hedge cap still guards).
+                target_qty = aster_info.round_qty(remaining)
+                if edge_ok or order_id is not None:
+                    try:
+                        asks = await self._trader.spot_depth(pair.mexc_symbol, "BUY")
+                    except ExchangeError:
+                        asks = []
+                    if asks:
+                        hedgeable = max_hedgeable_qty(
+                            price / pair.qty_multiplier, asks, entry_floor
+                        )
+                        cap = aster_info.round_qty(hedgeable / pair.qty_multiplier)
+                        target_qty = min(target_qty, cap)
 
                 if order_id is None:
-                    if edge_ok and remaining >= aster_info.step_size:
-                        qty = aster_info.round_qty(remaining)
-                        price = aster_info.round_price(desired, up=True)
+                    if edge_ok and target_qty >= aster_info.step_size:
                         client_id = intents.make_client_order_id(position.id, "pent")
                         try:
                             order_id = await self._trader.place_perp_maker(
-                                pair.aster_symbol, "SELL", qty, price, client_id
+                                pair.aster_symbol, "SELL", target_qty, price, client_id
                             )
                             order_price = price
+                            order_qty = target_qty
                             order_seen_executed = Decimal(0)
                             last_reprice = time.monotonic()
                         except ExchangeError as exc:
@@ -555,13 +638,18 @@ class Executor:
                     if not result.is_open:
                         order_id = None
                     else:
-                        moved = order_price != aster_info.round_price(desired, up=True)
+                        open_qty = order_qty - order_seen_executed
+                        moved = order_price != price
                         stale_edge = not edge_ok
+                        # Resize if the hedgeable cap drifted away from the
+                        # resting size by a lot (shrank -> over-exposed;
+                        # grew -> leaving fillable size on the table).
+                        size_drift = abs(target_qty - open_qty) >= aster_info.step_size
                         can_reprice = (
                             time.monotonic() - last_reprice
                             >= config.REPRICE_MIN_INTERVAL_SECONDS
                         )
-                        if (moved or stale_edge) and can_reprice:
+                        if (moved or stale_edge or size_drift) and can_reprice:
                             result = await self._trader.cancel_perp_order(
                                 pair.aster_symbol, order_id
                             )

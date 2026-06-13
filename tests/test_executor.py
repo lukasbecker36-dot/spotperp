@@ -34,7 +34,7 @@ def info(symbol: str) -> SymbolInfo:
 
 
 def set_books(md: MarketData, aster_bid: str, aster_ask: str,
-              mexc_bid: str, mexc_ask: str) -> None:
+              mexc_bid: str, mexc_ask: str, mexc_ask_qty: str = "100") -> None:
     import time
     ts = int(time.time() * 1000)
     md.aster_books["BTCUSDT"] = BookTicker(
@@ -42,7 +42,7 @@ def set_books(md: MarketData, aster_bid: str, aster_ask: str,
         Decimal(100), ts)
     md.mexc_books["BTCUSDT"] = BookTicker(
         "BTCUSDT", Decimal(mexc_bid), Decimal(100), Decimal(mexc_ask),
-        Decimal(100), ts)
+        Decimal(mexc_ask_qty), ts)
 
 
 @pytest.fixture
@@ -176,6 +176,20 @@ async def test_entry_floor_blocks_thin_basis(env):
     set_books(md, "100.4", "100.9", "99.9", "100.0")
     await wait_for_state(positions, pos.id, pm.OPEN)
     assert positions.get(pos.id).perp_entry_avg == Decimal("100.9")
+
+
+async def test_entry_completes_when_topofbook_thin(env):
+    """A thin MEXC top of book caps each maker chunk to the hedgeable size;
+    the entry should still reach OPEN, fully hedged, by chunking."""
+    md, positions, executor, notifier, conn = env
+    # +50bps basis but only 2 base units offered on the MEXC ask.
+    set_books(md, "100.4", "100.5", "99.9", "100.0", mexc_ask_qty="2")
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True)
+    executor.start_entry(pos)
+    await wait_for_state(positions, pos.id, pm.OPEN)
+    final = positions.get(pos.id)
+    assert final.perp_qty == Decimal("9.95")     # full target reached
+    assert final.spot_qty == final.perp_qty       # fully hedged
 
 
 async def test_aggressive_exit_closes_immediately(env):
