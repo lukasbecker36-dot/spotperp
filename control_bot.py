@@ -38,6 +38,7 @@ HELP = """Commands:
 /status — engine heartbeat + open positions
 /positions — active positions detail (bot DB)
 /recon — live exchange P&L: pairs open on the venues now, full round-trip cost
+/book SYMBOL — top 5 order book levels on both venues
 /enter SYMBOL NOTIONAL [min_bps] — start maker entry (floor defaults to fee breakeven)
 /cancel ID|SYMBOL — abort a working entry
 /exit ID|SYMBOL now — aggressive close (taker both legs)
@@ -79,6 +80,7 @@ class ControlBot:
             {"command": "cancel", "description": "Cancel working entry: ID|SYMBOL"},
             {"command": "positions", "description": "Show open positions"},
             {"command": "recon", "description": "Live exchange P&L (round-trip cost)"},
+            {"command": "book", "description": "Order book both venues: SYMBOL"},
             {"command": "status", "description": "Engine status and heartbeat"},
             {"command": "pnl", "description": "Realised P&L summary"},
             {"command": "trades", "description": "Recent closed trades"},
@@ -178,6 +180,10 @@ class ControlBot:
             return self._cmd_positions()
         if command == "recon":
             return await self._queue_and_wait("recon", {}, wait=25)
+        if command == "book":
+            if not args:
+                return "usage: /book SYMBOL"
+            return await self._queue_and_wait("book", {"symbol": args[0]}, wait=15)
         if command == "trades":
             return self._cmd_trades(args)
         if command == "pnl":

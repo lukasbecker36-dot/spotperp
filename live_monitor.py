@@ -17,6 +17,7 @@ import config
 import database
 import funding
 import position_manager as pm
+import book
 import recon
 import recovery
 import screener
@@ -368,6 +369,8 @@ class Engine:
                 return self._cmd_flatten()
             if command == "recon":
                 return await self._cmd_recon()
+            if command == "book":
+                return await self._cmd_book(args)
             return f"unknown command: {command}"
         except Exception as exc:
             log.exception("command %s failed", command)
@@ -465,6 +468,25 @@ class Engine:
                 self.executor.start_exit(self.positions.get(pos.id))
                 count += 1
         return f"flatten: {count} positions being closed/cancelled"
+
+    async def _cmd_book(self, args: dict) -> str:
+        """Top-5 order book levels on both venues for a cross-listed symbol."""
+        symbol = str(args.get("symbol", "")).upper()
+        if not symbol:
+            return "usage: /book SYMBOL"
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        pair = self.md.pair_maps.get(symbol)
+        if pair is None:
+            return f"{symbol} is not cross-listed (no Aster perp + MEXC spot pair)"
+        try:
+            aster_depth, mexc_depth = await asyncio.gather(
+                self.aster.depth(pair.aster_symbol, limit=10),
+                self.mexc.depth(pair.mexc_symbol, limit=10),
+            )
+        except ExchangeError as exc:
+            return f"{symbol}: book fetch failed ({exc})"
+        return book.format_book(symbol, pair.qty_multiplier, aster_depth, mexc_depth)
 
     async def _cmd_recon(self) -> str:
         """Value the short-perp / long-spot pairs actually open on the venues
