@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from executor import max_hedgeable_qty
+from executor import max_closeable_qty, max_hedgeable_qty
 
 BPS = Decimal(10000)
 
@@ -75,3 +75,47 @@ def test_monotonic_basis_decreases_past_cap():
 def test_empty_book_returns_zero():
     assert max_hedgeable_qty(Decimal(100), [], Decimal(0)) == Decimal(0)
     assert max_hedgeable_qty(Decimal(0), [(Decimal(1), Decimal(1))], Decimal(0)) == 0
+
+
+# ── exit side: max_closeable_qty (sell spot, basis must stay <= target) ──
+
+def close_bps(perp: Decimal, vwap: Decimal) -> Decimal:
+    return (perp - vwap) / vwap * BPS
+
+
+def test_closeable_full_depth_when_all_bids_clear_target():
+    # perp 100, target 0 -> vwap must stay >= 100. All bids at/above 100.
+    bids = [(Decimal("100.5"), Decimal(10)), (Decimal("100.0"), Decimal(10))]
+    assert max_closeable_qty(Decimal(100), bids, Decimal(0)) == Decimal(20)
+
+
+def test_closeable_zero_when_best_bid_above_target():
+    # perp 100, target 0 -> need vwap >= 100, but best bid 99.5 -> basis > 0.
+    bids = [(Decimal("99.5"), Decimal(10))]
+    assert max_closeable_qty(Decimal(100), bids, Decimal(0)) == Decimal(0)
+
+
+def test_closeable_partial_at_binding_level():
+    # perp 100, target 0 -> vwap_min = 100.
+    # L1: 101 x10 (vwap 101, ok). L2: 99 x100 -> would drop vwap below 100.
+    # take x of L2: (1010 + 99x)/(10+x) = 100 -> 1010 + 99x = 1000 + 100x
+    #   -> x = 10.
+    bids = [(Decimal("101"), Decimal(10)), (Decimal("99"), Decimal(100))]
+    q = max_closeable_qty(Decimal(100), bids, Decimal(0))
+    assert q == Decimal(20)
+    assert close_bps(Decimal(100), vwap_of(bids, q)) == pytest.approx(
+        Decimal(0), abs=Decimal("0.001")
+    )
+
+
+def test_closeable_monotonic_basis_rises_past_cap():
+    bids = [(Decimal("101"), Decimal(10)), (Decimal("99"), Decimal(100))]
+    target = Decimal("5")
+    q = max_closeable_qty(Decimal(100), bids, target)
+    assert close_bps(Decimal(100), vwap_of(bids, q)) <= target + Decimal("0.01")
+    over = vwap_of(bids, q + Decimal(1))
+    assert close_bps(Decimal(100), over) > target
+
+
+def test_closeable_empty_returns_zero():
+    assert max_closeable_qty(Decimal(100), [], Decimal(0)) == Decimal(0)

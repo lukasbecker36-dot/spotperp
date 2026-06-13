@@ -138,6 +138,47 @@ def max_hedgeable_qty(
     return cum_qty
 
 
+def max_closeable_qty(
+    perp_norm_price: Decimal,
+    bids: list[tuple[Decimal, Decimal]],
+    target_bps: Decimal,
+) -> Decimal:
+    """Mirror of max_hedgeable_qty for a passive exit: largest base quantity
+    sellable across `bids` (descending price) whose volume-weighted fill price
+    keeps the CLOSE basis at or below target_bps:
+
+        (perp_norm_price - vwap) / vwap * 1e4 <= target_bps
+
+    The perp buy-back fills at one resting price (perp_norm_price, the bid
+    normalised to base units); selling spot deeper lowers the VWAP and raises
+    the close basis, so there is a single max size. Returns the base quantity
+    where the target binds (partial of the breaking level included). 0 if even
+    the best bid would close above target.
+    """
+    if perp_norm_price <= 0 or not bids:
+        return Decimal(0)
+    vwap_min = perp_norm_price / (1 + target_bps / BPS)
+    if vwap_min <= 0:
+        return Decimal(0)
+    cum_qty = Decimal(0)
+    cum_cost = Decimal(0)
+    for price, qty in bids:
+        if qty <= 0:
+            continue
+        if price >= vwap_min:
+            cum_qty += qty
+            cum_cost += price * qty
+            continue
+        # This level would pull the VWAP below vwap_min (basis above target):
+        # take the partial that lands the VWAP exactly at vwap_min, then stop.
+        num = vwap_min * cum_qty - cum_cost  # <= 0 (prior prices >= vwap_min)
+        denom = price - vwap_min             # < 0
+        if denom < 0 and num <= 0:
+            cum_qty += min(num / denom, qty)
+        break
+    return cum_qty
+
+
 
 class LiveTrader(Trader):
     def __init__(self, aster: AsterClient, mexc: MexcClient, conn):
@@ -793,6 +834,7 @@ class Executor:
 
         order_id: str | None = None
         order_price = Decimal(0)
+        order_qty = Decimal(0)         # size the resting buy-back was placed with
         order_seen_executed = Decimal(0)
         last_reprice = 0.0
         to_sell = Decimal(0)   # spot base units pending sale after perp buy-backs
@@ -848,16 +890,39 @@ class Executor:
                 book = self._md.aster_books.get(pair.aster_symbol)
                 close = self._close_basis_bps(symbol)
                 gated = target is not None and (close is None or close > target)
+                price = (
+                    aster_info.round_price(book.bid, up=False) if book else order_price
+                )
+
+                # Cap the buy-back to what spot can sell (taker SELL, walking
+                # the bid book) without the close basis exceeding the target —
+                # the mirror of the entry sizing. Stops a thin spot bid from
+                # forcing the spot leg to sell through worse bids than the
+                # target implied. Depth unavailable / no target -> full size.
+                place_qty = remaining
+                if book is not None and target is not None:
+                    try:
+                        bids = await self._trader.spot_depth(pair.mexc_symbol, "SELL")
+                    except ExchangeError:
+                        bids = []
+                    if bids:
+                        closeable = max_closeable_qty(
+                            price / pair.qty_multiplier, bids, target
+                        )
+                        place_qty = min(
+                            remaining,
+                            aster_info.round_qty(closeable / pair.qty_multiplier),
+                        )
 
                 if order_id is None:
-                    if book is not None and not gated:
-                        price = aster_info.round_price(book.bid, up=False)
+                    if book is not None and not gated and place_qty >= aster_info.step_size:
                         client_id = intents.make_client_order_id(position.id, "pext")
                         try:
                             order_id = await self._trader.place_perp_maker(
-                                pair.aster_symbol, "BUY", remaining, price, client_id
+                                pair.aster_symbol, "BUY", place_qty, price, client_id
                             )
                             order_price = price
+                            order_qty = place_qty
                             order_seen_executed = Decimal(0)
                             last_reprice = time.monotonic()
                         except ExchangeError as exc:
@@ -870,14 +935,13 @@ class Executor:
                     if not result.is_open:
                         order_id = None
                     else:
-                        desired = (
-                            aster_info.round_price(book.bid, up=False) if book else order_price
-                        )
+                        open_qty = order_qty - order_seen_executed
+                        size_drift = abs(place_qty - open_qty) >= aster_info.step_size
                         can_reprice = (
                             time.monotonic() - last_reprice
                             >= config.REPRICE_MIN_INTERVAL_SECONDS
                         )
-                        if (gated or desired != order_price) and can_reprice:
+                        if (gated or price != order_price or size_drift) and can_reprice:
                             result = await self._trader.cancel_perp_order(
                                 pair.aster_symbol, order_id
                             )

@@ -34,14 +34,15 @@ def info(symbol: str) -> SymbolInfo:
 
 
 def set_books(md: MarketData, aster_bid: str, aster_ask: str,
-              mexc_bid: str, mexc_ask: str, mexc_ask_qty: str = "100") -> None:
+              mexc_bid: str, mexc_ask: str, mexc_ask_qty: str = "100",
+              mexc_bid_qty: str = "100") -> None:
     import time
     ts = int(time.time() * 1000)
     md.aster_books["BTCUSDT"] = BookTicker(
         "BTCUSDT", Decimal(aster_bid), Decimal(100), Decimal(aster_ask),
         Decimal(100), ts)
     md.mexc_books["BTCUSDT"] = BookTicker(
-        "BTCUSDT", Decimal(mexc_bid), Decimal(100), Decimal(mexc_ask),
+        "BTCUSDT", Decimal(mexc_bid), Decimal(mexc_bid_qty), Decimal(mexc_ask),
         Decimal(mexc_ask_qty), ts)
 
 
@@ -142,6 +143,21 @@ async def test_passive_exit_closes_with_pnl(env):
     gross = (Decimal("0.5") - Decimal("0.1")) * Decimal("9.95")
     assert final.realized_pnl_usd <= gross
     assert final.realized_pnl_usd > gross - Decimal("2")
+
+
+async def test_passive_exit_completes_when_bid_thin(env):
+    """A thin MEXC bid caps each buy-back chunk to the closeable size; the
+    exit must still fully close, chunking through (and the depth cap must not
+    be mistaken for 'position closed')."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    # converged: close basis ~10bps, target 15 -> not gated; only 2 units bid.
+    set_books(md, "100.0", "100.1", "99.9", "100.0", mexc_bid_qty="2")
+    positions.set_exit_request(pos_id, "passive", Decimal(15))
+    executor.start_exit(positions.get(pos_id))
+    await wait_for_state(positions, pos_id, pm.CLOSED)
+    final = positions.get(pos_id)
+    assert final.perp_qty == 0 and final.spot_qty == 0
 
 
 async def test_passive_exit_respects_target_gate(env):
