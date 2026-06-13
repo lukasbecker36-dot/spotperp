@@ -419,6 +419,37 @@ class Executor:
             rate = config.MEXC_MAKER_FEE if maker else config.MEXC_TAKER_FEE
         return qty * price * rate
 
+    async def _hedge_cap(
+        self, mexc_symbol: str, side: str, base_qty: Decimal, info: SymbolInfo
+    ) -> Decimal | None:
+        """IOC limit price that crosses enough *live* depth to fill base_qty,
+        plus a buffer. The hedge must fill to keep the position neutral, so we
+        price it to cross the real book up to the needed size rather than the
+        cached touch + a thin buffer — a fast microcap blows straight through
+        the latter (PLAY: cached ask + 10bps sat below the real ask, so the
+        IOC crossed nothing). Falls back to touch + buffer if depth is gone.
+        """
+        buf = config.HEDGE_SLIPPAGE_BPS / BPS
+        try:
+            levels = await self._trader.spot_depth(mexc_symbol, side)
+        except ExchangeError:
+            levels = []
+        ref: Decimal | None = None
+        cum = Decimal(0)
+        for price, qty in levels:
+            cum += qty
+            ref = price
+            if cum >= base_qty:
+                break  # this level completes the fill
+        if ref is None:
+            book = self._md.mexc_books.get(mexc_symbol)
+            if book is None:
+                return None
+            ref = book.ask if side == "BUY" else book.bid
+        if side == "BUY":
+            return info.round_price(ref * (1 + buf), up=True)
+        return info.round_price(ref * (1 - buf), up=False)
+
     async def _hedge_spot(
         self, position: pm.Position, side: str, base_qty: Decimal, phase: str
     ) -> tuple[Decimal, str | None]:
@@ -436,16 +467,11 @@ class Executor:
             return Decimal(0), None
         last_error: str | None = None
         for attempt in range(config.HEDGE_RETRY_ATTEMPTS):
-            book = self._md.mexc_books.get(pair.mexc_symbol)
-            if book is None:
-                last_error = "no MEXC quote in cache"
+            cap = await self._hedge_cap(pair.mexc_symbol, side, remaining, info)
+            if cap is None:
+                last_error = "no MEXC book/depth to price the hedge"
                 await asyncio.sleep(1)
                 continue
-            slip = config.HEDGE_SLIPPAGE_BPS / BPS
-            cap = (
-                book.ask * (1 + slip) if side == "BUY" else book.bid * (1 - slip)
-            )
-            cap = info.round_price(cap, up=(side == "BUY"))
             try:
                 fill = await self._trader.spot_taker(
                     pair.mexc_symbol, side, remaining, cap

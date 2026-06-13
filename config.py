@@ -78,7 +78,11 @@ ENTRY_TIMEOUT_MINUTES = 60
 EXIT_TIMEOUT_MINUTES = 30
 UNWIND_TIMEOUT_SECONDS = 60              # hard limit to flatten a naked leg
 HEDGE_RETRY_ATTEMPTS = 3
-HEDGE_SLIPPAGE_BPS = Decimal("10.0")     # IOC limit price buffer past the touch
+# Buffer added past the live depth level that completes the hedge fill (the
+# IOC is priced to cross real resting depth up to the needed size, then this
+# buffer on top). Wider = surer fill on fast/thin names, at most this much
+# extra slippage. 10bps off the cached touch was too tight for microcaps.
+HEDGE_SLIPPAGE_BPS = Decimal("25.0")
 MIN_HEDGE_NOTIONAL_USD = Decimal("5")    # accumulate partial fills below this
 
 # ── Funding ──

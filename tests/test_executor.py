@@ -192,6 +192,38 @@ async def test_entry_completes_when_topofbook_thin(env):
     assert final.spot_qty == final.perp_qty       # fully hedged
 
 
+async def test_hedge_cap_crosses_covering_depth(env, monkeypatch):
+    """The hedge IOC is priced to cross live depth up to the needed size,
+    plus the buffer — not the cached touch."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "HEDGE_SLIPPAGE_BPS", Decimal("25"))
+
+    async def fake_depth(symbol, side, limit=20):
+        return [(Decimal("100.0"), Decimal(5)),
+                (Decimal("100.5"), Decimal(5)),   # cumulative 10 covers qty 8
+                (Decimal("101.0"), Decimal(50))]
+    executor._trader.spot_depth = fake_depth
+
+    cap = await executor._hedge_cap("BTCUSDT", "BUY", Decimal(8), info("BTCUSDT"))
+    # crosses to the 100.5 level (completes the fill), +25bps, round up to tick
+    # 100.5 * 1.0025 = 100.75125 -> 100.8
+    assert cap == Decimal("100.8")
+
+
+async def test_hedge_cap_falls_back_to_touch_without_depth(env, monkeypatch):
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "HEDGE_SLIPPAGE_BPS", Decimal("25"))
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    async def empty_depth(symbol, side, limit=20):
+        return []
+    executor._trader.spot_depth = empty_depth
+
+    cap = await executor._hedge_cap("BTCUSDT", "BUY", Decimal(8), info("BTCUSDT"))
+    # falls back to MEXC ask 100.0 * 1.0025 = 100.25 -> round up to 100.3
+    assert cap == Decimal("100.3")
+
+
 async def test_aggressive_exit_closes_immediately(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)
