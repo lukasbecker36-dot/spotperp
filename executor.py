@@ -421,19 +421,24 @@ class Executor:
 
     async def _hedge_spot(
         self, position: pm.Position, side: str, base_qty: Decimal, phase: str
-    ) -> Decimal:
+    ) -> tuple[Decimal, str | None]:
         """Buy (entry) or sell (exit) spot for a perp fill increment.
 
-        Returns the UNFILLED remainder in MEXC base units (0 on success).
+        Returns (unfilled_remainder_in_base_units, last_error). The error is
+        the most recent MEXC rejection message (None if the only problem was
+        thin liquidity / partial fills), so callers can surface the real
+        reason instead of a generic "hedge failed".
         """
         pair = self._pair(position.symbol)
         info = self._md.mexc_info[pair.mexc_symbol]
         remaining = info.round_qty(base_qty)
         if remaining <= 0:
-            return Decimal(0)
+            return Decimal(0), None
+        last_error: str | None = None
         for attempt in range(config.HEDGE_RETRY_ATTEMPTS):
             book = self._md.mexc_books.get(pair.mexc_symbol)
             if book is None:
+                last_error = "no MEXC quote in cache"
                 await asyncio.sleep(1)
                 continue
             slip = config.HEDGE_SLIPPAGE_BPS / BPS
@@ -446,6 +451,7 @@ class Executor:
                     pair.mexc_symbol, side, remaining, cap
                 )
             except ExchangeError as exc:
+                last_error = str(exc)
                 log.warning("spot hedge attempt %s failed: %s", attempt + 1, exc)
                 await asyncio.sleep(1)
                 continue
@@ -460,10 +466,11 @@ class Executor:
                     self._fee_usd("mexc", False, fill.qty, fill.avg_price),
                 )
                 remaining = info.round_qty(remaining - fill.qty)
+                last_error = None  # progress made; not an outright rejection
             if remaining <= 0:
-                return Decimal(0)
+                return Decimal(0), None
             await asyncio.sleep(0.5)
-        return remaining
+        return remaining, last_error
 
     async def _unwind_perp(self, position: pm.Position, qty: Decimal) -> None:
         """Buy back a naked perp fill (leg risk). qty in Aster contract units."""
@@ -562,15 +569,16 @@ class Executor:
             notional = unhedged * pair.qty_multiplier * ref_price
             if not force and notional < config.MIN_HEDGE_NOTIONAL_USD:
                 return  # accumulate dust
-            shortfall = await self._hedge_spot(
+            shortfall, err = await self._hedge_spot(
                 position, "BUY", unhedged * pair.qty_multiplier, "entry"
             )
             naked = shortfall / pair.qty_multiplier
             unhedged = Decimal(0)
             if naked > 0:
+                reason = f" — MEXC: {err}" if err else " (no fill / thin book)"
                 await self._notifier.alert(
                     f"⚠️ position {position.id} {symbol}: spot hedge failed for"
-                    f" {shortfall} base units, unwinding perp leg"
+                    f" {shortfall} base units{reason}, unwinding perp leg"
                 )
                 await self._unwind_perp(position, naked)
 
@@ -785,12 +793,13 @@ class Executor:
             if not force and to_sell * ref < config.MIN_HEDGE_NOTIONAL_USD:
                 return
             qty = min(to_sell, self._positions.get(position.id).spot_qty)
-            shortfall = await self._hedge_spot(position, "SELL", qty, "exit")
+            shortfall, err = await self._hedge_spot(position, "SELL", qty, "exit")
             to_sell = shortfall
             if shortfall > 0:
+                reason = f" — MEXC: {err}" if err else " (no fill / thin book)"
                 await self._notifier.alert(
                     f"⚠️ position {position.id} {symbol}: spot exit sale incomplete,"
-                    f" {shortfall} base units pending"
+                    f" {shortfall} base units pending{reason}"
                 )
 
         try:
