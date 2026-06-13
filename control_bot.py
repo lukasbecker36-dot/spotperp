@@ -36,7 +36,8 @@ HELP = """Commands:
 /screen [n] — top basis opportunities
 /funding [n] — top funding carry (24h avg, 8h-equiv)
 /status — engine heartbeat + open positions
-/positions — active positions detail
+/positions — active positions detail (bot DB)
+/recon — live exchange P&L: pairs open on the venues now, full round-trip cost
 /enter SYMBOL NOTIONAL [min_bps] — start maker entry (floor defaults to fee breakeven)
 /cancel ID|SYMBOL — abort a working entry
 /exit ID|SYMBOL now — aggressive close (taker both legs)
@@ -77,6 +78,7 @@ class ControlBot:
             {"command": "exit", "description": "Exit: ID|SYMBOL now|passive [bps]"},
             {"command": "cancel", "description": "Cancel working entry: ID|SYMBOL"},
             {"command": "positions", "description": "Show open positions"},
+            {"command": "recon", "description": "Live exchange P&L (round-trip cost)"},
             {"command": "status", "description": "Engine status and heartbeat"},
             {"command": "pnl", "description": "Realised P&L summary"},
             {"command": "trades", "description": "Recent closed trades"},
@@ -174,6 +176,8 @@ class ControlBot:
             return self._cmd_status()
         if command == "positions":
             return self._cmd_positions()
+        if command == "recon":
+            return await self._queue_and_wait("recon", {}, wait=25)
         if command == "trades":
             return self._cmd_trades(args)
         if command == "pnl":
@@ -376,9 +380,11 @@ class ControlBot:
             payload["target_bps"] = args[2]
         return await self._queue_and_wait("exit", payload)
 
-    async def _queue_and_wait(self, command: str, args: dict) -> str:
+    async def _queue_and_wait(
+        self, command: str, args: dict, wait: int = COMMAND_WAIT_SECONDS
+    ) -> str:
         command_id = enqueue_command(self._conn, command, args)
-        deadline = time.monotonic() + COMMAND_WAIT_SECONDS
+        deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
             row = self._conn.execute(
                 "SELECT status, response FROM commands WHERE id=?", (command_id,)
@@ -388,7 +394,7 @@ class ControlBot:
             await asyncio.sleep(0.5)
         return (
             f"command queued (#{command_id}) but engine has not responded in"
-            f" {COMMAND_WAIT_SECONDS}s — is it running? check /status"
+            f" {wait}s — is it running? check /status"
         )
 
     # ── service control ──

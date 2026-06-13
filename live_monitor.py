@@ -17,6 +17,7 @@ import config
 import database
 import funding
 import position_manager as pm
+import recon
 import recovery
 import screener
 from auth import (
@@ -30,6 +31,12 @@ from executor import Executor, LiveTrader, MarketData, PaperTrader
 from notify import Notifier
 
 log = logging.getLogger("live_monitor")
+
+
+def _dec_or_zero(value) -> Decimal:
+    if value is None or value == "":
+        return Decimal(0)
+    return Decimal(str(value))
 
 
 class Engine:
@@ -359,6 +366,8 @@ class Engine:
                 return self._cmd_cancel(args)
             if command == "flatten":
                 return self._cmd_flatten()
+            if command == "recon":
+                return await self._cmd_recon()
             return f"unknown command: {command}"
         except Exception as exc:
             log.exception("command %s failed", command)
@@ -456,6 +465,125 @@ class Engine:
                 self.executor.start_exit(self.positions.get(pos.id))
                 count += 1
         return f"flatten: {count} positions being closed/cancelled"
+
+    async def _cmd_recon(self) -> str:
+        """Value the short-perp / long-spot pairs actually open on the venues
+        right now, with the full maker-Aster/taker-MEXC round-trip cost model.
+        Works for manually-opened positions too — it reads the exchanges, not
+        the bot's position DB."""
+        try:
+            risk = await self.aster.position_risk()
+            account = await self.mexc.account()
+        except ExchangeError as exc:
+            return f"recon needs live API access (Aster + MEXC): {exc}"
+
+        balances: dict[str, Decimal] = {}
+        for b in account.get("balances", []):
+            asset = b.get("asset")
+            if asset:
+                balances[asset] = _dec_or_zero(b.get("free")) + _dec_or_zero(
+                    b.get("locked")
+                )
+
+        now_ms = int(time.time() * 1000)
+        shorts = [
+            r for r in risk
+            if Decimal(str(r.get("positionAmt", "0"))) < 0
+        ]
+        if not shorts:
+            return "no short perp positions on Aster"
+
+        results = await asyncio.gather(
+            *(self._recon_pair(r, balances, now_ms) for r in shorts),
+            return_exceptions=True,
+        )
+        pairs: list[recon.PairRecon] = []
+        notes: list[str] = []
+        for r, res in zip(shorts, results):
+            sym = r.get("symbol", "?")
+            if isinstance(res, BaseException):
+                log.warning("recon %s failed: %r", sym, res)
+                notes.append(f"{sym}: recon failed ({res})")
+            elif isinstance(res, str):
+                notes.append(res)
+            elif res is not None:
+                pairs.append(res)
+        pairs.sort(key=lambda p: p.net_pnl, reverse=True)
+        return recon.format_report(pairs, notes)
+
+    async def _recon_pair(
+        self, risk_row: dict, balances: dict[str, Decimal], now_ms: int
+    ) -> recon.PairRecon | str | None:
+        symbol = risk_row.get("symbol", "")
+        pair = self.md.pair_maps.get(symbol)
+        if pair is None:
+            return f"{symbol}: perp only (no MEXC spot pair)"
+        info = self.md.mexc_info.get(pair.mexc_symbol)
+        if info is None:
+            return f"{symbol}: no MEXC symbol info"
+        base = info.base_asset
+        aster_book = self.md.aster_books.get(pair.aster_symbol)
+        mexc_book = self.md.mexc_books.get(pair.mexc_symbol)
+        if aster_book is None or mexc_book is None:
+            return f"{symbol}: no live quotes yet"
+
+        perp_qty = abs(Decimal(str(risk_row.get("positionAmt", "0"))))
+        perp_entry = Decimal(str(risk_row.get("entryPrice", "0")))
+        perp_exit = aster_book.bid
+        perp_base = perp_qty * pair.qty_multiplier
+
+        spot_balance = balances.get(base, Decimal(0))
+        spot_qty = min(spot_balance, perp_base)
+        if spot_qty <= 0:
+            return f"{symbol}: short perp but no {base} spot held"
+
+        try:
+            trades = await self.mexc.my_trades(pair.mexc_symbol, limit=200)
+        except ExchangeError:
+            log.exception("recon: myTrades(%s) failed", pair.mexc_symbol)
+            trades = []
+        recon_entry = recon.reconstruct_spot_entry(trades, spot_qty)
+        if recon_entry is not None:
+            spot_entry, earliest_ms, covered = recon_entry
+            spot_entry_est = not covered
+        else:
+            # No visible buys: assume spot entered near the perp entry price
+            # (zero-basis proxy), normalised to MEXC base units.
+            spot_entry = perp_entry / pair.qty_multiplier
+            earliest_ms = None
+            spot_entry_est = True
+
+        start_ms = earliest_ms or (now_ms - config.MAX_HOLD_HOURS * 3_600_000)
+        held_hours = (
+            Decimal(now_ms - earliest_ms) / Decimal(3_600_000)
+            if earliest_ms else None
+        )
+        funding_usd = Decimal(0)
+        try:
+            income = await self.aster.income_history(
+                pair.aster_symbol, "FUNDING_FEE", start_ms, now_ms
+            )
+            funding_usd = sum(
+                (Decimal(str(i.get("income", "0"))) for i in income), Decimal(0)
+            )
+        except ExchangeError:
+            log.exception("recon: income_history(%s) failed", pair.aster_symbol)
+
+        return recon.PairRecon(
+            symbol=symbol,
+            base_asset=base,
+            perp_qty=perp_qty,
+            perp_entry=perp_entry,
+            perp_exit=perp_exit,
+            spot_qty=spot_qty,
+            spot_entry=spot_entry,
+            spot_exit=mexc_book.bid,
+            spot_entry_est=spot_entry_est,
+            funding_usd=funding_usd,
+            held_hours=held_hours,
+            spot_balance=spot_balance,
+            perp_base=perp_base,
+        )
 
     async def _safety_loop(self) -> None:
         while True:
