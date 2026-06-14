@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_basis_bps TEXT,               -- realised entry basis (from fills)
     exit_mode TEXT,                     -- 'now' | 'passive' | NULL
     exit_target_bps TEXT,               -- passive exit target basis
+    exit_target_qty TEXT,               -- perp qty to stop at (partial exit floor); NULL=full
     perp_entry_avg TEXT, spot_entry_avg TEXT,
     perp_exit_avg TEXT, spot_exit_avg TEXT,
     fees_usd TEXT NOT NULL DEFAULT '0',
@@ -102,6 +103,7 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
 _MIGRATIONS = [
     "ALTER TABLE positions ADD COLUMN min_entry_bps TEXT",
     "ALTER TABLE positions ADD COLUMN trade_kind TEXT NOT NULL DEFAULT 'convergence'",
+    "ALTER TABLE positions ADD COLUMN exit_target_qty TEXT",
 ]
 
 

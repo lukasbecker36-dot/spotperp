@@ -43,8 +43,8 @@ HELP = """Commands:
 /book SYMBOL — top 5 order book levels on both venues
 /enter SYMBOL NOTIONAL [min_bps] [carry] — start maker entry (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close)
 /cancel ID|SYMBOL — abort a working entry
-/exit ID|SYMBOL now — aggressive close (taker both legs)
-/exit ID|SYMBOL passive [target_bps] — work maker close
+/exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins, omit=full
+/exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins, omit=full
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
 /trades [n] — last closed trades
 /pnl — realised P&L summary
@@ -401,10 +401,17 @@ class ControlBot:
 
     async def _cmd_exit(self, args: list[str]) -> str:
         if len(args) < 2 or args[1] not in ("now", "passive", "cancel"):
-            return "usage: /exit ID|SYMBOL now | passive [target_bps] | cancel"
+            return ("usage: /exit ID|SYMBOL now [qty] |"
+                    " passive [target_bps] [qty] | cancel\n"
+                    "qty = coins to close (as in /positions); omit = full")
         payload: dict = {"position_id": args[0], "mode": args[1]}
-        if args[1] == "passive" and len(args) > 2:
-            payload["target_bps"] = args[2]
+        if args[1] == "now" and len(args) > 2:
+            payload["qty"] = args[2]
+        elif args[1] == "passive":
+            if len(args) > 2:
+                payload["target_bps"] = args[2]
+            if len(args) > 3:
+                payload["qty"] = args[3]
         return await self._queue_and_wait("exit", payload)
 
     async def _queue_and_wait(

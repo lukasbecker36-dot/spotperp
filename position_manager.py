@@ -47,6 +47,7 @@ class Position:
     entry_basis_bps: Decimal | None
     exit_mode: str | None
     exit_target_bps: Decimal | None
+    exit_target_qty: Decimal | None   # perp qty to stop at (partial exit floor)
     perp_entry_avg: Decimal | None
     spot_entry_avg: Decimal | None
     perp_exit_avg: Decimal | None
@@ -79,6 +80,7 @@ class Position:
             entry_basis_bps=opt("entry_basis_bps"),
             exit_mode=row["exit_mode"],
             exit_target_bps=opt("exit_target_bps"),
+            exit_target_qty=opt("exit_target_qty"),
             perp_entry_avg=opt("perp_entry_avg"),
             spot_entry_avg=opt("spot_entry_avg"),
             perp_exit_avg=opt("perp_exit_avg"),
@@ -163,13 +165,16 @@ class PositionManager:
         self._conn.commit()
 
     def set_exit_request(
-        self, position_id: int, mode: str | None, target_bps: Decimal | None
+        self, position_id: int, mode: str | None, target_bps: Decimal | None,
+        target_qty: Decimal | None = None,
     ) -> None:
         self._conn.execute(
-            "UPDATE positions SET exit_mode=?, exit_target_bps=?, updated_ms=? WHERE id=?",
+            "UPDATE positions SET exit_mode=?, exit_target_bps=?, exit_target_qty=?,"
+            " updated_ms=? WHERE id=?",
             (
                 mode,
                 str(target_bps) if target_bps is not None else None,
+                str(target_qty) if target_qty is not None else None,
                 _now_ms(),
                 position_id,
             ),

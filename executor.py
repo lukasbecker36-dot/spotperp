@@ -826,13 +826,22 @@ class Executor:
         aster_info = self._md.aster_info[pair.aster_symbol]
         mexc_info = self._md.mexc_info[pair.mexc_symbol]
         self._positions.set_state(position.id, pm.EXITING)
-        journal(self._conn, f"position {position.id}: aggressive exit")
+        # Partial exit: stop closing once the perp falls to this floor (and the
+        # spot to the matching floor). None / 0 -> full close.
+        floor_perp = position.exit_target_qty or Decimal(0)
+        floor_spot = floor_perp * pair.qty_multiplier
+        journal(self._conn, f"position {position.id}: aggressive exit"
+                f" floor_perp={floor_perp}")
 
         deadline = time.monotonic() + config.EXIT_TIMEOUT_MINUTES * 60
         while time.monotonic() < deadline:
             pos = self._positions.get(position.id)
-            perp_left = aster_info.round_qty(pos.perp_qty)
-            spot_left = mexc_info.round_qty(pos.spot_qty)
+            perp_left = max(
+                Decimal(0), aster_info.round_qty(pos.perp_qty) - aster_info.round_qty(floor_perp)
+            )
+            spot_left = max(
+                Decimal(0), mexc_info.round_qty(pos.spot_qty) - mexc_info.round_qty(floor_spot)
+            )
             if perp_left <= 0 and spot_left <= 0:
                 break
             aster_book, mexc_book = self._books(symbol)
@@ -868,7 +877,7 @@ class Executor:
                     )
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
 
-        await self._finalize_close(position.id)
+        await self._complete_exit(position.id, floor_perp)
 
     async def _run_passive_exit(self, position: pm.Position) -> None:
         symbol = position.symbol
@@ -876,7 +885,9 @@ class Executor:
         aster_info = self._md.aster_info[pair.aster_symbol]
         self._positions.set_state(position.id, pm.EXITING)
         target = position.exit_target_bps
-        journal(self._conn, f"position {position.id}: passive exit target={target}")
+        floor_perp = position.exit_target_qty or Decimal(0)  # partial-exit floor
+        journal(self._conn, f"position {position.id}: passive exit target={target}"
+                f" floor_perp={floor_perp}")
 
         order_id: str | None = None
         order_price = Decimal(0)
@@ -916,19 +927,25 @@ class Executor:
                     f" {shortfall} base units pending{reason}"
                 )
 
+        done = False
         try:
             while True:
                 pos = self._positions.get(position.id)
                 if pos.exit_mode != "passive":
-                    # Mode changed (e.g. /exit ID now replaces this task).
+                    # Mode changed (e.g. /exit ID now replaces this task): the
+                    # replacement owns completion, so don't finalize here.
                     break
-                remaining = aster_info.round_qty(pos.perp_qty)
+                remaining = max(
+                    Decimal(0),
+                    aster_info.round_qty(pos.perp_qty) - aster_info.round_qty(floor_perp),
+                )
                 if remaining <= 0:
                     if order_id is not None:
                         await self._trader.cancel_perp_order(pair.aster_symbol, order_id)
                         order_id = None
                     await sell_pending(force=True)
-                    if self._positions.get(position.id).spot_qty <= 0:
+                    if to_sell <= 0:  # closed-portion spot fully sold
+                        done = True
                         break
                     await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
                     continue
@@ -1010,7 +1027,29 @@ class Executor:
                     log.exception("cleanup cancel failed for position %s", position.id)
             raise
 
-        await self._finalize_close(position.id)
+        if done:
+            await self._complete_exit(position.id, floor_perp)
+
+    async def _complete_exit(self, position_id: int, floor_perp: Decimal) -> None:
+        """Finish an exit run. A partial close (floor > 0 with residual left)
+        returns the position to OPEN at the reduced size — the exit fills
+        already shrank perp_qty/spot_qty, and realised P&L is booked only at
+        the final full close. A full close finalises P&L and marks CLOSED."""
+        pos = self._positions.get(position_id)
+        if floor_perp > 0 and (pos.perp_qty > 0 or pos.spot_qty > 0):
+            self._positions.set_exit_request(position_id, None, None, None)
+            self._positions.set_state(position_id, pm.OPEN, "partial exit complete")
+            journal(
+                self._conn,
+                f"position {position_id}: PARTIAL EXIT done, perp={pos.perp_qty}"
+                f" spot={pos.spot_qty} remain",
+            )
+            await self._notifier.alert(
+                f"✂️ position {position_id} {pos.symbol}: partial exit done —"
+                f" {pos.perp_qty} perp / {pos.spot_qty} spot remain (OPEN)"
+            )
+        else:
+            await self._finalize_close(position_id)
 
     async def _finalize_close(self, position_id: int) -> None:
         pos = self._positions.get(position_id)

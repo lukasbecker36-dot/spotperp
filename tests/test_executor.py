@@ -283,6 +283,53 @@ async def test_ensure_margin_skipped_in_paper(env):
     assert stub.calls == []
 
 
+async def wait_for_perp_qty(positions, position_id, qty, timeout=5.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if positions.get(position_id).perp_qty == qty:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"perp_qty never reached {qty}, is {positions.get(position_id).perp_qty}"
+    )
+
+
+async def test_partial_aggressive_exit_leaves_residual_open(env):
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    full = positions.get(pos_id).perp_qty            # 9.95
+    floor = full - Decimal("4.0")                     # stop at 5.95
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+    positions.set_exit_request(pos_id, "now", None, floor)
+    executor.start_exit(positions.get(pos_id))
+
+    await wait_for_perp_qty(positions, pos_id, floor)  # closed 4, residual remains
+    p = positions.get(pos_id)
+    assert p.state == pm.OPEN                          # not CLOSED
+    assert p.spot_qty == floor                         # mult 1
+    assert p.exit_mode is None                         # request cleared
+    assert p.realized_pnl_usd is None                  # P&L booked only at full close
+
+
+async def test_partial_then_full_exit_closes(env):
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    full = positions.get(pos_id).perp_qty
+    floor = full - Decimal("4.0")
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+    positions.set_exit_request(pos_id, "now", None, floor)
+    executor.start_exit(positions.get(pos_id))
+    await wait_for_perp_qty(positions, pos_id, floor)
+    assert positions.get(pos_id).state == pm.OPEN
+    # now close the rest (no qty -> full)
+    positions.set_exit_request(pos_id, "now", None, None)
+    executor.start_exit(positions.get(pos_id))
+    await wait_for_state(positions, pos_id, pm.CLOSED)
+    final = positions.get(pos_id)
+    assert final.perp_qty == 0 and final.spot_qty == 0
+    assert final.realized_pnl_usd is not None
+
+
 async def test_aggressive_exit_closes_immediately(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)

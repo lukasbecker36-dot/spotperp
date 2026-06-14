@@ -9,7 +9,7 @@ import csv
 import json
 import logging
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import aiohttp
 
@@ -492,12 +492,27 @@ class Engine:
         target_dec = Decimal(str(target)) if target is not None else (
             config.EXIT_BASIS_BPS if mode == "passive" else None
         )
-        self.positions.set_exit_request(pos.id, mode, target_dec)
+        # Optional partial-close size, in coins (perp contracts, as shown in
+        # /positions). Stored as the floor to stop at. >= current size = full.
+        target_qty = None
+        size_desc = "full"
+        qty_arg = args.get("qty")
+        if qty_arg is not None:
+            try:
+                q = Decimal(str(qty_arg))
+            except (InvalidOperation, ValueError):
+                return f"bad qty: {qty_arg}"
+            if q <= 0:
+                return "qty must be > 0"
+            if q < pos.perp_qty:
+                target_qty = pos.perp_qty - q
+                size_desc = f"{q} of {pos.perp_qty}"
+        self.positions.set_exit_request(pos.id, mode, target_dec, target_qty)
         self.executor.start_exit(self.positions.get(pos.id))
         desc = "aggressive (taker both legs)" if mode == "now" else (
             f"passive maker, target {target_dec}bps"
         )
-        return f"position {pos.id}: exit started — {desc}"
+        return f"position {pos.id}: exit started — {desc}, size {size_desc}"
 
     def _cmd_cancel(self, args: dict) -> str:
         pos = self._resolve_position(args["position_id"])
