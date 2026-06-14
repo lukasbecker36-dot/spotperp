@@ -384,6 +384,38 @@ class AsterClient(_BaseClient):
             "GET", f"/fapi/v3/income?{body}", venue=self.VENUE
         )
 
+    async def _post_margin(self, paths: list[str], params: dict[str, str]) -> Any:
+        """POST a signed margin/leverage change, trying each path in turn.
+        Aster mirrors the Binance endpoints but the version prefix is not
+        certain, so we try v3 then v1. 'No need to change' (already at the
+        requested value) is treated as success."""
+        last_exc: ExchangeError | None = None
+        for path in paths:
+            try:
+                body = self._signed_body(params)  # fresh nonce per attempt
+                return await self._request(
+                    "POST", path, data=body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    venue=self.VENUE,
+                )
+            except ExchangeError as exc:
+                if exc.code == -4046 or "no need to change" in str(exc).lower():
+                    return {"already_set": True}
+                last_exc = exc
+        raise last_exc if last_exc else ExchangeError(self.VENUE, "no margin path")
+
+    async def set_leverage(self, symbol: str, leverage: int) -> Any:
+        return await self._post_margin(
+            ["/fapi/v3/leverage", "/fapi/v1/leverage"],
+            {"symbol": symbol, "leverage": str(leverage)},
+        )
+
+    async def set_margin_type(self, symbol: str, margin_type: str) -> Any:
+        return await self._post_margin(
+            ["/fapi/v3/marginType", "/fapi/v1/marginType"],
+            {"symbol": symbol, "marginType": margin_type.upper()},
+        )
+
 
 # ─────────────────────────────── MEXC spot ────────────────────────────────
 

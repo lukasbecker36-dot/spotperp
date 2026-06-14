@@ -97,6 +97,13 @@ class Trader:
         BUY hits asks (ascending), SELL hits bids (descending)."""
         raise NotImplementedError
 
+    async def ensure_perp_margin(
+        self, symbol: str, leverage: int, margin_type: str
+    ) -> str | None:
+        """Set the Aster perp's margin type and leverage. Returns None on
+        success (incl. already-set), or an error message."""
+        raise NotImplementedError
+
 
 def max_hedgeable_qty(
     perp_norm_price: Decimal,
@@ -292,6 +299,17 @@ class LiveTrader(Trader):
             (Decimal(str(p)), Decimal(str(q))) for p, q in data.get(key, [])
         ]
 
+    async def ensure_perp_margin(self, symbol, leverage, margin_type):
+        try:
+            await self._aster.set_margin_type(symbol, margin_type)
+        except ExchangeError as exc:
+            return f"marginType: {exc}"
+        try:
+            await self._aster.set_leverage(symbol, leverage)
+        except ExchangeError as exc:
+            return f"leverage: {exc}"
+        return None
+
 
 @dataclass
 class _PaperOrder:
@@ -367,6 +385,9 @@ class PaperTrader(Trader):
             (book.bid, book.bid_qty)
         ]
 
+    async def ensure_perp_margin(self, symbol, leverage, margin_type):
+        return None  # no real account in paper mode
+
 
 class Executor:
     def __init__(
@@ -387,6 +408,7 @@ class Executor:
         self._paper = paper
         self._tasks: dict[int, asyncio.Task] = {}
         self._cancel_requested: set[int] = set()
+        self._margin_configured: set[str] = set()  # Aster symbols set to 1x isolated
 
     # ── public API (called by the live monitor's command poller) ──
 
@@ -583,6 +605,29 @@ class Executor:
 
     # ── entry ──
 
+    async def _ensure_margin(self, position: pm.Position, aster_symbol: str) -> None:
+        """Set 1x isolated on the Aster perp before the first live order on a
+        symbol. Best-effort: alert and proceed on failure (a small entry is
+        not worth blocking, but the operator must know it isn't at 1x)."""
+        if self._paper or aster_symbol in self._margin_configured:
+            return
+        err = await self._trader.ensure_perp_margin(
+            aster_symbol, config.ASTER_LEVERAGE, config.ASTER_MARGIN_TYPE
+        )
+        if err is None:
+            self._margin_configured.add(aster_symbol)
+            journal(
+                self._conn,
+                f"position {position.id}: Aster {aster_symbol} set"
+                f" {config.ASTER_MARGIN_TYPE} {config.ASTER_LEVERAGE}x",
+            )
+        else:
+            await self._notifier.alert(
+                f"⚠️ position {position.id} {position.symbol}: could NOT set"
+                f" {config.ASTER_MARGIN_TYPE} {config.ASTER_LEVERAGE}x on Aster"
+                f" ({err}) — check margin/leverage manually before relying on it"
+            )
+
     async def _run_entry(self, position: pm.Position) -> None:
         symbol = position.symbol
         pair = self._pair(symbol)
@@ -590,6 +635,7 @@ class Executor:
         self._positions.set_state(position.id, pm.ENTERING)
         journal(self._conn, f"position {position.id}: entering {symbol}"
                 f" notional={position.target_notional}")
+        await self._ensure_margin(position, pair.aster_symbol)
 
         aster_book, _ = self._books(symbol)
         if aster_book is None:

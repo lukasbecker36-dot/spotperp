@@ -3,6 +3,8 @@
     python scripts/probe_aster.py           # read-only checks
     python scripts/probe_aster.py --order SYMBOL QTY PRICE   # place+cancel a
                                             # far-from-market GTX order
+    python scripts/probe_aster.py --margin SYMBOL   # set 1x ISOLATED, verify
+                                            # which endpoint version works
 """
 from __future__ import annotations
 
@@ -62,6 +64,20 @@ async def main() -> None:
                 if Decimal(str(r.get("positionAmt", 0))) != 0
             ]
             print(f"open positions: {', '.join(open_pos) or 'none'}")
+
+        if creds and len(sys.argv) >= 3 and sys.argv[1] == "--margin":
+            symbol = sys.argv[2]
+            print(f"setting ISOLATED on {symbol} ...")
+            r1 = await client.set_margin_type(symbol, "ISOLATED")
+            print(f"  marginType -> {r1}")
+            print(f"setting leverage 1 on {symbol} ...")
+            r2 = await client.set_leverage(symbol, 1)
+            print(f"  leverage -> {r2}")
+            risk = await client.position_risk()
+            for r in risk:
+                if r.get("symbol") == symbol:
+                    print(f"  positionRisk: marginType={r.get('marginType')}"
+                          f" leverage={r.get('leverage')}")
 
         if creds and len(sys.argv) >= 5 and sys.argv[1] == "--order":
             symbol, qty, price = sys.argv[2], Decimal(sys.argv[3]), Decimal(sys.argv[4])

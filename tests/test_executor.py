@@ -240,6 +240,49 @@ async def test_hedge_cap_falls_back_to_touch_without_depth(env, monkeypatch):
     assert cap == Decimal("100.3")
 
 
+class _MarginStub:
+    def __init__(self, err=None):
+        self.calls = []
+        self.err = err
+
+    async def ensure_perp_margin(self, symbol, leverage, margin_type):
+        self.calls.append((symbol, leverage, margin_type))
+        return self.err
+
+
+async def test_ensure_margin_sets_once_and_caches(env):
+    md, positions, executor, notifier, conn = env
+    executor._paper = False  # exercise the live-path margin setup
+    stub = _MarginStub()
+    executor._trader = stub
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=False)
+    await executor._ensure_margin(pos, "BTCUSDT")
+    await executor._ensure_margin(pos, "BTCUSDT")  # cached -> no second call
+    assert stub.calls == [
+        ("BTCUSDT", config.ASTER_LEVERAGE, config.ASTER_MARGIN_TYPE)
+    ]
+    assert "BTCUSDT" in executor._margin_configured
+
+
+async def test_ensure_margin_alerts_and_does_not_cache_on_failure(env):
+    md, positions, executor, notifier, conn = env
+    executor._paper = False
+    executor._trader = _MarginStub(err="marginType: aster: position exists (code=-3000)")
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=False)
+    await executor._ensure_margin(pos, "BTCUSDT")
+    assert any("could NOT set" in m for m in notifier.messages)
+    assert "BTCUSDT" not in executor._margin_configured  # will retry next entry
+
+
+async def test_ensure_margin_skipped_in_paper(env):
+    md, positions, executor, notifier, conn = env
+    stub = _MarginStub()
+    executor._trader = stub  # paper stays True
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True)
+    await executor._ensure_margin(pos, "BTCUSDT")
+    assert stub.calls == []
+
+
 async def test_aggressive_exit_closes_immediately(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)
