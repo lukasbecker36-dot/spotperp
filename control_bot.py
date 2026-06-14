@@ -39,7 +39,7 @@ HELP = """Commands:
 /positions — active positions detail (bot DB)
 /recon — live exchange P&L: pairs open on the venues now, full round-trip cost
 /book SYMBOL — top 5 order book levels on both venues
-/enter SYMBOL NOTIONAL [min_bps] — start maker entry (floor defaults to fee breakeven)
+/enter SYMBOL NOTIONAL [min_bps] [carry] — start maker entry (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close)
 /cancel ID|SYMBOL — abort a working entry
 /exit ID|SYMBOL now — aggressive close (taker both legs)
 /exit ID|SYMBOL passive [target_bps] — work maker close
@@ -75,7 +75,7 @@ class ControlBot:
         commands = [
             {"command": "screen", "description": "Top basis opportunities"},
             {"command": "funding", "description": "Top funding carry (24h avg)"},
-            {"command": "enter", "description": "Enter: SYMBOL NOTIONAL [min_bps]"},
+            {"command": "enter", "description": "Enter: SYMBOL NOTIONAL [min_bps] [carry]"},
             {"command": "exit", "description": "Exit: ID|SYMBOL now|passive [bps]"},
             {"command": "cancel", "description": "Cancel working entry: ID|SYMBOL"},
             {"command": "positions", "description": "Show open positions"},
@@ -305,8 +305,10 @@ class ControlBot:
                 if p.opened_ms
                 else "-"
             )
+            kind_tag = " ⚓carry" if p.trade_kind == "carry" else ""
             lines.append(
-                f"#{p.id} {p.symbol} [{p.state}] perp={p.perp_qty} spot={p.spot_qty}"
+                f"#{p.id} {p.symbol} [{p.state}]{kind_tag}"
+                f" perp={p.perp_qty} spot={p.spot_qty}"
                 f" held={held}"
                 f"{' exit=' + p.exit_mode if p.exit_mode else ''}"
                 f"{' (paper)' if p.paper else ''}"
@@ -362,20 +364,29 @@ class ControlBot:
     # ── trading commands (queued to the engine) ──
 
     async def _cmd_enter(self, args: list[str]) -> str:
-        if len(args) not in (2, 3):
-            return ("usage: /enter SYMBOL NOTIONAL [min_bps]\n"
+        if len(args) < 2:
+            return ("usage: /enter SYMBOL NOTIONAL [min_bps] [carry]\n"
                     "min_bps = basis floor while the entry works"
-                    " (default: fee breakeven)")
+                    " (default: fee breakeven)\n"
+                    "carry = funding-carry trade: no auto-close, /exit only"
+                    " (default is a convergence trade that auto-closes)")
         try:
             notional = Decimal(args[1])
         except InvalidOperation:
             return f"bad notional: {args[1]}"
         payload: dict = {"symbol": args[0], "notional": str(notional)}
-        if len(args) == 3:
-            try:
-                payload["min_bps"] = str(Decimal(args[2]))
-            except InvalidOperation:
-                return f"bad min_bps: {args[2]}"
+        # Trailing args, any order: a number -> min_bps, 'carry'/'conv' -> kind.
+        for tok in args[2:]:
+            low = tok.lower()
+            if low in ("carry", "funding"):
+                payload["kind"] = "carry"
+            elif low in ("conv", "converge", "convergence"):
+                payload["kind"] = "convergence"
+            else:
+                try:
+                    payload["min_bps"] = str(Decimal(tok))
+                except InvalidOperation:
+                    return f"unrecognised arg: {tok} (expected min_bps or carry)"
         return await self._queue_and_wait("enter", payload)
 
     async def _cmd_exit(self, args: list[str]) -> str:

@@ -73,10 +73,12 @@ def engine(tmp_path, monkeypatch):
     conn.close()
 
 
-async def open_position(eng) -> int:
+async def open_position(eng, trade_kind: str = "convergence") -> int:
     """+50bps entry: perp ask 100.5 vs spot ask 100.0, paper instant fill."""
     set_books(eng.md, "100.4", "100.5", "99.9", "100.0")
-    pos = eng.positions.create("BTCUSDT", Decimal(1000), paper=True)
+    pos = eng.positions.create(
+        "BTCUSDT", Decimal(1000), paper=True, trade_kind=trade_kind
+    )
     eng.executor.start_entry(pos)
     for _ in range(200):
         if eng.positions.get(pos.id).state == pm.OPEN:
@@ -115,6 +117,26 @@ async def test_converged_tp_fires_when_profitable(engine):
     pos = engine.positions.get(pos_id)
     assert pos.exit_mode == "now"
     assert any("taking profit" in m for m in engine.notifier.messages)
+
+
+async def test_carry_trade_skips_converged_tp(engine):
+    """A carry trade holds for funding: the same converged + profitable
+    basis that auto-closes a convergence trade must NOT close a carry one."""
+    pos_id = await open_position(engine, trade_kind="carry")
+    set_books(engine.md, "99.0", "99.1", "99.9", "100.0")  # converged, profitable
+    await engine._check_safety(engine.positions.get(pos_id))
+    pos = engine.positions.get(pos_id)
+    assert pos.exit_mode is None
+    assert pos.state == pm.OPEN
+
+
+async def test_carry_trade_still_hits_adverse_stop(engine):
+    """The adverse-widen stop (liquidation protection) still applies to carry."""
+    pos_id = await open_position(engine, trade_kind="carry")
+    set_books(engine.md, "101.9", "102.0", "99.9", "100.0")  # widened ~+150bps
+    await engine._check_safety(engine.positions.get(pos_id))
+    assert engine.positions.get(pos_id).exit_mode == "now"
+    assert any("adverse stop" in m for m in engine.notifier.messages)
 
 
 async def test_converged_tp_gated_on_pnl(engine):

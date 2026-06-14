@@ -58,6 +58,7 @@ class Position:
     closed_ms: int | None
     created_ms: int
     min_entry_bps: Decimal | None
+    trade_kind: str          # 'convergence' (may auto-close) | 'carry' (manual only)
     note: str | None
 
     @classmethod
@@ -89,6 +90,7 @@ class Position:
             closed_ms=row["closed_ms"],
             created_ms=row["created_ms"],
             min_entry_bps=opt("min_entry_bps"),
+            trade_kind=(row["trade_kind"] or "convergence"),
             note=row["note"],
         )
 
@@ -102,13 +104,16 @@ class PositionManager:
     def create(
         self, symbol: str, notional: Decimal, *, paper: bool,
         direction: str = "premium", min_entry_bps: Decimal | None = None,
+        trade_kind: str = "convergence",
     ) -> Position:
         now = _now_ms()
         cur = self._conn.execute(
             "INSERT INTO positions (symbol, direction, state, paper, target_notional,"
-            " min_entry_bps, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " min_entry_bps, trade_kind, created_ms, updated_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (symbol, direction, PENDING_ENTRY, int(paper), str(notional),
-             str(min_entry_bps) if min_entry_bps is not None else None, now, now),
+             str(min_entry_bps) if min_entry_bps is not None else None,
+             trade_kind, now, now),
         )
         self._conn.commit()
         return self.get(int(cur.lastrowid))

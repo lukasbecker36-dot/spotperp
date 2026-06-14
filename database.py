@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS positions (
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL,
     min_entry_bps TEXT,                 -- per-entry basis floor (stop chasing below)
+    trade_kind TEXT NOT NULL DEFAULT 'convergence',  -- 'convergence' | 'carry'
     note TEXT
 );
 
@@ -100,6 +101,7 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
 
 _MIGRATIONS = [
     "ALTER TABLE positions ADD COLUMN min_entry_bps TEXT",
+    "ALTER TABLE positions ADD COLUMN trade_kind TEXT NOT NULL DEFAULT 'convergence'",
 ]
 
 

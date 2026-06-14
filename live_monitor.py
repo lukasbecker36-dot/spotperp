@@ -393,15 +393,21 @@ class Engine:
         min_bps = (
             Decimal(str(args["min_bps"])) if args.get("min_bps") is not None else None
         )
+        kind = "carry" if str(args.get("kind", "")).lower() == "carry" else "convergence"
         pos = self.positions.create(
-            symbol, notional, paper=self.paper, min_entry_bps=min_bps
+            symbol, notional, paper=self.paper, min_entry_bps=min_bps,
+            trade_kind=kind,
         )
         self.executor.start_entry(pos)
         floor = min_bps if min_bps is not None else config.ENTRY_MIN_EDGE_FLOOR_BPS
+        auto = (
+            "auto-closes on convergence/max-hold" if kind == "convergence"
+            else "CARRY: manual /exit only (adverse-widen stop still active)"
+        )
         return (
-            f"entry #{pos.id} started: SELL {symbol} perp (maker) /"
+            f"entry #{pos.id} started [{kind}]: SELL {symbol} perp (maker) /"
             f" BUY spot on fill, notional ${notional},"
-            f" basis floor {float(floor):.1f}bps"
+            f" basis floor {float(floor):.1f}bps — {auto}"
         )
 
     def _resolve_position(self, ref: str) -> pm.Position | str:
@@ -637,6 +643,11 @@ class Engine:
                 self.positions.set_exit_request(pos.id, "now", None)
                 self.executor.start_exit(self.positions.get(pos.id))
                 return
+        # Carry trades are held for funding and only the operator closes them:
+        # skip the convergence take-profit and the max-hold timeout. The
+        # adverse-widen stop above still applies (perp-liquidation protection).
+        if pos.trade_kind == "carry":
+            return
         if close is not None and close <= config.CONVERGED_TP_BPS:
             pnl = self._aggressive_close_pnl(pos)
             if pnl is not None and pnl > 0:
