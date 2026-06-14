@@ -90,6 +90,10 @@ class Engine:
         await self._refresh_funding()
         await self._refresh_funding_stats()
         self._resume_positions()
+        try:
+            await self._refresh_position_funding()
+        except Exception:
+            log.exception("startup position funding refresh failed")
         await self.notifier.alert(f"basis-trade engine started ({mode})")
         await asyncio.gather(
             self._market_loop(),
@@ -169,6 +173,36 @@ class Engine:
                 await self._refresh_funding_stats()
             except Exception:
                 log.exception("funding stats sweep error")
+            try:
+                await self._refresh_position_funding()
+            except Exception:
+                log.exception("position funding refresh error")
+
+    async def _refresh_position_funding(self) -> None:
+        """Set each open LIVE position's funding_usd to the actual FUNDING_FEE
+        income Aster has paid over the trade's life. Without this the live mark
+        falls back to extrapolating today's rate across the whole hold, which
+        badly distorts long-held / adopted positions."""
+        if self.paper:
+            return
+        now = int(time.time() * 1000)
+        for pos in self.positions.active():
+            if pos.state != pm.OPEN or pos.paper or pos.opened_ms is None:
+                continue
+            pair = self.md.pair_maps.get(pos.symbol)
+            if pair is None:
+                continue
+            try:
+                rows = await self.aster.income_history(
+                    pair.aster_symbol, "FUNDING_FEE", pos.opened_ms, now
+                )
+            except ExchangeError:
+                log.exception("funding income fetch failed for %s", pos.symbol)
+                continue
+            total = sum(
+                (Decimal(str(r.get("income", "0"))) for r in rows), Decimal(0)
+            )
+            self.positions.set_funding(pos.id, total)
 
     async def _refresh_funding_stats(self) -> None:
         """Sweep funding-rate history for every pair in rate-limited batches,
@@ -306,22 +340,25 @@ class Engine:
                 (mexc.bid - pos.spot_entry_avg) * pos.spot_qty
                 if pos.spot_entry_avg is not None else Decimal(0)
             )
-            # Funding accrued so far (estimate from the current rate at the
-            # symbol's own interval; live exact amounts land at close).
+            # Funding accrued so far. LIVE: the real FUNDING_FEE income, kept
+            # current by _refresh_position_funding (never extrapolate today's
+            # rate across a multi-day hold — that distorts the P&L). PAPER:
+            # estimate from the current rate at the symbol's interval.
             funding_est = pos.funding_usd
-            rate = (self.md.funding.get(pair.aster_symbol) or {}).get("funding_rate")
-            if (funding_est == 0 and rate is not None and pos.opened_ms
+            if (pos.paper and funding_est == 0 and pos.opened_ms
                     and pos.spot_entry_avg is not None):
-                stat = self.md.funding_stats.get(pair.aster_symbol)
-                interval = (
-                    Decimal(stat.interval_hours) if stat is not None
-                    else Decimal(config.FUNDING_INTERVAL_HOURS)
-                )
-                periods = (
-                    Decimal(now_ms - pos.opened_ms) / Decimal(3_600_000) / interval
-                )
-                notional = pos.perp_qty * pos.spot_entry_avg * pair.qty_multiplier
-                funding_est = rate * notional * periods
+                rate = (self.md.funding.get(pair.aster_symbol) or {}).get("funding_rate")
+                if rate is not None:
+                    stat = self.md.funding_stats.get(pair.aster_symbol)
+                    interval = (
+                        Decimal(stat.interval_hours) if stat is not None
+                        else Decimal(config.FUNDING_INTERVAL_HOURS)
+                    )
+                    periods = (
+                        Decimal(now_ms - pos.opened_ms) / Decimal(3_600_000) / interval
+                    )
+                    notional = pos.perp_qty * pos.spot_entry_avg * pair.qty_multiplier
+                    funding_est = rate * notional * periods
             upnl = perp_pnl + spot_pnl + funding_est - pos.fees_usd
             marks[str(pos.id)] = {
                 "close_bps": float(close_bps),

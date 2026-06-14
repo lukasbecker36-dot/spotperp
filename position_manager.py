@@ -184,6 +184,14 @@ class PositionManager:
         )
         self._conn.commit()
 
+    def set_funding(self, position_id: int, amount_usd: Decimal) -> None:
+        """Set absolute realised funding (from Aster income history)."""
+        self._conn.execute(
+            "UPDATE positions SET funding_usd=?, updated_ms=? WHERE id=?",
+            (str(amount_usd), _now_ms(), position_id),
+        )
+        self._conn.commit()
+
     def record_fill(
         self,
         position_id: int,

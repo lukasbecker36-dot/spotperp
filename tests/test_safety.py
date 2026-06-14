@@ -239,3 +239,40 @@ async def test_adopt_refuses_in_paper_mode(engine):
     msg = await engine._cmd_adopt({"symbol": "BTC"})
     assert "LIVE" in msg
     assert engine.positions.active() == []
+
+
+class _IncomeStub:
+    def __init__(self, rows):
+        self._rows = rows
+        self.calls = []
+
+    async def income_history(self, symbol, income_type, start_ms, end_ms):
+        self.calls.append((symbol, income_type, start_ms, end_ms))
+        return self._rows
+
+
+async def test_refresh_position_funding_uses_real_income(engine):
+    """funding_usd is set to the actual summed FUNDING_FEE income, not a
+    current-rate extrapolation."""
+    engine.paper = False
+    pos = engine.positions.create("BTCUSDT", Decimal(1000), paper=False)
+    engine.positions.set_state(pos.id, pm.OPEN)
+    engine.conn.execute(
+        "UPDATE positions SET opened_ms=? WHERE id=?", (1000, pos.id)
+    )
+    engine.conn.commit()
+    engine.aster = _IncomeStub([{"income": "1.5"}, {"income": "0.7"}, {"income": "-0.1"}])
+    await engine._refresh_position_funding()
+    assert engine.positions.get(pos.id).funding_usd == Decimal("2.1")
+    # queried over the trade's life (from opened_ms)
+    assert engine.aster.calls[0][2] == 1000
+
+
+async def test_refresh_position_funding_skips_paper_positions(engine):
+    engine.paper = False
+    pos = engine.positions.create("BTCUSDT", Decimal(1000), paper=True)
+    engine.positions.set_state(pos.id, pm.OPEN)
+    engine.aster = _IncomeStub([{"income": "9.9"}])
+    await engine._refresh_position_funding()
+    assert engine.positions.get(pos.id).funding_usd == Decimal(0)
+    assert engine.aster.calls == []
