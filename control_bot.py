@@ -37,6 +37,7 @@ HELP = """Commands:
 /funding [n] — top funding carry (24h avg, 8h-equiv)
 /status — engine heartbeat + open positions
 /positions — active positions detail (bot DB)
+/balance — USDT balance on each venue (Aster perp + MEXC spot)
 /recon — live exchange P&L: pairs open on the venues now, full round-trip cost
 /adopt SYMBOL — import an existing venue carry trade as a managed position
 /book SYMBOL — top 5 order book levels on both venues
@@ -80,6 +81,7 @@ class ControlBot:
             {"command": "exit", "description": "Exit: ID|SYMBOL now|passive [bps]"},
             {"command": "cancel", "description": "Cancel working entry: ID|SYMBOL"},
             {"command": "positions", "description": "Show open positions"},
+            {"command": "balance", "description": "USDT balance on each venue"},
             {"command": "recon", "description": "Live exchange P&L (round-trip cost)"},
             {"command": "adopt", "description": "Import venue carry trade: SYMBOL"},
             {"command": "book", "description": "Order book both venues: SYMBOL"},
@@ -182,6 +184,8 @@ class ControlBot:
             return self._cmd_positions()
         if command == "recon":
             return await self._queue_and_wait("recon", {}, wait=25)
+        if command == "balance":
+            return await self._queue_and_wait("balance", {}, wait=15)
         if command == "book":
             if not args:
                 return "usage: /book SYMBOL"

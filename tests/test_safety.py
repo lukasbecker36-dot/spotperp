@@ -241,6 +241,48 @@ async def test_adopt_refuses_in_paper_mode(engine):
     assert engine.positions.active() == []
 
 
+class _BalanceStub:
+    def __init__(self, aster_bals, mexc_bals):
+        self._aster = aster_bals
+        self._mexc = mexc_bals
+
+    async def balances(self):
+        return self._aster
+
+    async def account(self):
+        return {"balances": self._mexc}
+
+
+async def test_balance_sums_usdt_across_venues(engine):
+    stub = _BalanceStub(
+        [{"asset": "USDT", "balance": "3160.72", "availableBalance": "3000.00"},
+         {"asset": "BTC", "balance": "1.0"}],
+        [{"asset": "USDT", "free": "500.50", "locked": "10.00"},
+         {"asset": "SKYAI", "free": "100"}],
+    )
+    engine.aster = stub
+    engine.mexc = stub
+    msg = await engine._cmd_balance()
+    assert "Aster perp" in msg and "3,160.72" in msg
+    assert "MEXC spot" in msg and "510.50" in msg  # free + locked
+    assert "combined" in msg and "3,671.22" in msg  # 3160.72 + 510.50
+
+
+async def test_balance_handles_venue_error(engine):
+    class _Boom:
+        async def balances(self):
+            from exchange_client import ExchangeError
+            raise ExchangeError("aster", "down")
+
+        async def account(self):
+            return {"balances": [{"asset": "USDT", "free": "5", "locked": "0"}]}
+    engine.aster = _Boom()
+    engine.mexc = _Boom()
+    msg = await engine._cmd_balance()
+    assert "Aster perp  error" in msg
+    assert "MEXC spot" in msg and "5.00" in msg
+
+
 class _IncomeStub:
     def __init__(self, rows):
         self._rows = rows

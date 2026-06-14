@@ -410,6 +410,8 @@ class Engine:
                 return await self._cmd_book(args)
             if command == "adopt":
                 return await self._cmd_adopt(args)
+            if command == "balance":
+                return await self._cmd_balance()
             return f"unknown command: {command}"
         except Exception as exc:
             log.exception("command %s failed", command)
@@ -516,6 +518,44 @@ class Engine:
                 self.executor.start_exit(self.positions.get(pos.id))
                 count += 1
         return f"flatten: {count} positions being closed/cancelled"
+
+    async def _cmd_balance(self) -> str:
+        """USDT balance on each venue (Aster perp margin + MEXC spot)."""
+        lines = ["USDT balances"]
+        total = Decimal(0)
+        try:
+            bals = await self.aster.balances()
+            u = next((b for b in bals if b.get("asset") == "USDT"), None)
+            if u is not None:
+                bal = _dec_or_zero(u.get("balance"))
+                avail = _dec_or_zero(u.get("availableBalance"))
+                total += bal
+                lines.append(
+                    f"Aster perp  {float(bal):>10,.2f}  (avail {float(avail):,.2f})"
+                )
+            else:
+                lines.append("Aster perp  no USDT")
+        except ExchangeError as exc:
+            lines.append(f"Aster perp  error: {exc}")
+        try:
+            acct = await self.mexc.account()
+            u = next(
+                (b for b in acct.get("balances", []) if b.get("asset") == "USDT"), None
+            )
+            if u is not None:
+                free = _dec_or_zero(u.get("free"))
+                locked = _dec_or_zero(u.get("locked"))
+                tot = free + locked
+                total += tot
+                lines.append(
+                    f"MEXC spot   {float(tot):>10,.2f}  (free {float(free):,.2f})"
+                )
+            else:
+                lines.append("MEXC spot   no USDT")
+        except ExchangeError as exc:
+            lines.append(f"MEXC spot   error: {exc}")
+        lines.append(f"combined    {float(total):>10,.2f}")
+        return "\n".join(lines)
 
     async def _cmd_book(self, args: dict) -> str:
         """Top-5 order book levels on both venues for a cross-listed symbol."""
