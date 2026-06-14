@@ -87,10 +87,20 @@ async def open_position(eng, trade_kind: str = "convergence") -> int:
     raise AssertionError("entry never opened")
 
 
-async def test_adverse_widen_stop_fires(engine):
+async def test_adverse_stop_disabled_by_default(engine):
+    """Off by default: even a huge adverse widen must NOT force-close."""
+    pos_id = await open_position(engine)
+    assert config.ADVERSE_WIDEN_STOP_BPS is None
+    set_books(engine.md, "101.9", "102.0", "99.9", "100.0")  # widened ~+150bps
+    await engine._check_safety(engine.positions.get(pos_id))
+    assert engine.positions.get(pos_id).exit_mode is None
+
+
+async def test_adverse_widen_stop_fires_when_enabled(engine, monkeypatch):
+    monkeypatch.setattr(config, "ADVERSE_WIDEN_STOP_BPS", Decimal("100"))
     pos_id = await open_position(engine)
     # close basis = (aster_bid - mexc_bid)/mexc_bid; entry was ~50bps.
-    # Widen well past entry + ADVERSE_WIDEN_STOP_BPS (100): close ~200bps.
+    # Widen well past entry + 100bps: close ~200bps.
     set_books(engine.md, "101.9", "102.0", "99.9", "100.0")
     await engine._check_safety(engine.positions.get(pos_id))
     pos = engine.positions.get(pos_id)
@@ -98,7 +108,8 @@ async def test_adverse_widen_stop_fires(engine):
     assert any("adverse stop" in m for m in engine.notifier.messages)
 
 
-async def test_no_stop_inside_widen_band(engine):
+async def test_no_stop_inside_widen_band(engine, monkeypatch):
+    monkeypatch.setattr(config, "ADVERSE_WIDEN_STOP_BPS", Decimal("100"))
     pos_id = await open_position(engine)
     # close ~100bps, entry ~50bps: widened 50 < 100 threshold -> no action
     set_books(engine.md, "100.9", "101.0", "99.9", "100.0")
@@ -130,8 +141,9 @@ async def test_carry_trade_skips_converged_tp(engine):
     assert pos.state == pm.OPEN
 
 
-async def test_carry_trade_still_hits_adverse_stop(engine):
-    """The adverse-widen stop (liquidation protection) still applies to carry."""
+async def test_carry_trade_hits_adverse_stop_only_when_enabled(engine, monkeypatch):
+    """When re-enabled, the adverse-widen stop applies to carry too."""
+    monkeypatch.setattr(config, "ADVERSE_WIDEN_STOP_BPS", Decimal("100"))
     pos_id = await open_position(engine, trade_kind="carry")
     set_books(engine.md, "101.9", "102.0", "99.9", "100.0")  # widened ~+150bps
     await engine._check_safety(engine.positions.get(pos_id))

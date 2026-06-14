@@ -400,9 +400,14 @@ class Engine:
         )
         self.executor.start_entry(pos)
         floor = min_bps if min_bps is not None else config.ENTRY_MIN_EDGE_FLOOR_BPS
+        adverse = (
+            "" if config.ADVERSE_WIDEN_STOP_BPS is None
+            else f"; adverse-widen stop at +{float(config.ADVERSE_WIDEN_STOP_BPS):.0f}bps"
+        )
         auto = (
-            "auto-closes on convergence/max-hold" if kind == "convergence"
-            else "CARRY: manual /exit only (adverse-widen stop still active)"
+            f"auto-closes on convergence TP / max-hold{adverse}"
+            if kind == "convergence"
+            else f"CARRY: manual /exit only{adverse}"
         )
         return (
             f"entry #{pos.id} started [{kind}]: SELL {symbol} perp (maker) /"
@@ -626,7 +631,8 @@ class Engine:
 
     async def _check_safety(self, pos: pm.Position) -> None:
         close = self.executor._close_basis_bps(pos.symbol)
-        if close is not None and pos.entry_basis_bps is not None:
+        if (config.ADVERSE_WIDEN_STOP_BPS is not None
+                and close is not None and pos.entry_basis_bps is not None):
             widened = close - pos.entry_basis_bps
             if widened >= config.ADVERSE_WIDEN_STOP_BPS:
                 journal(

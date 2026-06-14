@@ -46,8 +46,14 @@ BASIS_LOG_SECONDS = 60.0                 # touch-basis CSV sampling cadence
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis
 # Adverse stop: force-close when the closeable basis has WIDENED this far
-# above the entry basis (the losing direction for short-perp/long-spot).
-ADVERSE_WIDEN_STOP_BPS = Decimal("100.0")
+# above the entry basis. DISABLED by default (None): a perp and its own spot
+# are tied together by funding and won't diverge enough to threaten the perp
+# margin, so we run without it (operator decision). Set a bps value here or
+# via the ADVERSE_WIDEN_STOP_BPS env var to re-enable.
+ADVERSE_WIDEN_STOP_BPS: Decimal | None = (
+    Decimal(os.environ["ADVERSE_WIDEN_STOP_BPS"])
+    if os.environ.get("ADVERSE_WIDEN_STOP_BPS") else None
+)
 # Convergence take-profit: when the closeable basis inverts below this level
 # AND an aggressive (taker both legs) close is net profitable, lock it in.
 # The PnL gate stops wide-spread names from being force-closed at a loss
