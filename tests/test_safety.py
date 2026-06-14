@@ -177,3 +177,65 @@ async def test_exit_command_accepts_symbol(engine):
     await open_position(engine)
     result = engine._cmd_exit({"position_id": "btc", "mode": "now"})
     assert "exit started" in result
+
+
+class _AsterStub:
+    def __init__(self, risk):
+        self._risk = risk
+
+    async def position_risk(self):
+        return self._risk
+
+
+class _MexcStub:
+    def __init__(self, balances, trades):
+        self._balances = balances
+        self._trades = trades
+
+    async def account(self):
+        return {"balances": self._balances}
+
+    async def my_trades(self, symbol, limit=200):
+        return self._trades
+
+
+async def test_adopt_creates_managed_carry_position(engine):
+    engine.paper = False
+    engine.aster = _AsterStub(
+        [{"symbol": "BTCUSDT", "positionAmt": "-10", "entryPrice": "100.0"}]
+    )
+    engine.mexc = _MexcStub(
+        [{"asset": "BTC", "free": "10", "locked": "0"}],
+        [{"isBuyer": True, "qty": "10", "price": "99.5", "time": 1000}],
+    )
+    msg = await engine._cmd_adopt({"symbol": "BTC"})
+    assert "adopted" in msg
+    active = engine.positions.active()
+    assert len(active) == 1
+    p = active[0]
+    assert p.symbol == "BTCUSDT" and p.state == pm.OPEN
+    assert p.trade_kind == "carry"
+    assert p.perp_qty == Decimal(10) and p.spot_qty == Decimal(10)
+    assert p.perp_entry_avg == Decimal("100.0")
+    assert p.spot_entry_avg == Decimal("99.5")
+    # (100 - 99.5)/99.5 * 1e4 = 50.25 bps
+    assert p.entry_basis_bps == pytest.approx(Decimal("50.25"), abs=Decimal("0.1"))
+    assert p.opened_ms == 1000  # from the earliest spot buy
+
+
+async def test_adopt_refuses_without_spot_leg(engine):
+    engine.paper = False
+    engine.aster = _AsterStub(
+        [{"symbol": "BTCUSDT", "positionAmt": "-10", "entryPrice": "100.0"}]
+    )
+    engine.mexc = _MexcStub([{"asset": "BTC", "free": "0", "locked": "0"}], [])
+    msg = await engine._cmd_adopt({"symbol": "BTC"})
+    assert "no BTC spot held" in msg
+    assert engine.positions.active() == []
+
+
+async def test_adopt_refuses_in_paper_mode(engine):
+    engine.paper = True
+    msg = await engine._cmd_adopt({"symbol": "BTC"})
+    assert "LIVE" in msg
+    assert engine.positions.active() == []

@@ -38,6 +38,7 @@ HELP = """Commands:
 /status — engine heartbeat + open positions
 /positions — active positions detail (bot DB)
 /recon — live exchange P&L: pairs open on the venues now, full round-trip cost
+/adopt SYMBOL — import an existing venue carry trade as a managed position
 /book SYMBOL — top 5 order book levels on both venues
 /enter SYMBOL NOTIONAL [min_bps] [carry] — start maker entry (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close)
 /cancel ID|SYMBOL — abort a working entry
@@ -80,6 +81,7 @@ class ControlBot:
             {"command": "cancel", "description": "Cancel working entry: ID|SYMBOL"},
             {"command": "positions", "description": "Show open positions"},
             {"command": "recon", "description": "Live exchange P&L (round-trip cost)"},
+            {"command": "adopt", "description": "Import venue carry trade: SYMBOL"},
             {"command": "book", "description": "Order book both venues: SYMBOL"},
             {"command": "status", "description": "Engine status and heartbeat"},
             {"command": "pnl", "description": "Realised P&L summary"},
@@ -184,6 +186,10 @@ class ControlBot:
             if not args:
                 return "usage: /book SYMBOL"
             return await self._queue_and_wait("book", {"symbol": args[0]}, wait=15)
+        if command == "adopt":
+            if not args:
+                return "usage: /adopt SYMBOL (import an existing venue carry trade)"
+            return await self._queue_and_wait("adopt", {"symbol": args[0]}, wait=25)
         if command == "trades":
             return self._cmd_trades(args)
         if command == "pnl":

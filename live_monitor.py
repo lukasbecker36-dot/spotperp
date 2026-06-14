@@ -371,6 +371,8 @@ class Engine:
                 return await self._cmd_recon()
             if command == "book":
                 return await self._cmd_book(args)
+            if command == "adopt":
+                return await self._cmd_adopt(args)
             return f"unknown command: {command}"
         except Exception as exc:
             log.exception("command %s failed", command)
@@ -498,6 +500,104 @@ class Engine:
         except ExchangeError as exc:
             return f"{symbol}: book fetch failed ({exc})"
         return book.format_book(symbol, pair.qty_multiplier, aster_depth, mexc_depth)
+
+    async def _cmd_adopt(self, args: dict) -> str:
+        """Import an existing on-venue short-perp / long-spot carry trade into
+        the bot's DB as an OPEN carry position, so it can be closed via /exit.
+        Reconstructs perp leg from Aster positionRisk and spot leg from MEXC
+        balance + myTrades. Live mode only."""
+        if self.paper:
+            return "adopt needs LIVE mode (engine is in paper) — these are real positions"
+        symbol = str(args.get("symbol", "")).upper()
+        if not symbol:
+            return "usage: /adopt SYMBOL"
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        pair = self.md.pair_maps.get(symbol)
+        if pair is None:
+            return f"{symbol} is not cross-listed (no Aster perp + MEXC spot pair)"
+        if any(p.symbol == symbol for p in self.positions.active()):
+            return f"{symbol} is already an active bot position"
+        info = self.md.mexc_info.get(pair.mexc_symbol)
+        if info is None:
+            return f"{symbol}: no MEXC symbol info"
+
+        try:
+            risk = await self.aster.position_risk()
+            account = await self.mexc.account()
+        except ExchangeError as exc:
+            return f"adopt needs live API access: {exc}"
+
+        perp_row = next(
+            (r for r in risk
+             if r.get("symbol") == pair.aster_symbol
+             and Decimal(str(r.get("positionAmt", "0"))) < 0),
+            None,
+        )
+        if perp_row is None:
+            return f"{symbol}: no short perp position on Aster to adopt"
+        perp_qty = abs(Decimal(str(perp_row.get("positionAmt", "0"))))
+        perp_entry = Decimal(str(perp_row.get("entryPrice", "0")))
+        perp_base = perp_qty * pair.qty_multiplier
+
+        base = info.base_asset
+        balance = Decimal(0)
+        for b in account.get("balances", []):
+            if b.get("asset") == base:
+                balance = _dec_or_zero(b.get("free")) + _dec_or_zero(b.get("locked"))
+                break
+        spot_qty = info.round_qty(min(balance, perp_base))
+        if spot_qty <= 0:
+            return (f"{symbol}: short perp but no {base} spot held on MEXC —"
+                    f" can't adopt as a hedged position (the LYN case)")
+
+        try:
+            trades = await self.mexc.my_trades(pair.mexc_symbol, limit=200)
+        except ExchangeError:
+            trades = []
+        rec = recon.reconstruct_spot_entry(trades, spot_qty)
+        if rec is not None:
+            spot_entry, earliest_ms, covered = rec
+        else:
+            spot_entry, earliest_ms, covered = perp_entry / pair.qty_multiplier, None, False
+
+        notional = spot_qty * spot_entry
+        pos = self.positions.create(
+            symbol, notional, paper=False, trade_kind="carry",
+        )
+        # Reconstruct the entry legs (fees unknown/already paid -> 0).
+        self.positions.record_fill(
+            pos.id, "aster", "entry", "SELL", perp_qty, perp_entry, Decimal(0)
+        )
+        self.positions.record_fill(
+            pos.id, "mexc", "entry", "BUY", spot_qty, spot_entry, Decimal(0)
+        )
+        entry_basis = (
+            (perp_entry / pair.qty_multiplier - spot_entry) / spot_entry * Decimal(10000)
+        )
+        self.positions.set_state(pos.id, pm.OPEN, "adopted from venue")
+        opened = earliest_ms or int(time.time() * 1000)
+        self.conn.execute(
+            "UPDATE positions SET opened_ms=?, entry_basis_bps=? WHERE id=?",
+            (opened, str(entry_basis), pos.id),
+        )
+        self.conn.commit()
+        journal(
+            self.conn,
+            f"position {pos.id}: ADOPTED {symbol} perp={perp_qty} spot={spot_qty}"
+            f" entry_basis={entry_basis:.1f}",
+        )
+        imbalance = spot_qty - perp_base
+        warn = ""
+        if abs(imbalance) > perp_base * Decimal("0.02"):
+            warn = f"\n⚠️ hedge imbalance: {float(imbalance):+.4f} {base} (perp vs spot)"
+        est = " (entry price estimated — short trade history)" if not covered else ""
+        return (
+            f"adopted #{pos.id} {symbol} [carry]: perp -{perp_qty} @ {perp_entry}"
+            f" / spot {spot_qty} @ {spot_entry}{est}\n"
+            f"entry basis {float(entry_basis):.1f}bps — close via /exit {pos.id}"
+            f"{warn}"
+        )
 
     async def _cmd_recon(self) -> str:
         """Value the short-perp / long-spot pairs actually open on the venues
