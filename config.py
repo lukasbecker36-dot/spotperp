@@ -60,7 +60,6 @@ ADVERSE_WIDEN_STOP_BPS: Decimal | None = (
 # right after entry just because their bid-side basis is structurally low.
 CONVERGED_TP_BPS = Decimal("-50.0")
 MAX_HOLD_HOURS = 168                     # 1 week max hold
-MAX_CONCURRENT_POSITIONS = 3
 # Aster perp margin applied to each symbol before its first live entry: 1x
 # isolated keeps the short fully margined (liquidation only on a ~100% move),
 # matching the fully-funded-perp capital model and the no-adverse-stop choice.

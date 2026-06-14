@@ -425,8 +425,6 @@ class Engine:
         if notional <= 0 or notional > config.MAX_NOTIONAL_PER_LEG_USD:
             return f"notional must be in (0, {config.MAX_NOTIONAL_PER_LEG_USD}]"
         active = [p for p in self.positions.active() if p.state != pm.UNWINDING]
-        if len(active) >= config.MAX_CONCURRENT_POSITIONS:
-            return f"max concurrent positions reached ({config.MAX_CONCURRENT_POSITIONS})"
         if any(p.symbol == symbol for p in active):
             return f"already have an active position in {symbol}"
         min_bps = (
