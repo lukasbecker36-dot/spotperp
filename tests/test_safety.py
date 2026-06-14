@@ -199,6 +199,27 @@ class _MexcStub:
         return self._trades
 
 
+async def test_cancel_stops_working_exit(engine):
+    pos_id = await open_position(engine)
+    # Passive exit gated (close ~50bps > target 5) -> sits EXITING, no fills.
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    engine.positions.set_exit_request(pos_id, "passive", Decimal(5))
+    engine.executor.start_exit(engine.positions.get(pos_id))
+    for _ in range(50):
+        if engine.positions.get(pos_id).state == pm.EXITING:
+            break
+        await asyncio.sleep(0.02)
+    assert engine.positions.get(pos_id).state == pm.EXITING
+
+    msg = engine._cmd_cancel({"position_id": str(pos_id)})
+    assert "cancelled" in msg
+    await asyncio.sleep(0.05)
+    p = engine.positions.get(pos_id)
+    assert p.state == pm.OPEN
+    assert p.exit_mode is None
+    assert p.perp_qty == Decimal("9.95")  # nothing was closed
+
+
 async def test_adopt_creates_managed_carry_position(engine):
     engine.paper = False
     engine.aster = _AsterStub(

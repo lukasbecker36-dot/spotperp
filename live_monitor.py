@@ -482,12 +482,7 @@ class Engine:
             return f"position {pos.id} is {pos.state}, cannot exit"
         mode = args.get("mode", "now")
         if mode == "cancel":
-            task = self.executor._tasks.get(pos.id)
-            if task and not task.done():
-                task.cancel()
-            self.positions.set_exit_request(pos.id, None, None)
-            self.positions.set_state(pos.id, pm.OPEN, "exit cancelled by operator")
-            return f"position {pos.id}: exit cancelled, back to OPEN"
+            return self._cancel_exit(pos)
         target = args.get("target_bps")
         target_dec = Decimal(str(target)) if target is not None else (
             config.EXIT_BASIS_BPS if mode == "passive" else None
@@ -514,13 +509,28 @@ class Engine:
         )
         return f"position {pos.id}: exit started — {desc}, size {size_desc}"
 
+    def _cancel_exit(self, pos: pm.Position) -> str:
+        """Stop a working exit: cancel the task (its cleanup pulls any resting
+        maker order and balances the legs) and return the position to OPEN."""
+        if pos.state != pm.EXITING and pos.exit_mode is None:
+            return f"position {pos.id} has no working exit"
+        task = self.executor._tasks.get(pos.id)
+        if task and not task.done():
+            task.cancel()
+        self.positions.set_exit_request(pos.id, None, None)
+        self.positions.set_state(pos.id, pm.OPEN, "exit cancelled by operator")
+        return f"position {pos.id}: exit cancelled, back to OPEN"
+
     def _cmd_cancel(self, args: dict) -> str:
         pos = self._resolve_position(args["position_id"])
         if isinstance(pos, str):
             return pos
+        # /cancel handles whatever is working: an exit if EXITING, else an entry.
+        if pos.state == pm.EXITING:
+            return self._cancel_exit(pos)
         if self.executor.request_cancel(pos.id):
             return f"position {pos.id}: entry cancel requested"
-        return f"position {pos.id}: no working entry task"
+        return f"position {pos.id}: no working entry or exit to cancel"
 
     def _cmd_flatten(self) -> str:
         count = 0

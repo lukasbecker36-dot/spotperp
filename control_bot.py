@@ -42,7 +42,7 @@ HELP = """Commands:
 /adopt SYMBOL — import an existing venue carry trade as a managed position
 /book SYMBOL — top 5 order book levels on both venues
 /enter SYMBOL NOTIONAL [min_bps] [carry] — start maker entry (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close)
-/cancel ID|SYMBOL — abort a working entry
+/cancel ID|SYMBOL — stop a working entry OR exit, back to OPEN
 /exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins, omit=full
 /exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins, omit=full
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
@@ -79,7 +79,7 @@ class ControlBot:
             {"command": "funding", "description": "Top funding carry (24h avg)"},
             {"command": "enter", "description": "Enter: SYMBOL NOTIONAL [min_bps] [carry]"},
             {"command": "exit", "description": "Exit: ID|SYMBOL now|passive [bps]"},
-            {"command": "cancel", "description": "Cancel working entry: ID|SYMBOL"},
+            {"command": "cancel", "description": "Cancel working entry or exit: ID|SYMBOL"},
             {"command": "positions", "description": "Show open positions"},
             {"command": "balance", "description": "USDT balance on each venue"},
             {"command": "recon", "description": "Live exchange P&L (round-trip cost)"},
