@@ -76,6 +76,7 @@ FUNDING_HISTORY_LIMIT = 30               # prints per symbol (>= 24h on 1h fundi
 COMMAND_POLL_SECONDS = 1.0
 ORDER_STATUS_POLL_SECONDS = 2.0
 REPRICE_MIN_INTERVAL_SECONDS = 3.0       # don't cancel/replace faster than this
+PASSIVE_UNREACHABLE_ALERT_SECONDS = 600  # throttle "passive target unreachable" alerts
 # Default basis floor while an entry works: stop resting/repricing when the
 # executable basis decays below cost breakeven (fees + slippage buffer), so a
 # falling perp ask can't walk the order down into an unprofitable entry.

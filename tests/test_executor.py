@@ -330,6 +330,45 @@ async def test_partial_then_full_exit_closes(env):
     assert final.realized_pnl_usd is not None
 
 
+async def test_passive_exit_holds_when_depth_missing(env):
+    """Regression (BANK -0.43): an empty spot_depth reply must NOT bypass the
+    close-size cap and dump the whole position. With a target set and no live
+    depth, the protected exit places nothing and stays EXITING."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    # Gate OPEN for target 0: aster bid == mexc bid -> close basis 0, not gated.
+    set_books(md, "99.9", "100.0", "99.9", "100.0")
+
+    async def empty_depth(symbol, side, limit=20):
+        return []
+    executor._trader.spot_depth = empty_depth
+
+    positions.set_exit_request(pos_id, "passive", Decimal(0))
+    executor.start_exit(positions.get(pos_id))
+    await asyncio.sleep(0.3)
+    p = positions.get(pos_id)
+    assert p.state == pm.EXITING            # still working, NOT closed
+    assert p.perp_qty == Decimal("9.95")    # nothing dumped at market
+
+
+async def test_passive_exit_alerts_when_target_below_min_notional(env):
+    """When the spot bid depth at the target only supports a sub-min-notional
+    buy-back, don't spam rejects/dump — alert that the target is unreachable
+    and keep the position open."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    # converged (close ~10bps < target 15, not gated) but only 0.01 on the bid:
+    # closeable size is well below the $5 min order.
+    set_books(md, "100.0", "100.1", "99.9", "100.0", mexc_bid_qty="0.01")
+    positions.set_exit_request(pos_id, "passive", Decimal(15))
+    executor.start_exit(positions.get(pos_id))
+    await asyncio.sleep(0.3)
+    p = positions.get(pos_id)
+    assert p.state == pm.EXITING
+    assert p.perp_qty == Decimal("9.95")    # nothing closed
+    assert any("not reachable" in m for m in notifier.messages)
+
+
 async def test_aggressive_exit_closes_immediately(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)

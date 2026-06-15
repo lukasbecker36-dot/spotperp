@@ -894,6 +894,7 @@ class Executor:
         order_qty = Decimal(0)         # size the resting buy-back was placed with
         order_seen_executed = Decimal(0)
         last_reprice = 0.0
+        last_unreachable_alert = 0.0   # throttle "target unreachable" notices
         to_sell = Decimal(0)   # spot base units pending sale after perp buy-backs
 
         async def absorb_fills(result: OrderResult) -> None:
@@ -961,24 +962,55 @@ class Executor:
                 # the bid book) without the close basis exceeding the target —
                 # the mirror of the entry sizing. Stops a thin spot bid from
                 # forcing the spot leg to sell through worse bids than the
-                # target implied. Depth unavailable / no target -> full size.
-                place_qty = remaining
-                if book is not None and target is not None:
-                    try:
-                        bids = await self._trader.spot_depth(pair.mexc_symbol, "SELL")
-                    except ExchangeError:
-                        bids = []
-                    if bids:
-                        closeable = max_closeable_qty(
-                            price / pair.qty_multiplier, bids, target
-                        )
-                        place_qty = min(
-                            remaining,
-                            aster_info.round_qty(closeable / pair.qty_multiplier),
-                        )
+                # target implied.
+                #
+                # A PROTECTED exit (target set) must NEVER fall through to full
+                # size when depth is missing: an empty/failed spot_depth reply
+                # once dumped a whole position at market (BANK, realised +134bps
+                # vs a target of 0). So with a target we size to ZERO unless we
+                # have live depth proving the spot leg can sell at the target.
+                # Only an untargeted "work it at any basis" exit closes full.
+                if target is None:
+                    place_qty = remaining
+                else:
+                    place_qty = Decimal(0)
+                    if book is not None:
+                        try:
+                            bids = await self._trader.spot_depth(pair.mexc_symbol, "SELL")
+                        except ExchangeError:
+                            bids = []
+                        if bids:
+                            closeable = max_closeable_qty(
+                                price / pair.qty_multiplier, bids, target
+                            )
+                            place_qty = min(
+                                remaining,
+                                aster_info.round_qty(closeable / pair.qty_multiplier),
+                            )
 
                 if order_id is None:
-                    if book is not None and not gated and place_qty >= aster_info.step_size:
+                    placeable = (
+                        book is not None and not gated
+                        and place_qty >= aster_info.step_size
+                    )
+                    if placeable and place_qty * price < aster_info.min_notional:
+                        # Spot depth at the target only supports a sub-minimum
+                        # buy-back; Aster would reject it (-4164). Don't spam
+                        # attempts — surface that the target can't be met on the
+                        # current spot bid depth so the operator can loosen it
+                        # or close aggressively instead.
+                        placeable = False
+                        now = time.monotonic()
+                        if now - last_unreachable_alert > config.PASSIVE_UNREACHABLE_ALERT_SECONDS:
+                            last_unreachable_alert = now
+                            await self._notifier.alert(
+                                f"⏳ position {position.id} {symbol}: passive exit"
+                                f" target {target}bps not reachable — spot bid"
+                                f" depth at the target is below the"
+                                f" {aster_info.min_notional} min order. Loosen the"
+                                f" target or use /exit {position.id} now."
+                            )
+                    if placeable:
                         client_id = intents.make_client_order_id(position.id, "pext")
                         try:
                             order_id = await self._trader.place_perp_maker(
