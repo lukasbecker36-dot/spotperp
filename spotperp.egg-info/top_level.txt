@@ -1,12 +1,15 @@
 auth
+book
 config
 control_bot
 database
 exchange_client
 executor
+funding
 intents
 live_monitor
 notify
 position_manager
+recon
 recovery
 screener
