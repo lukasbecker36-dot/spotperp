@@ -89,6 +89,17 @@ ENTRY_TIMEOUT_MINUTES = 60
 EXIT_TIMEOUT_MINUTES = 30
 UNWIND_TIMEOUT_SECONDS = 60              # hard limit to flatten a naked leg
 HEDGE_RETRY_ATTEMPTS = 3
+# A resting maker perp leg is adverse-selected: it fills preferentially when
+# the spot has rallied and the basis has compressed, then the reactive taker
+# hedge locks that worse spot. So the realized entry basis can land well below
+# the resting floor. Before hedging each perp fill we re-price the basis the
+# hedge would ACTUALLY pay against fresh spot depth, and:
+#   - abort (unwind the perp increment, don't enter) if it is below
+#     floor - ENTRY_HEDGE_ABORT_BPS, so a severe collapse never enters;
+#   - alert (but still enter) if the final realized basis lands more than
+#     ENTRY_REALIZED_ALERT_BPS below the floor, so it is never a silent miss.
+ENTRY_HEDGE_ABORT_BPS = Decimal(os.environ.get("ENTRY_HEDGE_ABORT_BPS", "20"))
+ENTRY_REALIZED_ALERT_BPS = Decimal(os.environ.get("ENTRY_REALIZED_ALERT_BPS", "10"))
 # Buffer added past the live depth level that completes the hedge fill (the
 # IOC is priced to cross real resting depth up to the needed size, then this
 # buffer on top). Wider = surer fill on fast/thin names, at most this much

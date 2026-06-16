@@ -283,6 +283,17 @@ async def test_ensure_margin_skipped_in_paper(env):
     assert stub.calls == []
 
 
+async def wait_for_message(notifier, needle, timeout=5.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if any(needle in m for m in notifier.messages):
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"no alert containing {needle!r}; messages={notifier.messages}"
+    )
+
+
 async def wait_for_perp_qty(positions, position_id, qty, timeout=5.0):
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
@@ -362,11 +373,40 @@ async def test_passive_exit_alerts_when_target_below_min_notional(env):
     set_books(md, "100.0", "100.1", "99.9", "100.0", mexc_bid_qty="0.01")
     positions.set_exit_request(pos_id, "passive", Decimal(15))
     executor.start_exit(positions.get(pos_id))
-    await asyncio.sleep(0.3)
+    await wait_for_message(notifier, "not reachable")
     p = positions.get(pos_id)
     assert p.state == pm.EXITING
     assert p.perp_qty == Decimal("9.95")    # nothing closed
-    assert any("not reachable" in m for m in notifier.messages)
+
+
+async def test_entry_aborts_when_hedge_basis_collapses(env):
+    """Adverse-selection guard: the resting maker passes the floor at
+    placement, but by hedge time the spot has rallied and the executable
+    basis has collapsed below floor - abort band. The engine must unwind the
+    perp fill instead of locking a bad entry."""
+    md, positions, executor, notifier, conn = env
+    config.ENTRY_HEDGE_ABORT_BPS = Decimal(20)
+    # Gate sees +50bps (perp ask 100.5 vs spot ask 100.0) -> places at floor 30.
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    calls = {"n": 0}
+
+    async def flip_depth(symbol, side, limit=20):
+        # First call (placement-time hedgeable cap) sees good depth; by the
+        # hedge-time re-check the ask has rallied to ~100.49 (basis ~1bps).
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return [(Decimal("100.0"), Decimal(100))]
+        return [(Decimal("100.49"), Decimal(100))]
+    executor._trader.spot_depth = flip_depth
+
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True, min_entry_bps=Decimal(30))
+    executor.start_entry(pos)
+    await wait_for_message(notifier, "collapsed")
+    await wait_for_state(positions, pos.id, pm.CANCELLED)
+    final = positions.get(pos.id)
+    assert final.spot_qty == 0           # never hedged into the bad basis
+    assert final.perp_qty == 0           # perp fill was unwound
 
 
 async def test_aggressive_exit_closes_immediately(env):

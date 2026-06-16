@@ -468,6 +468,34 @@ class Executor:
         mult = self._pair(symbol).qty_multiplier
         return (aster.ask / mult - mexc.ask) / mexc.ask * BPS
 
+    async def _live_hedge_basis_bps(
+        self, perp_price: Decimal, mexc_symbol: str, base_qty: Decimal,
+        mult: Decimal,
+    ) -> Decimal | None:
+        """Executable entry basis the spot hedge would ACTUALLY realise: the
+        perp fill price vs the VWAP of buying base_qty by walking fresh MEXC
+        asks. None if depth is unavailable. Unlike the placement-time gate this
+        re-prices against the book at the moment of hedging, catching the spot
+        drift / depth-walk that adverse-selects a resting maker entry."""
+        try:
+            asks = await self._trader.spot_depth(mexc_symbol, "BUY")
+        except ExchangeError:
+            asks = []
+        if not asks or base_qty <= 0:
+            return None
+        cum = Decimal(0)
+        cost = Decimal(0)
+        for px, qty in asks:
+            take = min(qty, base_qty - cum)
+            cost += take * px
+            cum += take
+            if cum >= base_qty:
+                break
+        if cum <= 0:
+            return None
+        vwap = cost / cum
+        return (perp_price / mult - vwap) / vwap * BPS
+
     def _close_basis_bps(self, symbol: str) -> Decimal | None:
         aster, mexc = self._books(symbol)
         if aster is None or mexc is None:
@@ -658,6 +686,7 @@ class Executor:
         order_qty = Decimal(0)         # size the resting maker was placed with
         order_seen_executed = Decimal(0)
         last_reprice = 0.0
+        aborted = False                # hedge-time basis collapse -> stop entry
 
         async def absorb_fills(result: OrderResult) -> None:
             nonlocal remaining, unhedged, order_seen_executed
@@ -674,7 +703,7 @@ class Executor:
             unhedged += delta
 
         async def hedge_unhedged(force: bool = False) -> None:
-            nonlocal unhedged
+            nonlocal unhedged, aborted
             if unhedged <= 0:
                 return
             book = self._md.mexc_books.get(pair.mexc_symbol)
@@ -682,6 +711,32 @@ class Executor:
             notional = unhedged * pair.qty_multiplier * ref_price
             if not force and notional < config.MIN_HEDGE_NOTIONAL_USD:
                 return  # accumulate dust
+
+            # Re-price the basis the hedge will actually pay against fresh spot
+            # depth. A resting maker fills adverse-selected (spot has rallied,
+            # basis compressed); if it has collapsed below the floor by more
+            # than the abort band, don't lock a bad entry — unwind this perp
+            # increment instead. order_price is where the perp leg filled.
+            perp_ref = order_price if order_price > 0 else ref_price
+            live_basis = await self._live_hedge_basis_bps(
+                perp_ref, pair.mexc_symbol,
+                unhedged * pair.qty_multiplier, pair.qty_multiplier,
+            )
+            if (
+                live_basis is not None
+                and live_basis < entry_floor - config.ENTRY_HEDGE_ABORT_BPS
+            ):
+                naked = unhedged
+                unhedged = Decimal(0)
+                aborted = True
+                await self._notifier.alert(
+                    f"🛑 position {position.id} {symbol}: entry basis collapsed to"
+                    f" {live_basis:.1f}bps (floor {entry_floor}bps) by hedge time"
+                    f" — unwinding {naked} perp units instead of entering"
+                )
+                await self._unwind_perp(position, naked)
+                return
+
             shortfall, err = await self._hedge_spot(
                 position, "BUY", unhedged * pair.qty_multiplier, "entry"
             )
@@ -700,7 +755,7 @@ class Executor:
                 cancelled = position.id in self._cancel_requested
                 timed_out = time.monotonic() > deadline
                 done = remaining < aster_info.step_size
-                if cancelled or timed_out or done:
+                if cancelled or timed_out or done or aborted:
                     if order_id is not None:
                         result = await self._trader.cancel_perp_order(
                             pair.aster_symbol, order_id
@@ -804,6 +859,17 @@ class Executor:
                 f" entry basis={entry_basis if entry_basis is None else round(float(entry_basis), 2)}bps"
                 f" ({'paper' if self._paper else 'LIVE'})"
             )
+            if (
+                entry_basis is not None
+                and entry_basis < entry_floor - config.ENTRY_REALIZED_ALERT_BPS
+            ):
+                await self._notifier.alert(
+                    f"⚠️ position {position.id} {symbol}: realized entry basis"
+                    f" {round(float(entry_basis), 2)}bps is well below your"
+                    f" {entry_floor}bps floor — the resting perp leg was"
+                    f" adverse-selected as spot rallied. Consider a higher floor"
+                    f" or a more liquid name."
+                )
         else:
             self._positions.set_state(position.id, pm.CANCELLED, "no fills")
             journal(self._conn, f"position {position.id}: entry ended with no fills")
