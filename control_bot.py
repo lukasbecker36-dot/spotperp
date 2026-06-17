@@ -41,7 +41,7 @@ HELP = """Commands:
 /recon — live exchange P&L: pairs open on the venues now, full round-trip cost
 /adopt SYMBOL — import an existing venue carry trade as a managed position
 /book SYMBOL — top 5 order book levels on both venues
-/enter SYMBOL NOTIONAL [min_bps] [carry] — start maker entry (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close)
+/enter SYMBOL NOTIONAL [min_bps] [carry] — start maker entry, or size up an already-OPEN position by NOTIONAL (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close)
 /cancel ID|SYMBOL — stop a working entry OR exit, back to OPEN
 /exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins, omit=full
 /exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins, omit=full
@@ -379,7 +379,9 @@ class ControlBot:
                     "min_bps = basis floor while the entry works"
                     " (default: fee breakeven)\n"
                     "carry = funding-carry trade: no auto-close, /exit only"
-                    " (default is a convergence trade that auto-closes)")
+                    " (default is a convergence trade that auto-closes)\n"
+                    "if a position in SYMBOL is already OPEN, this sizes it up"
+                    " by NOTIONAL instead of opening a new one")
         try:
             notional = Decimal(args[1])
         except InvalidOperation:

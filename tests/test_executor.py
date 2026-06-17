@@ -123,6 +123,57 @@ async def test_entry_cancel_on_already_filled(env):
     assert final.state == pm.OPEN
 
 
+async def test_start_add_grows_open_position(env):
+    """Sizing up an OPEN position: start_add works another maker entry for the
+    incremental notional, folding fills into the same position with a blended
+    average — not a second position."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    before = positions.get(pos_id)
+    assert before.perp_qty == Decimal("9.95")          # $1000 / 100.5
+
+    # Same +50bps book; add $500 -> ~4.975 more contracts at 100.5.
+    positions.add_target_notional(pos_id, Decimal(500))
+    executor.start_add(positions.get(pos_id), Decimal(500))
+    await wait_for_message(notifier, "added")
+    await wait_for_state(positions, pos_id, pm.OPEN)
+
+    final = positions.get(pos_id)
+    assert final.perp_qty == Decimal("14.925")
+    assert final.state == pm.OPEN
+    assert final.target_notional == Decimal(1500)
+    assert final.spot_qty == final.perp_qty            # still fully hedged
+    assert final.perp_entry_avg == Decimal("100.5")    # blended (same price)
+    assert final.entry_basis_bps == pytest.approx(Decimal(50), abs=Decimal("0.5"))
+    # still one position in the symbol
+    assert len([p for p in positions.active() if p.symbol == "BTCUSDT"]) == 1
+    assert any("added" in m for m in notifier.messages)
+
+
+async def test_add_no_fill_leaves_position_open(env):
+    """An add that can't fill (basis below its floor) must leave the prior
+    exposure OPEN and unchanged — never CANCEL the position."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    before = positions.get(pos_id)
+
+    # Floor above the live 50bps basis so the add never places.
+    positions.set_min_entry_bps(pos_id, Decimal(80))
+    positions.add_target_notional(pos_id, Decimal(500))
+    # Short entry timeout so the no-fill add returns quickly.
+    old = config.ENTRY_TIMEOUT_MINUTES
+    config.ENTRY_TIMEOUT_MINUTES = 0
+    try:
+        executor.start_add(positions.get(pos_id), Decimal(500))
+        await wait_for_message(notifier, "filled nothing")
+    finally:
+        config.ENTRY_TIMEOUT_MINUTES = old
+
+    final = positions.get(pos_id)
+    assert final.state == pm.OPEN
+    assert final.perp_qty == before.perp_qty           # unchanged
+
+
 async def test_passive_exit_closes_with_pnl(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)

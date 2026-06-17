@@ -415,6 +415,11 @@ class Executor:
     def start_entry(self, position: pm.Position) -> None:
         self._spawn(position.id, self._run_entry(position))
 
+    def start_add(self, position: pm.Position, add_notional: Decimal) -> None:
+        """Size up an already-OPEN position: work another maker entry for the
+        incremental notional, folding the fills into the same position."""
+        self._spawn(position.id, self._run_entry(position, add_notional=add_notional))
+
     def start_exit(self, position: pm.Position) -> None:
         existing = self._tasks.get(position.id)
         if existing and not existing.done():
@@ -656,22 +661,41 @@ class Executor:
                 f" ({err}) — check margin/leverage manually before relying on it"
             )
 
-    async def _run_entry(self, position: pm.Position) -> None:
+    async def _run_entry(
+        self, position: pm.Position, *, add_notional: Decimal | None = None
+    ) -> None:
         symbol = position.symbol
         pair = self._pair(symbol)
         aster_info = self._md.aster_info[pair.aster_symbol]
+        # An add works on a position that already holds exposure: target only
+        # the incremental notional, and on a no-fill outcome leave the prior
+        # exposure OPEN rather than CANCELling it.
+        is_add = add_notional is not None
+        leg_notional = add_notional if is_add else position.target_notional
+        had_exposure = position.perp_qty > 0 or position.spot_qty > 0
         self._positions.set_state(position.id, pm.ENTERING)
-        journal(self._conn, f"position {position.id}: entering {symbol}"
-                f" notional={position.target_notional}")
+        journal(self._conn, f"position {position.id}:"
+                f" {'adding to' if is_add else 'entering'} {symbol}"
+                f" notional={leg_notional}")
         await self._ensure_margin(position, pair.aster_symbol)
 
         aster_book, _ = self._books(symbol)
         if aster_book is None:
-            self._positions.set_state(position.id, pm.CANCELLED, "no quotes")
+            if had_exposure:
+                self._positions.set_state(position.id, pm.OPEN, "add aborted: no quotes")
+            else:
+                self._positions.set_state(position.id, pm.CANCELLED, "no quotes")
             return
-        total_qty = aster_info.round_qty(position.target_notional / aster_book.ask)
+        total_qty = aster_info.round_qty(leg_notional / aster_book.ask)
         if total_qty <= 0:
-            self._positions.set_state(position.id, pm.CANCELLED, "notional below lot size")
+            if had_exposure:
+                self._positions.set_state(
+                    position.id, pm.OPEN, "add below lot size"
+                )
+            else:
+                self._positions.set_state(
+                    position.id, pm.CANCELLED, "notional below lot size"
+                )
             return
 
         entry_floor = (
@@ -680,6 +704,7 @@ class Executor:
         )
         deadline = time.monotonic() + config.ENTRY_TIMEOUT_MINUTES * 60
         remaining = total_qty
+        run_filled = Decimal(0)        # perp contracts filled by THIS run (add-aware)
         unhedged = Decimal(0)          # perp filled, spot not yet bought
         order_id: str | None = None
         order_price = Decimal(0)
@@ -689,12 +714,13 @@ class Executor:
         aborted = False                # hedge-time basis collapse -> stop entry
 
         async def absorb_fills(result: OrderResult) -> None:
-            nonlocal remaining, unhedged, order_seen_executed
+            nonlocal remaining, unhedged, order_seen_executed, run_filled
             delta = result.executed_qty - order_seen_executed
             if delta <= 0:
                 return
             order_seen_executed = result.executed_qty
             remaining -= delta
+            run_filled += delta
             price = result.avg_price if result.avg_price > 0 else result.price
             self._positions.record_fill(
                 position.id, "aster", "entry", "SELL", delta, price,
@@ -782,7 +808,9 @@ class Executor:
                 target_qty = aster_info.round_qty(remaining)
                 if edge_ok or order_id is not None:
                     try:
-                        asks = await self._trader.spot_depth(pair.mexc_symbol, "BUY")
+                        asks = await self._trader.spot_depth(
+                            pair.mexc_symbol, "BUY", config.ENTRY_DEPTH_LEVELS
+                        )
                     except ExchangeError:
                         asks = []
                     if asks:
@@ -852,15 +880,39 @@ class Executor:
             )
             self._conn.commit()
             self._positions.set_state(position.id, pm.OPEN)
-            journal(self._conn, f"position {position.id}: OPEN perp={final.perp_qty}"
-                    f" spot={final.spot_qty} entry_basis={entry_basis}")
-            await self._notifier.alert(
-                f"✅ position {position.id} {symbol} OPEN: qty={final.perp_qty},"
-                f" entry basis={entry_basis if entry_basis is None else round(float(entry_basis), 2)}bps"
-                f" ({'paper' if self._paper else 'LIVE'})"
+            basis_str = (
+                "n/a" if entry_basis is None else f"{round(float(entry_basis), 2)}bps"
             )
+            if is_add and run_filled > 0:
+                journal(self._conn, f"position {position.id}: ADD +{run_filled} ->"
+                        f" perp={final.perp_qty} spot={final.spot_qty}"
+                        f" blended_basis={entry_basis}")
+                await self._notifier.alert(
+                    f"➕ position {position.id} {symbol}: added {run_filled} perp"
+                    f" units (total qty={final.perp_qty}), blended entry"
+                    f" basis={basis_str} ({'paper' if self._paper else 'LIVE'})"
+                )
+            elif is_add:
+                # Add worked but nothing filled (floor never met / timed out):
+                # the position is unchanged, still OPEN.
+                journal(self._conn, f"position {position.id}: add ended with no"
+                        f" additional fills (perp={final.perp_qty})")
+                await self._notifier.alert(
+                    f"position {position.id} {symbol}: add filled nothing"
+                    f" (basis stayed below floor / timed out) — position unchanged"
+                )
+            else:
+                journal(self._conn, f"position {position.id}: OPEN perp={final.perp_qty}"
+                        f" spot={final.spot_qty} entry_basis={entry_basis}")
+                await self._notifier.alert(
+                    f"✅ position {position.id} {symbol} OPEN: qty={final.perp_qty},"
+                    f" entry basis={basis_str}"
+                    f" ({'paper' if self._paper else 'LIVE'})"
+                )
             if (
-                entry_basis is not None
+                not is_add
+                and run_filled > 0
+                and entry_basis is not None
                 and entry_basis < entry_floor - config.ENTRY_REALIZED_ALERT_BPS
             ):
                 await self._notifier.alert(

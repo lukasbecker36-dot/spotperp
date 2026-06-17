@@ -181,6 +181,23 @@ class PositionManager:
         )
         self._conn.commit()
 
+    def add_target_notional(self, position_id: int, amount_usd: Decimal) -> None:
+        """Grow the target notional when sizing up an existing position."""
+        pos = self.get(position_id)
+        self._conn.execute(
+            "UPDATE positions SET target_notional=?, updated_ms=? WHERE id=?",
+            (str(pos.target_notional + amount_usd), _now_ms(), position_id),
+        )
+        self._conn.commit()
+
+    def set_min_entry_bps(self, position_id: int, min_bps: Decimal | None) -> None:
+        """Update the basis floor used while an entry/add works."""
+        self._conn.execute(
+            "UPDATE positions SET min_entry_bps=?, updated_ms=? WHERE id=?",
+            (str(min_bps) if min_bps is not None else None, _now_ms(), position_id),
+        )
+        self._conn.commit()
+
     def add_funding(self, position_id: int, amount_usd: Decimal) -> None:
         pos = self.get(position_id)
         self._conn.execute(

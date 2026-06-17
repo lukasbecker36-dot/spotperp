@@ -426,13 +426,45 @@ class Engine:
             return f"{symbol} is not cross-listed (no Aster perp + MEXC spot pair)"
         if notional <= 0 or notional > config.MAX_NOTIONAL_PER_LEG_USD:
             return f"notional must be in (0, {config.MAX_NOTIONAL_PER_LEG_USD}]"
-        active = [p for p in self.positions.active() if p.state != pm.UNWINDING]
-        if any(p.symbol == symbol for p in active):
-            return f"already have an active position in {symbol}"
         min_bps = (
             Decimal(str(args["min_bps"])) if args.get("min_bps") is not None else None
         )
         kind = "carry" if str(args.get("kind", "")).lower() == "carry" else "convergence"
+
+        # Size up an existing position rather than rejecting it.
+        existing = [
+            p for p in self.positions.active()
+            if p.symbol == symbol and p.state != pm.UNWINDING
+        ]
+        if existing:
+            if len(existing) > 1:
+                ids = ", ".join(str(p.id) for p in existing)
+                return (f"multiple active positions in {symbol} (ids {ids})"
+                        f" — can't auto-add, manage them by ID")
+            pos = existing[0]
+            if pos.state != pm.OPEN:
+                return (f"{symbol} position #{pos.id} is {pos.state} (still working)"
+                        f" — wait for it to settle or /cancel {pos.id} first")
+            new_total = pos.target_notional + notional
+            if new_total > config.MAX_NOTIONAL_PER_LEG_USD:
+                return (f"add would take {symbol} to ${new_total} notional, over the"
+                        f" ${config.MAX_NOTIONAL_PER_LEG_USD} per-leg cap")
+            if min_bps is not None:
+                self.positions.set_min_entry_bps(pos.id, min_bps)
+            self.positions.add_target_notional(pos.id, notional)
+            pos = self.positions.get(pos.id)
+            self.executor.start_add(pos, notional)
+            floor = (
+                min_bps if min_bps is not None
+                else (pos.min_entry_bps if pos.min_entry_bps is not None
+                      else config.ENTRY_MIN_EDGE_FLOOR_BPS)
+            )
+            return (
+                f"sizing up #{pos.id} {symbol} [{pos.trade_kind}]: adding ${notional}"
+                f" (target now ${pos.target_notional}) — SELL perp (maker) / BUY spot"
+                f" on fill, basis floor {float(floor):.1f}bps"
+            )
+
         pos = self.positions.create(
             symbol, notional, paper=self.paper, min_entry_bps=min_bps,
             trade_kind=kind,

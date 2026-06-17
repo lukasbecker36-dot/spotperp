@@ -106,6 +106,12 @@ ENTRY_REALIZED_ALERT_BPS = Decimal(os.environ.get("ENTRY_REALIZED_ALERT_BPS", "1
 # extra slippage. 10bps off the cached touch was too tight for microcaps.
 HEDGE_SLIPPAGE_BPS = Decimal("25.0")
 MIN_HEDGE_NOTIONAL_USD = Decimal("5")    # accumulate partial fills below this
+# Spot book levels fetched when sizing an entry/hedge. The taker leg walks
+# DOWN the ask book past top-of-book as long as the volume-weighted basis
+# still clears the floor (see max_hedgeable_qty), so a deeper fetch lets a
+# single placement absorb more size on a thin top-of-book name. 20 was the
+# old default; 50 reaches well past the touch without a heavy depth payload.
+ENTRY_DEPTH_LEVELS = int(os.environ.get("ENTRY_DEPTH_LEVELS", "50"))
 
 # ── Funding ──
 FUNDING_INTERVAL_HOURS = 8
