@@ -820,6 +820,16 @@ class Executor:
                         cap = aster_info.round_qty(hedgeable / pair.qty_multiplier)
                         target_qty = min(target_qty, cap)
 
+                # Cap each resting clip to bound adverse-selection blast radius:
+                # a single taker sweep can only catch one clip before the next
+                # tick re-checks the (now-collapsed) basis and stops resting.
+                if config.ENTRY_MAX_CLIP_NOTIONAL_USD is not None and price > 0:
+                    clip = aster_info.round_qty(
+                        config.ENTRY_MAX_CLIP_NOTIONAL_USD / price
+                    )
+                    if clip >= aster_info.step_size:
+                        target_qty = min(target_qty, clip)
+
                 if order_id is None:
                     if edge_ok and target_qty >= aster_info.step_size:
                         client_id = intents.make_client_order_id(position.id, "pent")

@@ -112,6 +112,18 @@ MIN_HEDGE_NOTIONAL_USD = Decimal("5")    # accumulate partial fills below this
 # single placement absorb more size on a thin top-of-book name. 20 was the
 # old default; 50 reaches well past the touch without a heavy depth payload.
 ENTRY_DEPTH_LEVELS = int(os.environ.get("ENTRY_DEPTH_LEVELS", "50"))
+# Largest notional rested in a SINGLE perp maker clip. The hedgeable-size cap
+# can legitimately rest a big order when spot is deep, but a resting maker is
+# adverse-selected: a violent taker sweep fills the whole clip in one tick at
+# the exact moment the basis collapses, and the hedge-abort guard then unwinds
+# all of it as a taker at a loss (ASTEROID: one 902k clip swept -> -40.7bps ->
+# -3.70 unwind). Capping the clip limits that blast radius — a sweep catches at
+# most one clip, then edge_ok goes false and the remainder never rests. None
+# (default) keeps the old single-order behaviour; set e.g. 100 to chunk entries.
+ENTRY_MAX_CLIP_NOTIONAL_USD: Decimal | None = (
+    Decimal(os.environ["ENTRY_MAX_CLIP_NOTIONAL_USD"])
+    if os.environ.get("ENTRY_MAX_CLIP_NOTIONAL_USD") else None
+)
 
 # ── Funding ──
 FUNDING_INTERVAL_HOURS = 8

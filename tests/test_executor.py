@@ -196,6 +196,33 @@ async def test_passive_exit_closes_with_pnl(env):
     assert final.realized_pnl_usd > gross - Decimal("2")
 
 
+async def test_entry_clip_cap_bounds_each_maker_order(env, monkeypatch):
+    """With a per-clip notional cap, no single resting maker order exceeds the
+    cap (limiting adverse-selection blast radius), yet the entry still reaches
+    the full target by chunking."""
+    monkeypatch.setattr(config, "ENTRY_MAX_CLIP_NOTIONAL_USD", Decimal(100))
+    md, positions, executor, notifier, conn = env
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    placed: list[Decimal] = []
+    orig = executor._trader.place_perp_maker
+
+    async def spy(symbol, side, qty, price, client_id):
+        placed.append(qty)
+        return await orig(symbol, side, qty, price, client_id)
+    executor._trader.place_perp_maker = spy
+
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True)
+    executor.start_entry(pos)
+    await wait_for_state(positions, pos.id, pm.OPEN)
+
+    final = positions.get(pos.id)
+    assert final.perp_qty == Decimal("9.95")          # full target still reached
+    assert len(placed) > 1                             # chunked, not one big order
+    clip_qty = Decimal("0.995")                        # round_qty(100 / 100.5)
+    assert all(q <= clip_qty for q in placed)          # no clip over the cap
+
+
 async def test_passive_exit_completes_when_bid_thin(env):
     """A thin MEXC bid caps each buy-back chunk to the closeable size; the
     exit must still fully close, chunking through (and the depth cap must not
