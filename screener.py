@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, asdict
 from decimal import Decimal
 
@@ -58,16 +59,55 @@ def build_pair_maps(
 @dataclass
 class ScreenerRow:
     symbol: str
-    entry_bps: float          # executable basis at entry, before costs
+    entry_bps: float          # executable basis at entry, before costs (live)
     close_bps: float          # basis closeable right now (passive exit)
     spread_cost_bps: float    # entry_bps - close_bps: both spreads crossed
     fees_bps: float           # entry + passive-exit fees, both legs
     funding_8h_bps: float     # positive = short perp receives funding
-    net_edge_bps: float       # entry - exit target - fees - slippage buffer
+    net_edge_bps: float       # entry - exit target - fees - slippage buffer (live)
     max_notional_usd: float   # top-of-book depth cap, min across venues/sides
     aster_ask: str
     mexc_ask: str
     ts_ms: int
+    # Time-windowed means (filled by RollingBasis): a persistent edge has
+    # entry_bps_avg ~ entry_bps; a one-tick blip has avg well below the live spike.
+    entry_bps_avg: float = 0.0
+    net_edge_bps_avg: float = 0.0
+    samples: int = 0          # samples in the window
+    window_s: float = 0.0     # span covered by those samples (seconds)
+
+
+class RollingBasis:
+    """Per-symbol time-windowed history of (entry, net) basis so /screen can
+    report a mean over the last window_s rather than a single tick. Owned by
+    the engine; sampled once per slow scan."""
+
+    def __init__(self, window_s: float):
+        self._window_ms = int(window_s * 1000)
+        self._hist: dict[str, deque] = defaultdict(deque)
+
+    def add(self, symbol: str, ts_ms: int, entry_bps: float, net_edge_bps: float):
+        dq = self._hist[symbol]
+        dq.append((ts_ms, entry_bps, net_edge_bps))
+        cutoff = ts_ms - self._window_ms
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+
+    def annotate(self, row: "ScreenerRow") -> "ScreenerRow":
+        """Fold the windowed means into a freshly computed row (after add)."""
+        dq = self._hist.get(row.symbol)
+        if not dq:
+            row.entry_bps_avg = row.entry_bps
+            row.net_edge_bps_avg = row.net_edge_bps
+            row.samples = 0
+            row.window_s = 0.0
+            return row
+        n = len(dq)
+        row.entry_bps_avg = sum(x[1] for x in dq) / n
+        row.net_edge_bps_avg = sum(x[2] for x in dq) / n
+        row.samples = n
+        row.window_s = (dq[-1][0] - dq[0][0]) / 1000.0
+        return row
 
 
 def compute_row(
@@ -127,12 +167,14 @@ def compute_row(
 
 
 def rank_rows(rows: list[ScreenerRow]) -> list[ScreenerRow]:
+    # Rank by the windowed-average net edge so a persistent opportunity outranks
+    # a one-tick spike. Depth eligibility stays on the current top-of-book.
     eligible = [
         r
         for r in rows
         if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
     ]
-    eligible.sort(key=lambda r: r.net_edge_bps, reverse=True)
+    eligible.sort(key=lambda r: r.net_edge_bps_avg, reverse=True)
     return eligible[: config.SCREENER_TOP_N]
 
 

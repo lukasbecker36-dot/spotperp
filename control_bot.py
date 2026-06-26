@@ -243,17 +243,30 @@ class ControlBot:
         rows = snap["rows"][:n]
         if not rows:
             return "no screener data (engine running?)"
-        hdr = f"{'symbol':<16}{'entry':>6}{'net':>6}{'fund':>6}{'depth$':>8}"
+        win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
+        # entry/net are the windowed averages; 'now' is the live net edge so a
+        # persistent edge (now ~ net) is distinguishable from a one-tick spike.
+        hdr = f"{'symbol':<14}{'entry':>6}{'net':>6}{'now':>6}{'fund':>6}{'depth$':>8}"
         sep = "-" * len(hdr)
-        lines = [f"screener ({age_s:.0f}s old, {len(snap['rows'])} pairs)", hdr, sep]
+        lines = [
+            f"screener ({age_s:.0f}s old, {len(snap['rows'])} pairs, {win_m:.0f}m avg)",
+            hdr, sep,
+        ]
+        max_n = 0
         for r in rows:
-            sym = r["symbol"][:15]
+            sym = r["symbol"][:13]
+            entry_avg = r.get("entry_bps_avg", r["entry_bps"])
+            net_avg = r.get("net_edge_bps_avg", r["net_edge_bps"])
+            max_n = max(max_n, r.get("samples", 0))
             lines.append(
-                f"{sym:<16}{r['entry_bps']:>6.1f}{r['net_edge_bps']:>6.1f}"
+                f"{sym:<14}{entry_avg:>6.1f}{net_avg:>6.1f}{r['net_edge_bps']:>6.1f}"
                 f"{r['funding_8h_bps']:>6.2f}{r['max_notional_usd']:>8,.0f}"
             )
         lines.append(sep)
-        lines.append("bps: entry=raw basis, net=after fees, fund=8h rate")
+        lines.append(
+            f"bps: entry/net = {win_m:.0f}m avg (<={max_n} samples), ranked by net;"
+            " now = live net edge, fund = 8h rate"
+        )
         return "\n".join(lines)
 
     def _cmd_funding(self, args: list[str]) -> str:

@@ -76,13 +76,56 @@ def test_compute_row_rejects_stale_quotes():
 
 
 def test_rank_rows_filters_depth_and_sorts():
-    def row(symbol: str, net: float, depth: float):
+    def row(symbol: str, net: float, depth: float, net_avg: float | None = None):
         return screener.ScreenerRow(
             symbol=symbol, entry_bps=net, close_bps=0, spread_cost_bps=0,
             fees_bps=0, funding_8h_bps=0, net_edge_bps=net,
             max_notional_usd=depth, aster_ask="1", mexc_ask="1", ts_ms=0,
+            net_edge_bps_avg=net if net_avg is None else net_avg,
         )
 
     rows = [row("A", 10, 1e6), row("B", 30, 1e6), row("C", 99, 1.0)]
     ranked = rank_rows(rows)
     assert [r.symbol for r in ranked] == ["B", "A"]  # C dropped: depth too thin
+
+
+def test_rank_rows_ranks_by_windowed_average_not_live():
+    """A one-tick live spike must NOT outrank a persistently higher average."""
+    def row(symbol: str, net_live: float, net_avg: float):
+        return screener.ScreenerRow(
+            symbol=symbol, entry_bps=net_live, close_bps=0, spread_cost_bps=0,
+            fees_bps=0, funding_8h_bps=0, net_edge_bps=net_live,
+            max_notional_usd=1e6, aster_ask="1", mexc_ask="1", ts_ms=0,
+            net_edge_bps_avg=net_avg,
+        )
+    # SPIKE looks best live (80) but averages 5; STEADY averages 30.
+    ranked = rank_rows([row("SPIKE", 80, 5), row("STEADY", 25, 30)])
+    assert [r.symbol for r in ranked] == ["STEADY", "SPIKE"]
+
+
+def test_rolling_basis_window_mean_and_pruning():
+    rb = screener.RollingBasis(window_s=300)  # 5 min
+    pair_row = lambda e, n: screener.ScreenerRow(
+        symbol="X", entry_bps=e, close_bps=0, spread_cost_bps=0, fees_bps=0,
+        funding_8h_bps=0, net_edge_bps=n, max_notional_usd=0, aster_ask="1",
+        mexc_ask="1", ts_ms=0,
+    )
+    # First sample with no history -> avg equals the live value, 1 sample.
+    rb.add("X", 0, 40.0, 20.0)
+    r = rb.annotate(pair_row(40.0, 20.0))
+    assert r.entry_bps_avg == 40.0 and r.net_edge_bps_avg == 20.0
+    assert r.samples == 1
+
+    # A later spike: the mean sits between the two, not at the spike.
+    rb.add("X", 15_000, 100.0, 80.0)  # +15s
+    r = rb.annotate(pair_row(100.0, 80.0))
+    assert r.samples == 2
+    assert r.entry_bps_avg == pytest.approx(70.0)   # (40+100)/2
+    assert r.net_edge_bps_avg == pytest.approx(50.0)  # (20+80)/2
+    assert r.window_s == pytest.approx(15.0)
+
+    # A sample past the window drops the oldest (time-pruned).
+    rb.add("X", 400_000, 10.0, 5.0)   # >300s after t=0 and t=15s
+    r = rb.annotate(pair_row(10.0, 5.0))
+    assert r.samples == 1             # only the newest remains
+    assert r.net_edge_bps_avg == pytest.approx(5.0)

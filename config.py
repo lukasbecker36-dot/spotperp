@@ -42,6 +42,10 @@ SLIPPAGE_BUFFER_BPS = Decimal("2.0")     # haircut for taker slippage per round 
 QUOTE_STALE_SECONDS = 10                 # ignore quotes older than this
 MIN_DEPTH_NOTIONAL_USD = Decimal("200")  # min top-of-book notional on both sides
 BASIS_LOG_SECONDS = 60.0                 # touch-basis CSV sampling cadence
+# /screen reports a time-windowed mean of entry/net basis (sampled once per
+# slow scan) so a persistent edge is distinguishable from a one-tick blip, and
+# rows are ranked by the AVERAGE net edge rather than the instantaneous touch.
+SCREEN_AVG_WINDOW_SECONDS = float(os.environ.get("SCREEN_AVG_WINDOW_SECONDS", "300"))
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

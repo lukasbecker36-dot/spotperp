@@ -80,6 +80,8 @@ class Engine:
         # or stand back down to OPEN. Operator /exit passive is never in here,
         # so manual passive exits keep their no-auto-escalation guarantee.
         self._auto_passive: set[int] = set()
+        # Rolling per-symbol basis history for the /screen 5-minute averages.
+        self._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
 
     # ── startup ──
 
@@ -250,6 +252,8 @@ class Engine:
                 funding_interval_hours=interval,
             )
             if row is not None:
+                self._basis_avg.add(sym, now, row.entry_bps, row.net_edge_bps)
+                self._basis_avg.annotate(row)
                 rows.append(row)
         screener.write_snapshot(screener.rank_rows(rows))
         self._log_basis_rows(rows)
