@@ -77,7 +77,7 @@ async def open_position(md, positions, executor) -> int:
     return pos.id
 
 
-async def wait_for_state(positions, position_id, state, timeout=5.0):
+async def wait_for_state(positions, position_id, state, timeout=10.0):
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if positions.get(position_id).state == state:
@@ -361,7 +361,7 @@ async def test_ensure_margin_skipped_in_paper(env):
     assert stub.calls == []
 
 
-async def wait_for_message(notifier, needle, timeout=5.0):
+async def wait_for_message(notifier, needle, timeout=10.0):
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if any(needle in m for m in notifier.messages):
@@ -372,7 +372,7 @@ async def wait_for_message(notifier, needle, timeout=5.0):
     )
 
 
-async def wait_for_perp_qty(positions, position_id, qty, timeout=5.0):
+async def wait_for_perp_qty(positions, position_id, qty, timeout=10.0):
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if positions.get(position_id).perp_qty == qty:

@@ -1022,7 +1022,11 @@ class Executor:
         order_qty = Decimal(0)         # size the resting buy-back was placed with
         order_seen_executed = Decimal(0)
         last_reprice = 0.0
-        last_unreachable_alert = 0.0   # throttle "target unreachable" notices
+        # -inf (not 0.0) so the FIRST alert always fires: time.monotonic() is
+        # seconds since boot, so a 0.0 sentinel suppresses the first alert for
+        # the first PASSIVE_UNREACHABLE_ALERT_SECONDS of machine uptime (now-0
+        # < threshold right after a reboot/restart).
+        last_unreachable_alert = float("-inf")  # throttle "target unreachable" notices
         to_sell = Decimal(0)   # spot base units pending sale after perp buy-backs
 
         async def absorb_fills(result: OrderResult) -> None:

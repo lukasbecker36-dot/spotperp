@@ -30,6 +30,7 @@ from position_manager import PositionManager
 log = logging.getLogger("control_bot")
 
 ENGINE_SERVICE = "basis-trade.service"
+CONTROL_SERVICE = "basis-trade-control.service"
 COMMAND_WAIT_SECONDS = 10
 
 HELP = """Commands:
@@ -53,6 +54,7 @@ HELP = """Commands:
 /paper — switch to paper (restarts engine)
 /live YES — switch to LIVE (restarts engine)
 /start /stop YES /restart — engine service control
+/update — git pull + restart engine and control bot (deploy latest code)
 /flatten YES — emergency close everything
 """
 
@@ -228,6 +230,8 @@ class ControlBot:
             return self._systemctl("stop")
         if command == "restart":
             return self._systemctl("restart")
+        if command == "update":
+            return self._update()
         return f"unknown command /{command}\n\n{HELP}"
 
     # ── read commands ──
@@ -435,14 +439,55 @@ class ControlBot:
 
     # ── service control ──
 
-    def _systemctl(self, action: str) -> str:
+    def _systemctl(self, action: str, service: str = ENGINE_SERVICE) -> str:
         result = subprocess.run(
-            ["sudo", "systemctl", action, ENGINE_SERVICE],
+            ["sudo", "systemctl", action, service],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
             return f"systemctl {action} failed: {result.stderr.strip()}"
-        return f"systemctl {action} {ENGINE_SERVICE}: ok"
+        return f"systemctl {action} {service}: ok"
+
+    def _git_pull(self) -> tuple[bool, str]:
+        """Fast-forward the deploy checkout to its tracked branch. Returns
+        (ok, summary). Pins origin/<current-branch> so it works regardless of
+        how tracking is configured on the server."""
+        repo = str(config.PROJECT_ROOT)
+        head = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True,
+        )
+        if head.returncode != 0:
+            return False, f"git branch lookup failed: {head.stderr.strip()}"
+        branch = head.stdout.strip()
+        pull = subprocess.run(
+            ["git", "-C", repo, "pull", "--ff-only", "origin", branch],
+            capture_output=True, text=True,
+        )
+        out = (pull.stdout + pull.stderr).strip()
+        if pull.returncode != 0:
+            return False, f"git pull failed ({branch}):\n{out}"
+        return True, f"git pull {branch}: {out.splitlines()[-1] if out else 'ok'}"
+
+    def _update(self) -> str:
+        """Pull the latest code and restart both services. The engine restarts
+        synchronously; the control bot (this process) restarts detached after a
+        short delay so this reply is delivered before systemd kills us."""
+        ok, pull_msg = self._git_pull()
+        if not ok:
+            return f"❌ update aborted — {pull_msg}\n(no restart)"
+        engine_msg = self._systemctl("restart", ENGINE_SERVICE)
+        # Restart our own service out-of-band: a detached child survives this
+        # process being killed, and the sleep lets the Telegram reply flush.
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 3 && sudo systemctl restart {CONTROL_SERVICE}"],
+            start_new_session=True,
+        )
+        return (
+            f"🔄 {pull_msg}\n{engine_msg}\n"
+            f"control bot restarting in ~3s (this is the last message from the"
+            f" old process) — send /status in a few seconds to confirm both are up"
+        )
 
 
 async def main() -> None:
