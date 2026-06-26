@@ -54,11 +54,23 @@ ADVERSE_WIDEN_STOP_BPS: Decimal | None = (
     Decimal(os.environ["ADVERSE_WIDEN_STOP_BPS"])
     if os.environ.get("ADVERSE_WIDEN_STOP_BPS") else None
 )
-# Convergence take-profit: when the closeable basis inverts below this level
-# AND an aggressive (taker both legs) close is net profitable, lock it in.
-# The PnL gate stops wide-spread names from being force-closed at a loss
-# right after entry just because their bid-side basis is structurally low.
-CONVERGED_TP_BPS = Decimal("-50.0")
+# Convergence auto-close (two-tier). The closeable (maker-taker) basis is the
+# convergence measure: perp maker buy-back at the Aster bid vs spot taker sell
+# at the MEXC bid.
+#   1. Once it reaches CONVERGED_PASSIVE_BPS the premium has converged, so the
+#      engine starts WORKING A PASSIVE maker buy-back (0 perp fee) at that
+#      target — booking the convergence without paying to cross the perp.
+#   2. If the basis runs negative far enough that an AGGRESSIVE taker-both-legs
+#      close is also net positive (funding + price, after taker fees), it
+#      crosses immediately and locks it (the passive fill might never come).
+#   3. If the basis recovers back above CONVERGED_PASSIVE_BPS +
+#      CONVERGED_PASSIVE_RESET_BPS the passive work is stood down and the
+#      position returns to OPEN (keeps collecting funding, max-hold re-armed).
+# Carry trades ignore all of this — operator /exit only.
+CONVERGED_PASSIVE_BPS = Decimal(os.environ.get("CONVERGED_PASSIVE_BPS", "0.0"))
+CONVERGED_PASSIVE_RESET_BPS = Decimal(
+    os.environ.get("CONVERGED_PASSIVE_RESET_BPS", "5.0")
+)
 MAX_HOLD_HOURS = 168                     # 1 week max hold
 # Aster perp margin applied to each symbol before its first live entry: 1x
 # isolated keeps the short fully margined (liquidation only on a ~100% move),

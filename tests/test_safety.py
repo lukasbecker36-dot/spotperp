@@ -69,6 +69,7 @@ def engine(tmp_path, monkeypatch):
     eng.positions = positions
     eng.notifier = notifier
     eng.executor = executor
+    eng._auto_passive = set()
     yield eng
     conn.close()
 
@@ -151,17 +152,64 @@ async def test_carry_trade_hits_adverse_stop_only_when_enabled(engine, monkeypat
     assert any("adverse stop" in m for m in engine.notifier.messages)
 
 
-async def test_converged_tp_gated_on_pnl(engine):
-    """Wide Aster book right after entry (the ETHFI case): bid-side basis is
-    deeply negative but a taker close would lose money -> no force close."""
+async def test_converged_starts_passive_when_taker_unprofitable(engine):
+    """Converged (maker-taker basis <= 0) but a taker-taker close would lose
+    (wide Aster ask, the ETHFI case): don't cross at a loss — work it passively
+    at the convergence target instead."""
     pos_id = await open_position(engine)
-    # close basis ~-100bps but the ask is still 101.5: buying back at the
-    # ask loses 1.0/unit on the perp leg -> est pnl negative.
+    # close basis ~-90bps but the ask is still 101.5: a taker buy-back at the
+    # ask loses 1.0/unit on the perp leg -> aggressive est pnl negative.
     set_books(engine.md, "99.0", "101.5", "99.9", "100.0")
     await engine._check_safety(engine.positions.get(pos_id))
     pos = engine.positions.get(pos_id)
-    assert pos.exit_mode is None
+    assert pos.exit_mode == "passive"
+    assert pos.exit_target_bps == config.CONVERGED_PASSIVE_BPS
+    assert pos_id in engine._auto_passive
+    assert any("passive maker close" in m for m in engine.notifier.messages)
+
+
+async def test_auto_passive_escalates_when_taker_turns_profitable(engine):
+    """A convergence-auto passive exit crosses to a taker close once the basis
+    runs negative enough that taker-taker is net positive."""
+    pos_id = await open_position(engine)
+    engine.positions.set_exit_request(pos_id, "passive", config.CONVERGED_PASSIVE_BPS)
+    engine.positions.set_state(pos_id, pm.EXITING)
+    engine._auto_passive.add(pos_id)
+    # Tight book, deeply inverted: taker buy-back at 99.1 (entry 100.5) wins.
+    set_books(engine.md, "99.0", "99.1", "99.9", "100.0")
+    await engine._check_auto_passive(engine.positions.get(pos_id))
+    pos = engine.positions.get(pos_id)
+    assert pos.exit_mode == "now"
+    assert pos_id not in engine._auto_passive
+    assert any("crossing to lock" in m for m in engine.notifier.messages)
+
+
+async def test_auto_passive_resets_to_open_on_basis_recovery(engine):
+    """If the basis recovers back into premium, stand the passive close down and
+    return the position to OPEN (keeps collecting funding, max-hold re-armed)."""
+    pos_id = await open_position(engine)
+    engine.positions.set_exit_request(pos_id, "passive", config.CONVERGED_PASSIVE_BPS)
+    engine.positions.set_state(pos_id, pm.EXITING)
+    engine._auto_passive.add(pos_id)
+    # Basis back to ~+50bps, well above the reset band.
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    await engine._check_auto_passive(engine.positions.get(pos_id))
+    pos = engine.positions.get(pos_id)
     assert pos.state == pm.OPEN
+    assert pos.exit_mode is None
+    assert pos_id not in engine._auto_passive
+    assert any("stood down" in m for m in engine.notifier.messages)
+
+
+async def test_auto_passive_releases_operator_override(engine):
+    """If the operator switches an auto passive exit to a taker close, the auto
+    manager releases ownership and stops touching it."""
+    pos_id = await open_position(engine)
+    engine.positions.set_exit_request(pos_id, "now", None)  # operator took over
+    engine.positions.set_state(pos_id, pm.EXITING)
+    engine._auto_passive.add(pos_id)
+    await engine._check_auto_passive(engine.positions.get(pos_id))
+    assert pos_id not in engine._auto_passive
 
 
 async def test_resolve_position_by_symbol(engine):

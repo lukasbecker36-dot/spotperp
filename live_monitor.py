@@ -75,6 +75,11 @@ class Engine:
             self.md, trader, self.positions, self.notifier, self.conn,
             paper=self.paper,
         )
+        # Position ids whose passive exit was started by the convergence auto-
+        # close (not the operator): these may escalate to a taker-taker close
+        # or stand back down to OPEN. Operator /exit passive is never in here,
+        # so manual passive exits keep their no-auto-escalation guarantee.
+        self._auto_passive: set[int] = set()
 
     # ── startup ──
 
@@ -476,7 +481,9 @@ class Engine:
             else f"; adverse-widen stop at +{float(config.ADVERSE_WIDEN_STOP_BPS):.0f}bps"
         )
         auto = (
-            f"auto-closes on convergence TP / max-hold{adverse}"
+            f"auto-closes: passive maker at"
+            f" {float(config.CONVERGED_PASSIVE_BPS):.0f}bps, crosses if taker"
+            f" turns profitable, max-hold {config.MAX_HOLD_HOURS}h{adverse}"
             if kind == "convergence"
             else f"CARRY: manual /exit only{adverse}"
         )
@@ -853,10 +860,16 @@ class Engine:
     async def _safety_loop(self) -> None:
         while True:
             try:
+                seen_auto: set[int] = set()
                 for pos in self.positions.active():
-                    if pos.state != pm.OPEN:
-                        continue
-                    await self._check_safety(pos)
+                    if pos.state == pm.OPEN:
+                        await self._check_safety(pos)
+                    elif pos.state == pm.EXITING and pos.id in self._auto_passive:
+                        seen_auto.add(pos.id)
+                        await self._check_auto_passive(pos)
+                # Drop ids that are no longer in an auto passive exit (closed,
+                # cancelled, or escalated away).
+                self._auto_passive &= seen_auto
             except Exception:
                 log.exception("safety loop error")
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS * 5)
@@ -882,30 +895,94 @@ class Engine:
                 self.executor.start_exit(self.positions.get(pos.id))
                 return
         # Carry trades are held for funding and only the operator closes them:
-        # skip the convergence take-profit and the max-hold timeout. The
+        # skip the convergence auto-close and the max-hold timeout. The
         # adverse-widen stop above still applies (perp-liquidation protection).
         if pos.trade_kind == "carry":
             return
-        if close is not None and close <= config.CONVERGED_TP_BPS:
+        # Two-tier convergence auto-close (see config.CONVERGED_PASSIVE_BPS).
+        # While still in premium (close above the passive trigger) just hold and
+        # collect funding; max-hold below still bounds the carry.
+        if close is not None and close <= config.CONVERGED_PASSIVE_BPS:
             pnl = self._aggressive_close_pnl(pos)
             if pnl is not None and pnl > 0:
+                # Taker-taker close is profitable now — cross and lock it.
                 journal(
                     self.conn,
                     f"position {pos.id}: CONVERGED TP basis={close:.1f}bps"
                     f" est_pnl={pnl:.2f}",
                 )
                 await self.notifier.alert(
-                    f"🎯 position {pos.id} {pos.symbol}: basis inverted to"
-                    f" {float(close):.1f}bps, taker close nets"
-                    f" ${float(pnl):+.2f} — taking profit"
+                    f"🎯 position {pos.id} {pos.symbol}: basis {float(close):.1f}bps,"
+                    f" taker close nets ${float(pnl):+.2f} — taking profit"
                 )
                 self.positions.set_exit_request(pos.id, "now", None)
                 self.executor.start_exit(self.positions.get(pos.id))
                 return
+            # Converged but a taker close isn't worth it yet: work it passively
+            # at the convergence target (maker perp buy-back, 0 perp fee).
+            journal(
+                self.conn,
+                f"position {pos.id}: CONVERGED basis={close:.1f}bps -> passive"
+                f" exit at {config.CONVERGED_PASSIVE_BPS}bps",
+            )
+            await self.notifier.alert(
+                f"🎯 position {pos.id} {pos.symbol}: basis converged to"
+                f" {float(close):.1f}bps — working a passive maker close at"
+                f" {float(config.CONVERGED_PASSIVE_BPS):.0f}bps (will cross if a"
+                f" taker close turns profitable)"
+            )
+            self._auto_passive.add(pos.id)
+            self.positions.set_exit_request(
+                pos.id, "passive", config.CONVERGED_PASSIVE_BPS
+            )
+            self.executor.start_exit(self.positions.get(pos.id))
+            return
         if pos.opened_ms is not None:
             hold_hours = (time.time() * 1000 - pos.opened_ms) / 3_600_000
             if hold_hours > config.MAX_HOLD_HOURS:
                 await self._force_close_timeout(pos)
+
+    async def _check_auto_passive(self, pos: pm.Position) -> None:
+        """Manage a convergence-auto passive exit while it works: escalate to a
+        taker-taker close if that turns profitable, or stand it back down to
+        OPEN if the basis recovers into premium. Operator passive exits are
+        never routed here, so they keep their no-auto-escalation guarantee."""
+        if pos.exit_mode != "passive":
+            # Operator switched it (e.g. /exit now) — release ownership.
+            self._auto_passive.discard(pos.id)
+            return
+        close = self.executor._close_basis_bps(pos.symbol)
+        if close is None:
+            return
+        # Basis recovered into premium: stop working the close, hand back to
+        # OPEN so it keeps collecting funding and max-hold is re-armed.
+        if close > config.CONVERGED_PASSIVE_BPS + config.CONVERGED_PASSIVE_RESET_BPS:
+            self._auto_passive.discard(pos.id)
+            self._cancel_exit(pos)
+            journal(
+                self.conn,
+                f"position {pos.id}: basis recovered to {close:.1f}bps -> back"
+                f" to OPEN (passive close stood down)",
+            )
+            await self.notifier.alert(
+                f"↩️ position {pos.id} {pos.symbol}: basis recovered to"
+                f" {float(close):.1f}bps — passive close stood down, holding"
+            )
+            return
+        pnl = self._aggressive_close_pnl(pos)
+        if pnl is not None and pnl > 0:
+            self._auto_passive.discard(pos.id)
+            journal(
+                self.conn,
+                f"position {pos.id}: ESCALATE passive->taker basis={close:.1f}bps"
+                f" est_pnl={pnl:.2f}",
+            )
+            await self.notifier.alert(
+                f"🎯 position {pos.id} {pos.symbol}: basis {float(close):.1f}bps,"
+                f" taker close now nets ${float(pnl):+.2f} — crossing to lock it"
+            )
+            self.positions.set_exit_request(pos.id, "now", None)
+            self.executor.start_exit(self.positions.get(pos.id))
 
     def _aggressive_close_pnl(self, pos: pm.Position) -> Decimal | None:
         """Estimated net PnL of closing taker on both legs right now:
