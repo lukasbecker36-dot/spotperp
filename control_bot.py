@@ -279,20 +279,28 @@ class ControlBot:
         rows = snap["rows"][:n]
         if not rows:
             return "no funding data yet"
-        hdr = f"{'symbol':<14}{'iv':>3}{'24h':>7}{'now':>7}{'entry':>7}{'net':>7}{'depth$':>8}"
+        win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
+        hdr = f"{'symbol':<14}{'iv':>3}{'24h':>7}{'fund':>7}{'entry':>7}{'net':>7}{'depth$':>8}"
         sep = "-" * len(hdr)
         lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
+
+        def avg(r, key_avg, key_live):
+            # 5m windowed mean; fall back to live (old snapshot / no samples).
+            v = r.get(key_avg)
+            return v if v is not None else r.get(key_live)
+
         for r in rows:
-            entry = f"{r['entry_bps']:>7.1f}" if r["entry_bps"] is not None else f"{'-':>7}"
-            net = f"{r['net_edge_bps']:>7.1f}" if r["net_edge_bps"] is not None else f"{'-':>7}"
+            ev, nv = avg(r, "entry_bps_avg", "entry_bps"), avg(r, "net_edge_bps_avg", "net_edge_bps")
+            entry = f"{ev:>7.1f}" if ev is not None else f"{'-':>7}"
+            net = f"{nv:>7.1f}" if nv is not None else f"{'-':>7}"
             depth = f"{r['max_notional_usd']:>8,.0f}" if r.get("max_notional_usd") else f"{'-':>8}"
             lines.append(
                 f"{r['symbol'][:13]:<14}{r['interval_hours']:>2}h"
                 f"{r['avg_24h_8h_bps']:>7.1f}{r['current_8h_bps']:>7.1f}{entry}{net}{depth}"
             )
         lines.append(sep)
-        lines.append("iv=funding interval; 24h=avg carry/8h; now=latest/8h")
-        lines.append("all bps; short perp receives positive funding")
+        lines.append("iv=funding interval; 24h=avg carry/8h; fund=latest/8h")
+        lines.append(f"entry/net = {win_m:.0f}m avg basis; short perp gets +funding")
         return "\n".join(lines)
 
     def _cmd_status(self) -> str:

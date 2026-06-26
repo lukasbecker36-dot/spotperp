@@ -305,6 +305,9 @@ class Engine:
                     (self.md.funding.get(sym) or {}).get("funding_rate"),
                     now_ms=now, funding_interval_hours=stat.interval_hours,
                 )
+                # The screener snapshot (run just before this) already added
+                # this scan's sample, so annotate (read-only) for the 5m means.
+                self._basis_avg.annotate(screen)
             rows.append({
                 "symbol": sym,
                 "interval_hours": stat.interval_hours,
@@ -313,6 +316,9 @@ class Engine:
                 "realized_24h_bps": stat.realized_24h_bps,
                 "entry_bps": screen.entry_bps if screen else None,
                 "net_edge_bps": screen.net_edge_bps if screen else None,
+                "entry_bps_avg": screen.entry_bps_avg if screen else None,
+                "net_edge_bps_avg": screen.net_edge_bps_avg if screen else None,
+                "samples": screen.samples if screen else 0,
                 "max_notional_usd": screen.max_notional_usd if screen else 0.0,
             })
         rows.sort(key=lambda r: r["avg_24h_8h_bps"], reverse=True)
