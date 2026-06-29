@@ -351,14 +351,19 @@ class ControlBot:
                 f"{' exit=' + p.exit_mode if p.exit_mode else ''}"
                 f"{' (paper)' if p.paper else ''}"
             )
-            m = marks.get(str(p.id)) if marks_fresh else None
-            if m:
+            if not marks_fresh:
+                lines.append(f"   basis {entry} -> ? (engine heartbeat stale)")
+                continue
+            m = marks.get(str(p.id))
+            if m and "upnl_usd" in m:
                 lines.append(
                     f"   basis {entry} -> {m['close_bps']:.1f}bps"
                     f" | uPnL ${m['upnl_usd']:+.2f}"
                     f" (funding ${m['funding_usd']:+.2f},"
                     f" fees ${float(p.fees_usd):.2f})"
                 )
+            elif m and "skip" in m:
+                lines.append(f"   basis {entry} -> ? ({m['skip']})")
             else:
                 lines.append(f"   basis {entry} -> ? (no live mark)")
         return "\n".join(lines)

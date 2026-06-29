@@ -367,15 +367,27 @@ class Engine:
         estimate and unrealized P&L at passive-exit touch prices."""
         now_ms = int(time.time() * 1000)
         marks: dict[str, dict] = {}
+        # Every active position gets an entry: a full mark, or a {"skip": reason}
+        # so /positions can explain WHY a live mark is missing instead of a bare
+        # "no live mark".
         for pos in self.positions.active():
+            pid = str(pos.id)
             if pos.perp_qty <= 0 or pos.perp_entry_avg is None:
+                marks[pid] = {"skip": "no recorded entry price"}
                 continue
             pair = self.md.pair_maps.get(pos.symbol)
             if pair is None:
+                marks[pid] = {"skip": "symbol not cross-listed now (try /refresh)"}
                 continue
             aster = self.md.aster_books.get(pair.aster_symbol)
             mexc = self.md.mexc_books.get(pair.mexc_symbol)
-            if aster is None or mexc is None or aster.bid <= 0 or mexc.bid <= 0:
+            if aster is None or mexc is None:
+                venue = "Aster" if aster is None else "MEXC"
+                marks[pid] = {"skip": f"no live {venue} quote"}
+                continue
+            if aster.bid <= 0 or mexc.bid <= 0:
+                venue = "Aster perp" if aster.bid <= 0 else "MEXC spot"
+                marks[pid] = {"skip": f"no {venue} bid (thin book)"}
                 continue
             # Basis closeable right now: maker perp buy-back at the bid vs
             # spot sell at the bid (same definition as the screener's close).

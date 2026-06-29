@@ -201,6 +201,27 @@ async def test_auto_passive_resets_to_open_on_basis_recovery(engine):
     assert any("stood down" in m for m in engine.notifier.messages)
 
 
+async def test_position_marks_full_when_book_live(engine):
+    pid = await open_position(engine)
+    marks = engine._position_marks()
+    assert "upnl_usd" in marks[str(pid)]      # full mark, not a skip
+
+
+async def test_position_marks_skips_with_reason_no_bid(engine):
+    """A thin book (no bid on a venue) yields an explanatory skip, not silence."""
+    pid = await open_position(engine)
+    set_books(engine.md, "100.4", "100.5", "0", "100.0")  # MEXC bid = 0
+    m = engine._position_marks()[str(pid)]
+    assert "skip" in m and "MEXC spot bid" in m["skip"]
+
+
+async def test_position_marks_skips_when_symbol_not_in_universe(engine):
+    pid = await open_position(engine)
+    engine.md.pair_maps.pop("BTCUSDT")        # e.g. delisted / stale universe
+    m = engine._position_marks()[str(pid)]
+    assert "skip" in m and "cross-listed" in m["skip"]
+
+
 class _InfoStub:
     """Stub exchange client exposing only async exchange_info."""
     def __init__(self, infos=None, error: Exception | None = None):
