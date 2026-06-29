@@ -42,6 +42,7 @@ HELP = """Commands:
 /recon — live exchange P&L: pairs open on the venues now, full round-trip cost
 /adopt SYMBOL — import an existing venue carry trade as a managed position
 /book SYMBOL — top 5 order book levels on both venues
+/refresh — rebuild the cross-listed coin universe (pick up new listings)
 /enter SYMBOL NOTIONAL [min_bps] [carry] — start maker entry, or size up an already-OPEN position by NOTIONAL (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close)
 /cancel ID|SYMBOL — stop a working entry OR exit, back to OPEN
 /exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins, omit=full
@@ -196,6 +197,8 @@ class ControlBot:
             if not args:
                 return "usage: /adopt SYMBOL (import an existing venue carry trade)"
             return await self._queue_and_wait("adopt", {"symbol": args[0]}, wait=25)
+        if command == "refresh":
+            return await self._queue_and_wait("refresh", {}, wait=25)
         if command == "trades":
             return self._cmd_trades(args)
         if command == "pnl":

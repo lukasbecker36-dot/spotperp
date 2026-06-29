@@ -201,6 +201,47 @@ async def test_auto_passive_resets_to_open_on_basis_recovery(engine):
     assert any("stood down" in m for m in engine.notifier.messages)
 
 
+class _InfoStub:
+    """Stub exchange client exposing only async exchange_info."""
+    def __init__(self, infos=None, error: Exception | None = None):
+        self._infos = infos or {}
+        self._error = error
+
+    async def exchange_info(self):
+        if self._error is not None:
+            raise self._error
+        return self._infos
+
+
+async def test_refresh_picks_up_new_listing(engine):
+    """A coin listed on both venues after startup becomes tradeable on refresh."""
+    universe = {"BTCUSDT": object(), "NEWUSDT": object()}
+    engine.aster = _InfoStub(universe)
+    engine.mexc = _InfoStub(universe)
+    assert "NEWUSDT" not in engine.md.pair_maps      # not in the startup universe
+    added, removed = await engine._load_symbol_maps()
+    assert "NEWUSDT" in engine.md.pair_maps
+    assert added == ["NEWUSDT"] and removed == []
+
+
+async def test_refresh_failure_keeps_existing_universe(engine):
+    """A failed exchangeInfo fetch must not wipe the current universe."""
+    before = dict(engine.md.pair_maps)
+    engine.aster = _InfoStub(error=RuntimeError("aster 5xx"))
+    engine.mexc = _InfoStub({"BTCUSDT": object(), "NEWUSDT": object()})
+    added, removed = await engine._load_symbol_maps()
+    assert added == [] and removed == []
+    assert engine.md.pair_maps == before            # untouched
+
+
+async def test_cmd_refresh_reports_added_symbols(engine):
+    universe = {"BTCUSDT": object(), "NEWUSDT": object()}
+    engine.aster = _InfoStub(universe)
+    engine.mexc = _InfoStub(universe)
+    msg = await engine._cmd_refresh()
+    assert "NEW" in msg and "+1" in msg
+
+
 async def test_auto_passive_releases_operator_override(engine):
     """If the operator switches an auto passive exit to a taker close, the auto
     manager releases ownership and stops touching it."""

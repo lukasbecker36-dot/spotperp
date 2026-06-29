@@ -88,7 +88,7 @@ class Engine:
     async def start(self) -> None:
         mode = "paper" if self.paper else "LIVE"
         journal(self.conn, f"engine starting in {mode} mode")
-        await self._load_symbol_maps()
+        await self._load_symbol_maps(initial=True)
         await recovery.reconcile(
             self.conn, self.positions, self.aster, self.mexc, self.notifier,
             paper=self.paper,
@@ -109,20 +109,42 @@ class Engine:
             self._funding_loop(),
         )
 
-    async def _load_symbol_maps(self) -> None:
+    async def _load_symbol_maps(self, *, initial: bool = False) -> tuple[list[str], list[str]]:
+        """(Re)build the cross-listed universe from both venues' exchangeInfo.
+        Returns (added, removed) canonical symbols vs the previous universe. On
+        a periodic refresh a fetch failure leaves the existing maps untouched;
+        at startup it raises (the engine must have a universe to run)."""
         aster_info, mexc_info = await asyncio.gather(
-            self.aster.exchange_info(), self.mexc.exchange_info()
+            self.aster.exchange_info(), self.mexc.exchange_info(),
+            return_exceptions=True,
         )
+        if not isinstance(aster_info, dict) or not isinstance(mexc_info, dict):
+            msg = (f"symbol map refresh failed (aster={aster_info!r:.80},"
+                   f" mexc={mexc_info!r:.80})")
+            if initial:
+                raise RuntimeError(msg)
+            log.warning(msg)
+            return [], []
+        new_maps = screener.build_pair_maps(set(aster_info), set(mexc_info))
+        before = set(self.md.pair_maps)
+        added = sorted(set(new_maps) - before)
+        removed = sorted(before - set(new_maps))
         self.md.aster_info = aster_info
         self.md.mexc_info = mexc_info
-        self.md.pair_maps = screener.build_pair_maps(
-            set(aster_info), set(mexc_info)
-        )
+        self.md.pair_maps = new_maps
         log.info(
             "symbol maps: %d aster, %d mexc, %d tradeable pairs",
-            len(aster_info), len(mexc_info), len(self.md.pair_maps),
+            len(aster_info), len(mexc_info), len(new_maps),
         )
-        journal(self.conn, f"{len(self.md.pair_maps)} cross-listed USDT pairs")
+        if initial:
+            journal(self.conn, f"{len(new_maps)} cross-listed USDT pairs")
+        elif added or removed:
+            journal(
+                self.conn,
+                f"symbol universe changed: +{len(added)} -{len(removed)}"
+                f" (now {len(new_maps)})",
+            )
+        return added, removed
 
     def _resume_positions(self) -> None:
         for pos in self.positions.active():
@@ -140,15 +162,27 @@ class Engine:
 
     async def _market_loop(self) -> None:
         last_slow = 0.0
+        last_symbol_refresh = time.monotonic()  # startup already loaded the universe
         while True:
             try:
                 await self._refresh_books()
-                if time.monotonic() - last_slow >= config.SLOW_SCAN_SECONDS:
-                    last_slow = time.monotonic()
+                now_mono = time.monotonic()
+                if now_mono - last_slow >= config.SLOW_SCAN_SECONDS:
+                    last_slow = now_mono
                     await self._refresh_funding()
                     self._write_screener_snapshot()
                     self._write_funding_snapshot()
                     self._write_heartbeat()
+                if now_mono - last_symbol_refresh >= config.SYMBOL_REFRESH_SECONDS:
+                    last_symbol_refresh = now_mono
+                    added, _removed = await self._load_symbol_maps()
+                    if added:
+                        names = ", ".join(s[:-4] for s in added[:20])
+                        more = " …" if len(added) > 20 else ""
+                        await self.notifier.alert(
+                            f"🆕 {len(added)} new cross-listed pair(s) now"
+                            f" tradeable: {names}{more}"
+                        )
             except Exception:
                 log.exception("market loop error")
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
@@ -427,6 +461,8 @@ class Engine:
                 return await self._cmd_adopt(args)
             if command == "balance":
                 return await self._cmd_balance()
+            if command == "refresh":
+                return await self._cmd_refresh()
             return f"unknown command: {command}"
         except Exception as exc:
             log.exception("command %s failed", command)
@@ -629,6 +665,20 @@ class Engine:
         except ExchangeError as exc:
             lines.append(f"MEXC spot   error: {exc}")
         lines.append(f"combined    {float(total):>10,.2f}")
+        return "\n".join(lines)
+
+    async def _cmd_refresh(self) -> str:
+        """Re-fetch both venues' exchangeInfo and rebuild the tradeable universe
+        on demand, so a freshly-listed coin becomes available without waiting
+        for the periodic refresh or restarting the engine."""
+        added, removed = await self._load_symbol_maps()
+        lines = [f"universe refreshed: {len(self.md.pair_maps)} cross-listed pairs"]
+        if added:
+            lines.append(f"+{len(added)}: " + ", ".join(s[:-4] for s in added[:30]))
+        if removed:
+            lines.append(f"-{len(removed)}: " + ", ".join(s[:-4] for s in removed[:30]))
+        if not added and not removed:
+            lines.append("(no change — both venues already known, or fetch failed)")
         return "\n".join(lines)
 
     async def _cmd_book(self, args: dict) -> str:

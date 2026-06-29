@@ -86,6 +86,10 @@ MAX_NOTIONAL_PER_LEG_USD = Decimal("5000")
 # ── Execution ──
 POLL_INTERVAL_SECONDS = 1.0              # fast tick: book refresh + executor step
 SLOW_SCAN_SECONDS = 15.0                 # screener snapshot + funding refresh
+# Re-fetch both venues' exchangeInfo and rebuild the cross-listed universe on
+# this cadence so newly-listed coins become tradeable without an engine
+# restart (also exposed on demand via the /refresh command).
+SYMBOL_REFRESH_SECONDS = float(os.environ.get("SYMBOL_REFRESH_SECONDS", "1800"))
 FUNDING_REFRESH_SECONDS = 900.0          # full funding-history sweep cadence
 FUNDING_FETCH_BATCH = 8                  # concurrent funding-history fetches
 FUNDING_HISTORY_LIMIT = 30               # prints per symbol (>= 24h on 1h funding)
