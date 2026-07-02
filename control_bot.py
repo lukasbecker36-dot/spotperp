@@ -283,7 +283,8 @@ class ControlBot:
         if not rows:
             return "no funding data yet"
         win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
-        hdr = f"{'symbol':<14}{'iv':>3}{'24h':>7}{'fund':>7}{'entry':>7}{'net':>7}{'depth$':>8}"
+        hdr = (f"{'symbol':<12}{'iv':>3}{'24h':>6}{'fund':>6}{'next':>6}"
+               f"{'entry':>6}{'net':>6}{'depth$':>8}")
         sep = "-" * len(hdr)
         lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
 
@@ -294,15 +295,17 @@ class ControlBot:
 
         for r in rows:
             ev, nv = avg(r, "entry_bps_avg", "entry_bps"), avg(r, "net_edge_bps_avg", "net_edge_bps")
-            entry = f"{ev:>7.1f}" if ev is not None else f"{'-':>7}"
-            net = f"{nv:>7.1f}" if nv is not None else f"{'-':>7}"
+            entry = f"{ev:>6.1f}" if ev is not None else f"{'-':>6}"
+            net = f"{nv:>6.1f}" if nv is not None else f"{'-':>6}"
             depth = f"{r['max_notional_usd']:>8,.0f}" if r.get("max_notional_usd") else f"{'-':>8}"
+            nh = r.get("next_funding_h")
+            nxt = f"{nh:>5.1f}h" if nh is not None and nh >= 0 else f"{'-':>6}"
             lines.append(
-                f"{r['symbol'][:13]:<14}{r['interval_hours']:>2}h"
-                f"{r['avg_24h_8h_bps']:>7.1f}{r['current_8h_bps']:>7.1f}{entry}{net}{depth}"
+                f"{r['symbol'][:11]:<12}{r['interval_hours']:>2}h"
+                f"{r['avg_24h_8h_bps']:>6.1f}{r['current_8h_bps']:>6.1f}{nxt}{entry}{net}{depth}"
             )
         lines.append(sep)
-        lines.append("iv=funding interval; 24h=avg carry/8h; fund=latest/8h")
+        lines.append("iv=interval; 24h=avg carry/8h; fund=settled/8h; next=to settle")
         lines.append(f"entry/net = {win_m:.0f}m avg basis; short perp gets +funding")
         return "\n".join(lines)
 

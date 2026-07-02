@@ -332,22 +332,38 @@ class Engine:
                 continue
             aster = self.md.aster_books.get(pair.aster_symbol)
             mexc = self.md.mexc_books.get(pair.mexc_symbol)
+            fund_row = self.md.funding.get(sym) or {}
+            live_rate = fund_row.get("funding_rate")
             screen = None
             if aster is not None and mexc is not None:
                 screen = screener.compute_row(
-                    pair, aster, mexc,
-                    (self.md.funding.get(sym) or {}).get("funding_rate"),
+                    pair, aster, mexc, live_rate,
                     now_ms=now, funding_interval_hours=stat.interval_hours,
                 )
                 # The screener snapshot (run just before this) already added
                 # this scan's sample, so annotate (read-only) for the 5m means.
                 self._basis_avg.annotate(screen)
+            # Recompute the current rate from the 15s-fresh premiumIndex rather
+            # than the 15-min stats sweep, so a new funding settlement shows up
+            # promptly. (lastFundingRate only changes at each settlement, so
+            # this holds steady between them by design — not a stale snapshot.)
+            current_8h = stat.current_8h_bps
+            if live_rate is not None and stat.interval_hours:
+                current_8h = float(
+                    live_rate * Decimal(10000) * Decimal(8) / Decimal(stat.interval_hours)
+                )
+            next_ms = fund_row.get("next_funding_time")
+            next_funding_h = (
+                float((next_ms - now) / Decimal(3_600_000))
+                if next_ms and next_ms > 0 else None
+            )
             rows.append({
                 "symbol": sym,
                 "interval_hours": stat.interval_hours,
-                "current_8h_bps": stat.current_8h_bps,
+                "current_8h_bps": current_8h,
                 "avg_24h_8h_bps": stat.avg_24h_8h_bps,
                 "realized_24h_bps": stat.realized_24h_bps,
+                "next_funding_h": next_funding_h,
                 "entry_bps": screen.entry_bps if screen else None,
                 "net_edge_bps": screen.net_edge_bps if screen else None,
                 "entry_bps_avg": screen.entry_bps_avg if screen else None,
