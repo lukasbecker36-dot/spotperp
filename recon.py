@@ -87,6 +87,17 @@ class PairRecon:
     held_hours: Decimal | None
     spot_balance: Decimal      # total base held on MEXC (free+locked)
     perp_base: Decimal         # perp_qty * qty_multiplier
+    perp_mark: Decimal = Decimal(0)   # Aster mark price (liq triggers on this)
+    perp_liq: Decimal = Decimal(0)    # Aster liquidation price (0 = none/unknown)
+
+    @property
+    def liq_distance_pct(self) -> Decimal | None:
+        """How far the mark must move to liquidate the SHORT, as a % of mark.
+        Liquidation is above the mark for a short, so this is positive; smaller
+        = closer to liquidation. None if no liq/mark price is available."""
+        if self.perp_mark <= 0 or self.perp_liq <= 0:
+            return None
+        return (self.perp_liq - self.perp_mark) / self.perp_mark * Decimal(100)
 
     @property
     def perp_pnl(self) -> Decimal:
@@ -139,6 +150,16 @@ def format_report(pairs: list[PairRecon], notes: list[str]) -> str:
             f"  spot {est}{_p(p.spot_entry)}->{_p(p.spot_exit)}"
             f"  {float(p.spot_pnl):+.2f}"
         )
+        # Liquidation proximity for the short perp: mark now vs liq price above.
+        dist = p.liq_distance_pct
+        if dist is not None:
+            warn = " ⚠️" if dist < Decimal(15) else ""
+            lines.append(
+                f"  mark {_p(p.perp_mark)}  liq {_p(p.perp_liq)}"
+                f"  (+{float(dist):.1f}% to liq){warn}"
+            )
+        elif p.perp_mark > 0:
+            lines.append(f"  mark {_p(p.perp_mark)}  liq n/a")
         lines.append(
             f"  funding {float(p.funding_usd):+.2f}"
             f"   fees -{float(p.fees):.2f}"

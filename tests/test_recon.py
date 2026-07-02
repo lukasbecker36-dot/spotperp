@@ -90,5 +90,44 @@ def test_format_report_totals(monkeypatch):
     assert "TOTAL NET P&L  $+2.00" in out  # +1 perp + 0 spot + 1 funding
 
 
+def _pair(**kw):
+    base = dict(
+        symbol="BTCUSDT", base_asset="BTC",
+        perp_qty=Decimal(1), perp_entry=Decimal(100), perp_exit=Decimal(99),
+        spot_qty=Decimal(1), spot_entry=Decimal(99), spot_exit=Decimal(99),
+        spot_entry_est=False, funding_usd=Decimal(0), held_hours=Decimal(2),
+        spot_balance=Decimal(1), perp_base=Decimal(1),
+    )
+    base.update(kw)
+    return recon.PairRecon(**base)
+
+
+def test_liq_distance_pct_for_short():
+    # Short: liquidation is above the mark. mark 100, liq 150 -> +50% of room.
+    p = _pair(perp_mark=Decimal(100), perp_liq=Decimal(150))
+    assert p.liq_distance_pct == Decimal(50)
+
+
+def test_liq_distance_none_without_prices():
+    assert _pair(perp_mark=Decimal(100), perp_liq=Decimal(0)).liq_distance_pct is None
+    assert _pair(perp_mark=Decimal(0), perp_liq=Decimal(150)).liq_distance_pct is None
+
+
+def test_format_report_shows_mark_liq_and_warns_when_close(monkeypatch):
+    monkeypatch.setattr(config, "ASTER_MAKER_FEE", Decimal("0.0"))
+    monkeypatch.setattr(config, "MEXC_TAKER_FEE", Decimal("0.0"))
+    safe = recon.format_report([_pair(perp_mark=Decimal(100), perp_liq=Decimal(190))], [])
+    assert "liq 190" in safe and "+90.0% to liq" in safe and "⚠️" not in safe
+    close = recon.format_report([_pair(perp_mark=Decimal(100), perp_liq=Decimal(108))], [])
+    assert "+8.0% to liq" in close and "⚠️" in close  # <15% -> warn
+
+
+def test_format_report_liq_na_when_missing(monkeypatch):
+    monkeypatch.setattr(config, "ASTER_MAKER_FEE", Decimal("0.0"))
+    monkeypatch.setattr(config, "MEXC_TAKER_FEE", Decimal("0.0"))
+    out = recon.format_report([_pair(perp_mark=Decimal(100), perp_liq=Decimal(0))], [])
+    assert "liq n/a" in out
+
+
 def test_format_report_empty():
     assert "no matched" in recon.format_report([], [])

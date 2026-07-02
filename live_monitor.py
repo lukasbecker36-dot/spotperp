@@ -913,6 +913,11 @@ class Engine:
         perp_entry = Decimal(str(risk_row.get("entryPrice", "0")))
         perp_exit = aster_book.bid
         perp_base = perp_qty * pair.qty_multiplier
+        # Mark price drives liquidation; fall back to the book mid if absent.
+        perp_mark = _dec_or_zero(risk_row.get("markPrice"))
+        if perp_mark <= 0:
+            perp_mark = (aster_book.bid + aster_book.ask) / Decimal(2)
+        perp_liq = _dec_or_zero(risk_row.get("liquidationPrice"))
 
         spot_balance = balances.get(base, Decimal(0))
         spot_qty = min(spot_balance, perp_base)
@@ -965,6 +970,8 @@ class Engine:
             held_hours=held_hours,
             spot_balance=spot_balance,
             perp_base=perp_base,
+            perp_mark=perp_mark,
+            perp_liq=perp_liq,
         )
 
     async def _safety_loop(self) -> None:
