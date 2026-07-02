@@ -340,6 +340,34 @@ async def test_position_marks_skips_when_symbol_not_in_universe(engine):
     assert "skip" in m and "cross-listed" in m["skip"]
 
 
+async def test_remove_marks_position_closed_no_trading(engine):
+    pid = await open_position(engine)
+    out = engine._cmd_remove({"position_id": "BTC"})
+    assert "removed" in out.lower()
+    pos = engine.positions.get(pid)
+    assert pos.state == pm.CLOSED
+    assert pos.realized_pnl_usd is None      # unknown (closed off-book), not faked
+
+
+async def test_remove_clears_auto_state(engine):
+    pid = await open_position(engine)
+    engine._auto_passive.add(pid)
+    engine._liq_alerted[pid] = 1.0
+    engine._cmd_remove({"position_id": str(pid)})
+    assert engine.positions.get(pid).state == pm.CLOSED
+    assert pid not in engine._auto_passive and pid not in engine._liq_alerted
+
+
+async def test_remove_unknown_symbol(engine):
+    assert "no active position" in engine._cmd_remove({"position_id": "ETH"})
+
+
+async def test_remove_already_closed(engine):
+    pid = await open_position(engine)
+    engine._cmd_remove({"position_id": str(pid)})
+    assert "already CLOSED" in engine._cmd_remove({"position_id": str(pid)})
+
+
 class _StopClient:
     """Records place/cancel and returns ids, for /stops tests."""
     def __init__(self, open_orders=None):

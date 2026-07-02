@@ -49,6 +49,7 @@ HELP = """Commands:
 /exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins, omit=full
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
 /stops SYMBOL — place liq-protection stop (perp) + sell limit (spot) ~1% below liq price
+/remove ID|SYMBOL YES — stop tracking a position closed manually on the exchange (DB only)
 /trades [n] — last closed trades
 /pnl — realised P&L summary
 /log [n] — last journal lines
@@ -206,6 +207,14 @@ class ControlBot:
                         " orders (reduce-only buy STOP on Aster + sell LIMIT on"
                         " MEXC) 1% below the perp liq price, full size")
             return await self._queue_and_wait("stops", {"symbol": args[0]}, wait=25)
+        if command == "remove":
+            if not args:
+                return ("usage: /remove ID|SYMBOL YES — stop tracking a position"
+                        " you closed manually on the exchange (no venue orders)")
+            if not confirmed:
+                return ("this stops tracking the position (marks it CLOSED, no"
+                        " venue orders) — repeat as: /remove {} YES".format(args[0]))
+            return await self._queue_and_wait("remove", {"position_id": args[0]})
         if command == "trades":
             return self._cmd_trades(args)
         if command == "pnl":

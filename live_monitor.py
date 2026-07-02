@@ -593,6 +593,8 @@ class Engine:
                 return await self._cmd_refresh()
             if command == "stops":
                 return await self._cmd_stops(args)
+            if command == "remove":
+                return self._cmd_remove(args)
             return f"unknown command: {command}"
         except Exception as exc:
             log.exception("command %s failed", command)
@@ -746,6 +748,32 @@ class Engine:
         if self.executor.request_cancel(pos.id):
             return f"position {pos.id}: entry cancel requested"
         return f"position {pos.id}: no working entry or exit to cancel"
+
+    def _cmd_remove(self, args: dict) -> str:
+        """Stop tracking a position that was closed manually on the exchange:
+        mark it CLOSED in the DB with NO venue orders (unlike /flatten, which
+        trades to close). Cancels any working entry/exit task and clears its
+        auto-exit / liq-alert state. Reversible via /adopt if done by mistake."""
+        pos = self._resolve_position(str(args.get("position_id", "")))
+        if isinstance(pos, str):
+            return pos
+        if pos.state in (pm.CLOSED, pm.CANCELLED):
+            return f"position {pos.id} {pos.symbol} is already {pos.state}"
+        task = self.executor._tasks.get(pos.id)
+        if task and not task.done():
+            task.cancel()
+        self._auto_passive.discard(pos.id)
+        self._liq_alerted.pop(pos.id, None)
+        prior = pos.state
+        self.positions.set_state(pos.id, pm.CLOSED, "removed: closed manually on venue")
+        journal(self.conn, f"position {pos.id} {pos.symbol}: /remove -> CLOSED"
+                f" (was {prior}, no venue orders)")
+        return (
+            f"removed #{pos.id} {pos.symbol} from active positions — marked CLOSED,"
+            f" no venue orders placed (was {prior}, perp={pos.perp_qty}"
+            f" spot={pos.spot_qty}). If that was a mistake, /adopt {pos.symbol}"
+            f" to restore tracking."
+        )
 
     def _cmd_flatten(self) -> str:
         count = 0
