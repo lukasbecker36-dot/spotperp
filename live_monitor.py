@@ -82,6 +82,9 @@ class Engine:
         self._auto_passive: set[int] = set()
         # Rolling per-symbol basis history for the /screen 5-minute averages.
         self._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+        # Aster positionRisk cached by symbol (mark + liquidation price) for the
+        # /positions liq readout. Refreshed each slow scan in live mode.
+        self._position_risk: dict[str, dict] = {}
 
     # ── startup ──
 
@@ -196,6 +199,10 @@ class Engine:
             await self._refresh_funding()
         except Exception:
             log.exception("slow scan: funding rate refresh failed")
+        try:
+            await self._refresh_position_risk()
+        except Exception:
+            log.exception("slow scan: position risk refresh failed")
         for label, fn in (
             ("screener snapshot", self._write_screener_snapshot),
             ("funding snapshot", self._write_funding_snapshot),
@@ -225,6 +232,21 @@ class Engine:
             self.md.funding = await self.aster.premium_index()
         except ExchangeError:
             log.exception("funding refresh failed")
+
+    async def _refresh_position_risk(self) -> None:
+        """Cache Aster positionRisk by symbol (mark + liquidation price) so
+        /positions can show how close each perp short is to liquidation. Live
+        mode only — paper has no venue positions."""
+        if self.paper:
+            return
+        try:
+            risk = await self.aster.position_risk()
+        except ExchangeError:
+            log.exception("position risk refresh failed")
+            return
+        self._position_risk = {
+            r["symbol"]: r for r in risk if r.get("symbol")
+        }
 
     async def _funding_loop(self) -> None:
         while True:
@@ -459,11 +481,24 @@ class Engine:
                     notional = pos.perp_qty * pos.spot_entry_avg * pair.qty_multiplier
                     funding_est = rate * notional * periods
             upnl = perp_pnl + spot_pnl + funding_est - pos.fees_usd
-            marks[str(pos.id)] = {
+            mark = {
                 "close_bps": float(close_bps),
                 "funding_usd": float(funding_est),
                 "upnl_usd": float(upnl),
             }
+            # Liquidation proximity for the short perp: mark vs liq price (from
+            # the cached positionRisk). Liq is above the mark for a short, so the
+            # distance is positive; smaller = closer. Live mode only.
+            risk = self._position_risk.get(pair.aster_symbol)
+            if risk:
+                liq = _dec_or_zero(risk.get("liquidationPrice"))
+                mark_px = _dec_or_zero(risk.get("markPrice"))
+                if mark_px <= 0:
+                    mark_px = aster.bid
+                if liq > 0 and mark_px > 0:
+                    mark["liq_price"] = float(liq)
+                    mark["liq_dist_pct"] = float((liq - mark_px) / mark_px * Decimal(100))
+            marks[str(pos.id)] = mark
         return marks
 
     def _write_heartbeat(self) -> None:

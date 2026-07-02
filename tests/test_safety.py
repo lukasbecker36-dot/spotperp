@@ -71,6 +71,7 @@ def engine(tmp_path, monkeypatch):
     eng.notifier = notifier
     eng.executor = executor
     eng._auto_passive = set()
+    eng._position_risk = {}
     yield eng
     conn.close()
 
@@ -249,6 +250,24 @@ async def test_position_marks_full_when_book_live(engine):
     pid = await open_position(engine)
     marks = engine._position_marks()
     assert "upnl_usd" in marks[str(pid)]      # full mark, not a skip
+
+
+async def test_position_marks_include_liq_distance(engine):
+    pid = await open_position(engine)
+    # Cache a positionRisk row: mark 100, liq 150 -> +50% room for the short.
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "150"}
+    }
+    m = engine._position_marks()[str(pid)]
+    assert m["liq_price"] == 150.0
+    assert m["liq_dist_pct"] == pytest.approx(50.0)
+
+
+async def test_position_marks_omit_liq_without_risk(engine):
+    pid = await open_position(engine)
+    engine._position_risk = {}                # no cached risk (e.g. paper / not fetched)
+    m = engine._position_marks()[str(pid)]
+    assert "upnl_usd" in m and "liq_dist_pct" not in m
 
 
 async def test_position_marks_skips_with_reason_no_bid(engine):

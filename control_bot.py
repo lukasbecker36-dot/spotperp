@@ -359,11 +359,15 @@ class ControlBot:
                 continue
             m = marks.get(str(p.id))
             if m and "upnl_usd" in m:
+                liq = ""
+                if m.get("liq_dist_pct") is not None:
+                    d = m["liq_dist_pct"]
+                    liq = f" | liq +{d:.0f}%{' ⚠️' if d < 15 else ''}"
                 lines.append(
                     f"   basis {entry} -> {m['close_bps']:.1f}bps"
                     f" | uPnL ${m['upnl_usd']:+.2f}"
                     f" (funding ${m['funding_usd']:+.2f},"
-                    f" fees ${float(p.fees_usd):.2f})"
+                    f" fees ${float(p.fees_usd):.2f}){liq}"
                 )
             elif m and "skip" in m:
                 lines.append(f"   basis {entry} -> ? ({m['skip']})")
