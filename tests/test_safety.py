@@ -72,6 +72,7 @@ def engine(tmp_path, monkeypatch):
     eng.executor = executor
     eng._auto_passive = set()
     eng._position_risk = {}
+    eng._liq_alerted = {}
     yield eng
     conn.close()
 
@@ -261,6 +262,60 @@ async def test_position_marks_include_liq_distance(engine):
     m = engine._position_marks()[str(pid)]
     assert m["liq_price"] == 150.0
     assert m["liq_dist_pct"] == pytest.approx(50.0)
+
+
+async def _make_live_open(engine):
+    """Open a position, then flip it to live so liq checks apply."""
+    pid = await open_position(engine)
+    engine.conn.execute("UPDATE positions SET paper=0 WHERE id=?", (pid,))
+    engine.conn.commit()
+    return pid
+
+
+async def test_liq_alert_fires_when_close(engine):
+    pid = await _make_live_open(engine)
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "108"}
+    }  # +8% -> under the 15% threshold
+    await engine._check_liquidation(engine.positions.get(pid))
+    assert any("LIQUIDATION" in m for m in engine.notifier.messages)
+    assert pid in engine._liq_alerted
+
+
+async def test_liq_alert_throttled_then_rearms(engine):
+    pid = await _make_live_open(engine)
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "108"}
+    }
+    await engine._check_liquidation(engine.positions.get(pid))
+    await engine._check_liquidation(engine.positions.get(pid))
+    assert sum("LIQUIDATION" in m for m in engine.notifier.messages) == 1  # throttled
+
+    # Recover above threshold -> re-arm; next danger alerts again.
+    engine._position_risk["BTCUSDT"]["liquidationPrice"] = "200"  # +100%
+    await engine._check_liquidation(engine.positions.get(pid))
+    assert pid not in engine._liq_alerted
+    engine._position_risk["BTCUSDT"]["liquidationPrice"] = "108"  # danger again
+    await engine._check_liquidation(engine.positions.get(pid))
+    assert sum("LIQUIDATION" in m for m in engine.notifier.messages) == 2
+
+
+async def test_liq_alert_silent_when_safe(engine):
+    pid = await _make_live_open(engine)
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "200"}
+    }  # +100% -> safe
+    await engine._check_liquidation(engine.positions.get(pid))
+    assert not any("LIQUIDATION" in m for m in engine.notifier.messages)
+
+
+async def test_liq_alert_skips_paper(engine):
+    pid = await open_position(engine)   # stays paper
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "101"}
+    }
+    await engine._check_liquidation(engine.positions.get(pid))
+    assert not any("LIQUIDATION" in m for m in engine.notifier.messages)
 
 
 async def test_position_marks_omit_liq_without_risk(engine):

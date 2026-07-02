@@ -153,7 +153,7 @@ def format_report(pairs: list[PairRecon], notes: list[str]) -> str:
         # Liquidation proximity for the short perp: mark now vs liq price above.
         dist = p.liq_distance_pct
         if dist is not None:
-            warn = " ⚠️" if dist < Decimal(15) else ""
+            warn = " ⚠️" if dist < config.LIQ_ALERT_PCT else ""
             lines.append(
                 f"  mark {_p(p.perp_mark)}  liq {_p(p.perp_liq)}"
                 f"  (+{float(dist):.1f}% to liq){warn}"

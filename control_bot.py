@@ -362,7 +362,8 @@ class ControlBot:
                 liq = ""
                 if m.get("liq_dist_pct") is not None:
                     d = m["liq_dist_pct"]
-                    liq = f" | liq +{d:.0f}%{' ⚠️' if d < 15 else ''}"
+                    warn = " ⚠️" if d < float(config.LIQ_ALERT_PCT) else ""
+                    liq = f" | liq +{d:.0f}%{warn}"
                 lines.append(
                     f"   basis {entry} -> {m['close_bps']:.1f}bps"
                     f" | uPnL ${m['upnl_usd']:+.2f}"

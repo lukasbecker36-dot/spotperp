@@ -85,6 +85,9 @@ class Engine:
         # Aster positionRisk cached by symbol (mark + liquidation price) for the
         # /positions liq readout. Refreshed each slow scan in live mode.
         self._position_risk: dict[str, dict] = {}
+        # Throttle for the near-liquidation alert: position id -> last-alert
+        # monotonic time. Popped when the position recovers above the threshold.
+        self._liq_alerted: dict[int, float] = {}
 
     # ── startup ──
 
@@ -486,20 +489,59 @@ class Engine:
                 "funding_usd": float(funding_est),
                 "upnl_usd": float(upnl),
             }
-            # Liquidation proximity for the short perp: mark vs liq price (from
-            # the cached positionRisk). Liq is above the mark for a short, so the
-            # distance is positive; smaller = closer. Live mode only.
-            risk = self._position_risk.get(pair.aster_symbol)
-            if risk:
-                liq = _dec_or_zero(risk.get("liquidationPrice"))
-                mark_px = _dec_or_zero(risk.get("markPrice"))
-                if mark_px <= 0:
-                    mark_px = aster.bid
-                if liq > 0 and mark_px > 0:
-                    mark["liq_price"] = float(liq)
-                    mark["liq_dist_pct"] = float((liq - mark_px) / mark_px * Decimal(100))
+            # Liquidation proximity for the short perp (live mode only).
+            liq_stats = self._liq_stats(pos)
+            if liq_stats is not None:
+                mark["liq_price"], mark["liq_dist_pct"] = liq_stats
             marks[str(pos.id)] = mark
         return marks
+
+    def _liq_stats(self, pos: pm.Position) -> tuple[float, float] | None:
+        """(liquidation_price, distance_pct) for a position's short perp, or
+        None if there's no cached risk/mark. Distance is the % the mark must
+        rise to hit liquidation (liq is above the mark for a short)."""
+        pair = self.md.pair_maps.get(pos.symbol)
+        if pair is None:
+            return None
+        risk = self._position_risk.get(pair.aster_symbol)
+        if not risk:
+            return None
+        liq = _dec_or_zero(risk.get("liquidationPrice"))
+        mark_px = _dec_or_zero(risk.get("markPrice"))
+        if mark_px <= 0:
+            book = self.md.aster_books.get(pair.aster_symbol)
+            if book is not None and book.bid > 0:
+                mark_px = book.bid
+        if liq <= 0 or mark_px <= 0:
+            return None
+        return float(liq), float((liq - mark_px) / mark_px * Decimal(100))
+
+    async def _check_liquidation(self, pos: pm.Position) -> None:
+        """Alert (throttled) when a live perp short's mark is within
+        LIQ_ALERT_PCT of its liquidation price. Re-arms once it recovers."""
+        if pos.paper or pos.perp_qty <= 0:
+            return
+        stats = self._liq_stats(pos)
+        if stats is None:
+            return
+        _liq, dist = stats
+        if dist >= float(config.LIQ_ALERT_PCT):
+            self._liq_alerted.pop(pos.id, None)  # recovered -> re-arm
+            return
+        now = time.monotonic()
+        last = self._liq_alerted.get(pos.id)
+        if last is not None and now - last < config.LIQ_ALERT_THROTTLE_SECONDS:
+            return
+        self._liq_alerted[pos.id] = now
+        journal(
+            self.conn,
+            f"position {pos.id}: LIQ WARNING {dist:.1f}% from liquidation", "ERROR",
+        )
+        await self.notifier.alert(
+            f"🚨 position {pos.id} {pos.symbol}: perp short is {dist:.1f}% from"
+            f" LIQUIDATION (threshold {float(config.LIQ_ALERT_PCT):.0f}%) —"
+            f" add margin or reduce the position"
+        )
 
     def _write_heartbeat(self) -> None:
         config.HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1014,6 +1056,9 @@ class Engine:
             try:
                 seen_auto: set[int] = set()
                 for pos in self.positions.active():
+                    # Liquidation risk exists in any state while the perp short
+                    # is open, so check it independently of the basis logic.
+                    await self._check_liquidation(pos)
                     if pos.state == pm.OPEN:
                         await self._check_safety(pos)
                     elif pos.state == pm.EXITING and pos.id in self._auto_passive:

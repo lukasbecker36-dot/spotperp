@@ -75,6 +75,11 @@ CONVERGED_PASSIVE_BPS = Decimal(os.environ.get("CONVERGED_PASSIVE_BPS", "0.0"))
 CONVERGED_PASSIVE_RESET_BPS = Decimal(
     os.environ.get("CONVERGED_PASSIVE_RESET_BPS", "5.0")
 )
+# Alert (and flag in /positions & /recon) when a perp short's mark is within
+# this % of its liquidation price. Re-alerts at most every throttle window
+# while still in danger; re-arms once it recovers back above the threshold.
+LIQ_ALERT_PCT = Decimal(os.environ.get("LIQ_ALERT_PCT", "15"))
+LIQ_ALERT_THROTTLE_SECONDS = float(os.environ.get("LIQ_ALERT_THROTTLE_SECONDS", "1800"))
 MAX_HOLD_HOURS = 168                     # 1 week max hold
 # Aster perp margin applied to each symbol before its first live entry: 1x
 # isolated keeps the short fully margined (liquidation only on a ~100% move),
