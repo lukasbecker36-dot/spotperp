@@ -359,9 +359,12 @@ class Engine:
                     pair, aster, mexc, live_rate,
                     now_ms=now, funding_interval_hours=stat.interval_hours,
                 )
-                # The screener snapshot (run just before this) already added
-                # this scan's sample, so annotate (read-only) for the 5m means.
-                self._basis_avg.annotate(screen)
+                # compute_row returns None on a stale / zero-priced book (common
+                # for thin microcaps); only annotate a real row. The screener
+                # snapshot (run just before this) already added this scan's
+                # sample, so annotate is read-only here for the 5m means.
+                if screen is not None:
+                    self._basis_avg.annotate(screen)
             # Recompute the current rate from the 15s-fresh premiumIndex rather
             # than the 15-min stats sweep, so a new funding settlement shows up
             # promptly. (lastFundingRate only changes at each settlement, so

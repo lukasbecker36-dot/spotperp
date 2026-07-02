@@ -202,6 +202,25 @@ async def test_auto_passive_resets_to_open_on_basis_recovery(engine):
     assert any("stood down" in m for m in engine.notifier.messages)
 
 
+async def test_funding_snapshot_survives_zero_priced_book(engine, monkeypatch, tmp_path):
+    """Regression: compute_row returns None on a stale/zero book (thin microcap);
+    the funding snapshot must skip it, not crash annotate(None) — which froze the
+    funding file and heartbeat for days."""
+    import funding as funding_mod
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    # A funding stat for BTCUSDT so the row is built, but a zero-ask book so
+    # compute_row returns None.
+    engine.md.funding_stats["BTCUSDT"] = funding_mod.summarize(
+        "BTCUSDT", [], None, now_ms=0
+    )
+    set_books(engine.md, "100.4", "100.5", "99.9", "0")   # MEXC ask = 0 -> None row
+    engine._write_funding_snapshot()                       # must not raise
+    import json
+    snap = json.loads((tmp_path / "fnd.json").read_text())
+    assert snap["rows"][0]["entry_bps"] is None            # row kept, basis absent
+
+
 async def test_slow_scan_isolates_write_failures(engine, monkeypatch, tmp_path):
     """A throw in one snapshot write must NOT block the others — in particular
     the heartbeat must keep writing (regression: a broken funding snapshot

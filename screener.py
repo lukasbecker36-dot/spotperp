@@ -93,8 +93,11 @@ class RollingBasis:
         while dq and dq[0][0] < cutoff:
             dq.popleft()
 
-    def annotate(self, row: "ScreenerRow") -> "ScreenerRow":
-        """Fold the windowed means into a freshly computed row (after add)."""
+    def annotate(self, row: "ScreenerRow | None") -> "ScreenerRow | None":
+        """Fold the windowed means into a freshly computed row (after add).
+        No-op on None so a skipped/stale row can't crash the caller."""
+        if row is None:
+            return None
         dq = self._hist.get(row.symbol)
         if not dq:
             row.entry_bps_avg = row.entry_bps
