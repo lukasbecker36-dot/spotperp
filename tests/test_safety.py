@@ -13,6 +13,7 @@ import config
 import database
 import live_monitor
 import position_manager as pm
+import screener
 from exchange_client import BookTicker, SymbolInfo
 from executor import Executor, MarketData, PaperTrader
 from screener import PairMap
@@ -199,6 +200,30 @@ async def test_auto_passive_resets_to_open_on_basis_recovery(engine):
     assert pos.exit_mode is None
     assert pos_id not in engine._auto_passive
     assert any("stood down" in m for m in engine.notifier.messages)
+
+
+async def test_slow_scan_isolates_write_failures(engine, monkeypatch, tmp_path):
+    """A throw in one snapshot write must NOT block the others — in particular
+    the heartbeat must keep writing (regression: a broken funding snapshot
+    froze the heartbeat and funding file for days while /screen stayed fresh)."""
+    monkeypatch.setattr(config, "HEARTBEAT_FILE", tmp_path / "hb.json")
+    monkeypatch.setattr(config, "SCREENER_SNAPSHOT_FILE", tmp_path / "scr.json")
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._last_basis_log = 0.0
+
+    async def noop():
+        return None
+    monkeypatch.setattr(engine, "_refresh_funding", noop)
+
+    def boom():
+        raise RuntimeError("funding snapshot kaboom")
+    monkeypatch.setattr(engine, "_write_funding_snapshot", boom)
+
+    await engine._slow_scan()   # must not raise
+
+    assert (tmp_path / "hb.json").exists()    # heartbeat written despite failure
+    assert (tmp_path / "scr.json").exists()   # screener too
 
 
 async def test_position_marks_full_when_book_live(engine):

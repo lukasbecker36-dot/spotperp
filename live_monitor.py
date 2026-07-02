@@ -169,10 +169,7 @@ class Engine:
                 now_mono = time.monotonic()
                 if now_mono - last_slow >= config.SLOW_SCAN_SECONDS:
                     last_slow = now_mono
-                    await self._refresh_funding()
-                    self._write_screener_snapshot()
-                    self._write_funding_snapshot()
-                    self._write_heartbeat()
+                    await self._slow_scan()
                 if now_mono - last_symbol_refresh >= config.SYMBOL_REFRESH_SECONDS:
                     last_symbol_refresh = now_mono
                     added, _removed = await self._load_symbol_maps()
@@ -186,6 +183,28 @@ class Engine:
             except Exception:
                 log.exception("market loop error")
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+
+    async def _slow_scan(self) -> None:
+        """Refresh funding + write the three snapshot files. Each step is
+        isolated so a failure in one (e.g. a data-dependent throw in the
+        funding snapshot) can't cascade and silently freeze the others — the
+        heartbeat in particular must keep writing so /positions marks and
+        /status stay live. Failures are logged individually to pinpoint them.
+        (A shared try once let a broken funding write freeze the heartbeat and
+        funding snapshot for days while /screen stayed fresh.)"""
+        try:
+            await self._refresh_funding()
+        except Exception:
+            log.exception("slow scan: funding rate refresh failed")
+        for label, fn in (
+            ("screener snapshot", self._write_screener_snapshot),
+            ("funding snapshot", self._write_funding_snapshot),
+            ("heartbeat", self._write_heartbeat),
+        ):
+            try:
+                fn()
+            except Exception:
+                log.exception("slow scan: %s write failed", label)
 
     async def _refresh_books(self) -> None:
         aster_books, mexc_books = await asyncio.gather(
