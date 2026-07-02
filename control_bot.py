@@ -48,6 +48,7 @@ HELP = """Commands:
 /exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins, omit=full
 /exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins, omit=full
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
+/stops SYMBOL — place liq-protection stop (perp) + sell limit (spot) ~1% below liq price
 /trades [n] — last closed trades
 /pnl — realised P&L summary
 /log [n] — last journal lines
@@ -199,6 +200,12 @@ class ControlBot:
             return await self._queue_and_wait("adopt", {"symbol": args[0]}, wait=25)
         if command == "refresh":
             return await self._queue_and_wait("refresh", {}, wait=25)
+        if command == "stops":
+            if not args:
+                return ("usage: /stops SYMBOL — place liquidation-protection"
+                        " orders (reduce-only buy STOP on Aster + sell LIMIT on"
+                        " MEXC) 1% below the perp liq price, full size")
+            return await self._queue_and_wait("stops", {"symbol": args[0]}, wait=25)
         if command == "trades":
             return self._cmd_trades(args)
         if command == "pnl":

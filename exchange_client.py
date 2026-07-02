@@ -296,6 +296,8 @@ class AsterClient(_BaseClient):
         price: Decimal | None = None,
         time_in_force: str | None = None,
         reduce_only: bool = False,
+        stop_price: Decimal | None = None,
+        working_type: str | None = None,
         client_order_id: str | None = None,
     ) -> OrderResult:
         params: dict[str, str] = {
@@ -312,6 +314,10 @@ class AsterClient(_BaseClient):
             params["timeInForce"] = time_in_force
         if reduce_only:
             params["reduceOnly"] = "true"
+        if stop_price is not None:
+            params["stopPrice"] = format(stop_price, "f")
+        if working_type:
+            params["workingType"] = working_type
         if client_order_id:
             params["newClientOrderId"] = client_order_id
         body = self._signed_body(params)

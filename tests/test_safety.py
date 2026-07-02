@@ -340,6 +340,70 @@ async def test_position_marks_skips_when_symbol_not_in_universe(engine):
     assert "skip" in m and "cross-listed" in m["skip"]
 
 
+class _StopClient:
+    """Records place/cancel and returns ids, for /stops tests."""
+    def __init__(self, open_orders=None):
+        self.placed = []
+        self.cancelled = []
+        self._open = open_orders or []
+
+    async def open_orders(self, symbol):
+        return self._open
+
+    async def cancel_order(self, symbol, order_id):
+        self.cancelled.append(order_id)
+
+    async def place_order(self, symbol, side, order_type, **kw):
+        from types import SimpleNamespace
+        self.placed.append({"symbol": symbol, "side": side, "type": order_type, **kw})
+        return SimpleNamespace(order_id=f"oid-{order_type}")
+
+    async def position_risk(self):
+        return []
+
+
+async def test_stops_places_reduce_only_perp_stop_and_spot_limit(engine):
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _StopClient()
+    engine.mexc = _StopClient()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "150"}
+    }
+    out = await engine._cmd_stops({"symbol": "BTC"})
+
+    # Perp: reduce-only buy STOP_MARKET at 1% below liq (148.5), full size.
+    perp = engine.aster.placed[0]
+    assert perp["side"] == "BUY" and perp["type"] == "STOP_MARKET"
+    assert perp["reduce_only"] is True and perp["working_type"] == "MARK_PRICE"
+    assert perp["stop_price"] == Decimal("148.5")
+    assert perp["quantity"] == Decimal("9.95")
+    # Spot: sell LIMIT at the same level, full size.
+    spot = engine.mexc.placed[0]
+    assert spot["side"] == "SELL" and spot["type"] == "LIMIT"
+    assert spot["price"] == Decimal("148.5") and spot["quantity"] == Decimal("9.95")
+    assert "below liq 150" in out
+
+
+async def test_stops_requires_live_mode(engine):
+    await open_position(engine)              # engine.paper stays True
+    out = await engine._cmd_stops({"symbol": "BTC"})
+    assert "LIVE mode" in out
+
+
+async def test_stops_needs_liquidation_price(engine):
+    await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _StopClient()
+    engine.mexc = _StopClient()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "0"}
+    }
+    out = await engine._cmd_stops({"symbol": "BTC"})
+    assert "no liquidation price" in out
+    assert engine.aster.placed == []         # nothing placed without a liq price
+
+
 class _InfoStub:
     """Stub exchange client exposing only async exchange_info."""
     def __init__(self, infos=None, error: Exception | None = None):

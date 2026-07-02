@@ -80,6 +80,10 @@ CONVERGED_PASSIVE_RESET_BPS = Decimal(
 # while still in danger; re-arms once it recovers back above the threshold.
 LIQ_ALERT_PCT = Decimal(os.environ.get("LIQ_ALERT_PCT", "15"))
 LIQ_ALERT_THROTTLE_SECONDS = float(os.environ.get("LIQ_ALERT_THROTTLE_SECONDS", "1800"))
+# /stops places protective orders this % below the perp liquidation price: a
+# reduce-only buy STOP_MARKET on Aster (triggers on the mark, closing the short
+# before liquidation) and a resting sell LIMIT on MEXC at the same level.
+STOP_LIQ_BUFFER_PCT = Decimal(os.environ.get("STOP_LIQ_BUFFER_PCT", "1"))
 MAX_HOLD_HOURS = 168                     # 1 week max hold
 # Aster perp margin applied to each symbol before its first live entry: 1x
 # isolated keeps the short fully margined (liquidation only on a ~100% move),

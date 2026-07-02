@@ -16,6 +16,7 @@ import aiohttp
 import config
 import database
 import funding
+import intents
 import position_manager as pm
 import book
 import recon
@@ -590,6 +591,8 @@ class Engine:
                 return await self._cmd_balance()
             if command == "refresh":
                 return await self._cmd_refresh()
+            if command == "stops":
+                return await self._cmd_stops(args)
             return f"unknown command: {command}"
         except Exception as exc:
             log.exception("command %s failed", command)
@@ -807,6 +810,96 @@ class Engine:
         if not added and not removed:
             lines.append("(no change — both venues already known, or fetch failed)")
         return "\n".join(lines)
+
+    async def _cmd_stops(self, args: dict) -> str:
+        """Place liquidation-protection orders for one position: a reduce-only
+        buy STOP_MARKET on the Aster perp STOP_LIQ_BUFFER_PCT below the liq
+        price (triggers on the mark, closing the short before liquidation), and
+        a resting sell LIMIT on MEXC spot at the same level (full size on both).
+        Re-running refreshes: prior /stops orders are cancelled first."""
+        if self.paper:
+            return "stops need LIVE mode — they place real protective orders"
+        pos = self._resolve_position(str(args.get("symbol", "")))
+        if isinstance(pos, str):
+            return pos
+        if pos.state not in (pm.OPEN, pm.EXITING):
+            return f"position {pos.id} is {pos.state}, no stops placed"
+        pair = self.md.pair_maps.get(pos.symbol)
+        if pair is None:
+            return f"{pos.symbol}: not cross-listed"
+        aster_info = self.md.aster_info.get(pair.aster_symbol)
+        mexc_info = self.md.mexc_info.get(pair.mexc_symbol)
+        if aster_info is None or mexc_info is None:
+            return f"{pos.symbol}: missing symbol info (try /refresh)"
+
+        risk = self._position_risk.get(pair.aster_symbol)
+        if not risk:
+            try:
+                rows = await self.aster.position_risk()
+            except ExchangeError as exc:
+                return f"{pos.symbol}: couldn't fetch positionRisk ({exc})"
+            risk = next(
+                (r for r in rows if r.get("symbol") == pair.aster_symbol), None
+            )
+        liq = _dec_or_zero(risk.get("liquidationPrice")) if risk else Decimal(0)
+        if liq <= 0:
+            return (f"{pos.symbol}: no liquidation price on Aster"
+                    f" (cross-margin / no leverage?) — can't size the stop")
+
+        buf = config.STOP_LIQ_BUFFER_PCT / Decimal(100)
+        stop_ref = liq * (Decimal(1) - buf)          # perp-contract price terms
+        perp_stop = aster_info.round_price(stop_ref, up=False)
+        spot_price = mexc_info.round_price(stop_ref / pair.qty_multiplier, up=False)
+        perp_qty = aster_info.round_qty(pos.perp_qty)
+        spot_qty = mexc_info.round_qty(pos.spot_qty)
+        if perp_qty <= 0 or spot_qty <= 0:
+            return f"{pos.symbol}: position too small to place stops"
+
+        cancelled = await self._cancel_stop_orders(pair)
+        lines: list[str] = []
+        try:
+            r = await self.aster.place_order(
+                pair.aster_symbol, "BUY", "STOP_MARKET",
+                quantity=perp_qty, stop_price=perp_stop, reduce_only=True,
+                working_type="MARK_PRICE",
+                client_order_id=intents.make_client_order_id(pos.id, "stop"),
+            )
+            lines.append(f"perp STOP buy {perp_qty} trigger {recon._p(perp_stop)} (id {r.order_id})")
+        except ExchangeError as exc:
+            lines.append(f"perp stop FAILED: {exc}")
+        try:
+            r = await self.mexc.place_order(
+                pair.mexc_symbol, "SELL", "LIMIT",
+                quantity=spot_qty, price=spot_price,
+                client_order_id=intents.make_client_order_id(pos.id, "stop"),
+            )
+            lines.append(f"spot SELL limit {spot_qty} @ {recon._p(spot_price)} (id {r.order_id})")
+        except ExchangeError as exc:
+            lines.append(f"spot limit FAILED: {exc}")
+
+        journal(self.conn, f"position {pos.id}: /stops liq={liq} stop={perp_stop}"
+                f" (cancelled {cancelled} prior)")
+        head = (f"stops for #{pos.id} {pos.symbol}: {float(config.STOP_LIQ_BUFFER_PCT):.0f}%"
+                f" below liq {recon._p(liq)}")
+        if cancelled:
+            head += f" (replaced {cancelled} prior)"
+        return head + "\n  " + "\n  ".join(lines)
+
+    async def _cancel_stop_orders(self, pair: screener.PairMap) -> int:
+        """Cancel any resting /stops orders (client id prefix sp_stop_) on both
+        venues for a symbol, so re-running /stops refreshes rather than stacks."""
+        cancelled = 0
+        for client, symbol in (
+            (self.aster, pair.aster_symbol), (self.mexc, pair.mexc_symbol)
+        ):
+            try:
+                for o in await client.open_orders(symbol):
+                    if o.client_order_id.startswith("sp_stop_"):
+                        await client.cancel_order(symbol, o.order_id)
+                        cancelled += 1
+            except ExchangeError:
+                log.exception("cancel prior stops on %s failed", symbol)
+        return cancelled
 
     async def _cmd_book(self, args: dict) -> str:
         """Top-5 order book levels on both venues for a cross-listed symbol."""
