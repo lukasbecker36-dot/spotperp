@@ -155,6 +155,21 @@ async def test_carry_trade_hits_adverse_stop_only_when_enabled(engine, monkeypat
     assert any("adverse stop" in m for m in engine.notifier.messages)
 
 
+async def test_safety_skips_on_stale_book(engine):
+    """A frozen book (old ts) must not trigger any auto-close."""
+    import time as _t
+    pos_id = await open_position(engine)
+    # Deeply converged + profitable, but quotes are 30s old (> QUOTE_STALE).
+    old = int(_t.time() * 1000) - 30_000
+    from exchange_client import BookTicker
+    engine.md.aster_books["BTCUSDT"] = BookTicker(
+        "BTCUSDT", Decimal("99.0"), Decimal(100), Decimal("99.1"), Decimal(100), old)
+    engine.md.mexc_books["BTCUSDT"] = BookTicker(
+        "BTCUSDT", Decimal("99.9"), Decimal(100), Decimal("100.0"), Decimal(100), old)
+    await engine._check_safety(engine.positions.get(pos_id))
+    assert engine.positions.get(pos_id).exit_mode is None   # nothing fired
+
+
 async def test_converged_starts_passive_when_taker_unprofitable(engine):
     """Converged (maker-taker basis <= 0) but a taker-taker close would lose
     (wide Aster ask, the ETHFI case): don't cross at a loss — work it passively
@@ -342,7 +357,7 @@ async def test_position_marks_skips_when_symbol_not_in_universe(engine):
 
 async def test_remove_marks_position_closed_no_trading(engine):
     pid = await open_position(engine)
-    out = engine._cmd_remove({"position_id": "BTC"})
+    out = await engine._cmd_remove({"position_id": "BTC"})
     assert "removed" in out.lower()
     pos = engine.positions.get(pid)
     assert pos.state == pm.CLOSED
@@ -353,19 +368,19 @@ async def test_remove_clears_auto_state(engine):
     pid = await open_position(engine)
     engine._auto_passive.add(pid)
     engine._liq_alerted[pid] = 1.0
-    engine._cmd_remove({"position_id": str(pid)})
+    await engine._cmd_remove({"position_id": str(pid)})
     assert engine.positions.get(pid).state == pm.CLOSED
     assert pid not in engine._auto_passive and pid not in engine._liq_alerted
 
 
 async def test_remove_unknown_symbol(engine):
-    assert "no active position" in engine._cmd_remove({"position_id": "ETH"})
+    assert "no active position" in await engine._cmd_remove({"position_id": "ETH"})
 
 
 async def test_remove_already_closed(engine):
     pid = await open_position(engine)
-    engine._cmd_remove({"position_id": str(pid)})
-    assert "already CLOSED" in engine._cmd_remove({"position_id": str(pid)})
+    await engine._cmd_remove({"position_id": str(pid)})
+    assert "already CLOSED" in await engine._cmd_remove({"position_id": str(pid)})
 
 
 class _StopClient:
@@ -495,7 +510,7 @@ async def test_resolve_position_by_symbol(engine):
 
 async def test_exit_command_accepts_symbol(engine):
     await open_position(engine)
-    result = engine._cmd_exit({"position_id": "btc", "mode": "now"})
+    result = await engine._cmd_exit({"position_id": "btc", "mode": "now"})
     assert "exit started" in result
 
 

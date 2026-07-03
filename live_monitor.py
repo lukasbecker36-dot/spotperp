@@ -605,11 +605,11 @@ class Engine:
             if command == "enter":
                 return self._cmd_enter(args)
             if command == "exit":
-                return self._cmd_exit(args)
+                return await self._cmd_exit(args)
             if command == "cancel":
                 return self._cmd_cancel(args)
             if command == "flatten":
-                return self._cmd_flatten()
+                return await self._cmd_flatten()
             if command == "recon":
                 return await self._cmd_recon()
             if command == "book":
@@ -623,7 +623,7 @@ class Engine:
             if command == "stops":
                 return await self._cmd_stops(args)
             if command == "remove":
-                return self._cmd_remove(args)
+                return await self._cmd_remove(args)
             return f"unknown command: {command}"
         except Exception as exc:
             log.exception("command %s failed", command)
@@ -720,7 +720,19 @@ class Engine:
             return f"multiple active positions in {symbol} (ids {ids}) — use the ID"
         return matches[0]
 
-    def _cmd_exit(self, args: dict) -> str:
+    async def _cancel_stops_for(self, pos: pm.Position) -> int:
+        """Cancel a position's resting protective /stops on both venues. Called
+        when a close begins so the spot LIMIT stops locking the balance (which
+        makes the exit's spot sell fail 'insufficient balance') and the perp
+        STOP doesn't fire mid-close. No-op in paper / when no pair."""
+        if self.paper:
+            return 0
+        pair = self.md.pair_maps.get(pos.symbol)
+        if pair is None:
+            return 0
+        return await self._cancel_stop_orders(pair)
+
+    async def _cmd_exit(self, args: dict) -> str:
         pos = self._resolve_position(args["position_id"])
         if isinstance(pos, str):
             return pos
@@ -729,6 +741,7 @@ class Engine:
         mode = args.get("mode", "now")
         if mode == "cancel":
             return self._cancel_exit(pos)
+        await self._cancel_stops_for(pos)
         target = args.get("target_bps")
         target_dec = Decimal(str(target)) if target is not None else (
             config.EXIT_BASIS_BPS if mode == "passive" else None
@@ -778,11 +791,13 @@ class Engine:
             return f"position {pos.id}: entry cancel requested"
         return f"position {pos.id}: no working entry or exit to cancel"
 
-    def _cmd_remove(self, args: dict) -> str:
+    async def _cmd_remove(self, args: dict) -> str:
         """Stop tracking a position that was closed manually on the exchange:
-        mark it CLOSED in the DB with NO venue orders (unlike /flatten, which
-        trades to close). Cancels any working entry/exit task and clears its
-        auto-exit / liq-alert state. Reversible via /adopt if done by mistake."""
+        mark it CLOSED in the DB and place NO closing trades (unlike /flatten).
+        Cancels any working entry/exit task, clears its auto-exit / liq-alert
+        state, and cancels any resting orders it left on the venues (entry,
+        exit and /stops) so they can't fire on an untracked position.
+        Reversible via /adopt if done by mistake."""
         pos = self._resolve_position(str(args.get("position_id", "")))
         if isinstance(pos, str):
             return pos
@@ -793,24 +808,32 @@ class Engine:
             task.cancel()
         self._auto_passive.discard(pos.id)
         self._liq_alerted.pop(pos.id, None)
+        cancelled = 0
+        pair = self.md.pair_maps.get(pos.symbol)
+        if pair is not None and not self.paper:
+            cancelled = await self._cancel_stop_orders(
+                pair, ("sp_stop_", "sp_pent_", "sp_pext_")
+            )
         prior = pos.state
         self.positions.set_state(pos.id, pm.CLOSED, "removed: closed manually on venue")
         journal(self.conn, f"position {pos.id} {pos.symbol}: /remove -> CLOSED"
-                f" (was {prior}, no venue orders)")
+                f" (was {prior}, cancelled {cancelled} resting orders)")
+        extra = f", cancelled {cancelled} resting order(s)" if cancelled else ""
         return (
             f"removed #{pos.id} {pos.symbol} from active positions — marked CLOSED,"
-            f" no venue orders placed (was {prior}, perp={pos.perp_qty}"
+            f" no closing trades placed{extra} (was {prior}, perp={pos.perp_qty}"
             f" spot={pos.spot_qty}). If that was a mistake, /adopt {pos.symbol}"
             f" to restore tracking."
         )
 
-    def _cmd_flatten(self) -> str:
+    async def _cmd_flatten(self) -> str:
         count = 0
         for pos in self.positions.active():
             if pos.state in (pm.PENDING_ENTRY, pm.ENTERING):
                 self.executor.request_cancel(pos.id)
                 count += 1
             elif pos.state == pm.OPEN:
+                await self._cancel_stops_for(pos)
                 self.positions.set_exit_request(pos.id, "now", None)
                 self.executor.start_exit(self.positions.get(pos.id))
                 count += 1
@@ -942,20 +965,24 @@ class Engine:
             head += f" (replaced {cancelled} prior)"
         return head + "\n  " + "\n  ".join(lines)
 
-    async def _cancel_stop_orders(self, pair: screener.PairMap) -> int:
-        """Cancel any resting /stops orders (client id prefix sp_stop_) on both
-        venues for a symbol, so re-running /stops refreshes rather than stacks."""
+    async def _cancel_stop_orders(
+        self, pair: screener.PairMap, prefixes: tuple[str, ...] = ("sp_stop_",)
+    ) -> int:
+        """Cancel our resting orders on both venues for a symbol, matched by
+        client-id prefix. Default is just /stops (sp_stop_) so re-running /stops
+        refreshes rather than stacks; /remove passes all sp_ prefixes to clear
+        every order it left behind."""
         cancelled = 0
         for client, symbol in (
             (self.aster, pair.aster_symbol), (self.mexc, pair.mexc_symbol)
         ):
             try:
                 for o in await client.open_orders(symbol):
-                    if o.client_order_id.startswith("sp_stop_"):
+                    if o.client_order_id.startswith(prefixes):
                         await client.cancel_order(symbol, o.order_id)
                         cancelled += 1
             except ExchangeError:
-                log.exception("cancel prior stops on %s failed", symbol)
+                log.exception("cancel resting orders on %s failed", symbol)
         return cancelled
 
     async def _cmd_book(self, args: dict) -> str:
@@ -1242,6 +1269,11 @@ class Engine:
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS * 5)
 
     async def _check_safety(self, pos: pm.Position) -> None:
+        # Never auto-close on a frozen book: a stale quote can show a phantom
+        # converged/inverted basis and trigger a taker close into prices that no
+        # longer exist. Max-hold waits too; it'll fire once quotes are fresh.
+        if not self.executor._books_fresh(pos.symbol):
+            return
         close = self.executor._close_basis_bps(pos.symbol)
         if (config.ADVERSE_WIDEN_STOP_BPS is not None
                 and close is not None and pos.entry_basis_bps is not None):
@@ -1258,6 +1290,7 @@ class Engine:
                     f" ({float(pos.entry_basis_bps):.1f} ->"
                     f" {float(close):.1f}bps) — force closing"
                 )
+                await self._cancel_stops_for(pos)
                 self.positions.set_exit_request(pos.id, "now", None)
                 self.executor.start_exit(self.positions.get(pos.id))
                 return
@@ -1282,6 +1315,7 @@ class Engine:
                     f"🎯 position {pos.id} {pos.symbol}: basis {float(close):.1f}bps,"
                     f" taker close nets ${float(pnl):+.2f} — taking profit"
                 )
+                await self._cancel_stops_for(pos)
                 self.positions.set_exit_request(pos.id, "now", None)
                 self.executor.start_exit(self.positions.get(pos.id))
                 return
@@ -1298,6 +1332,7 @@ class Engine:
                 f" {float(config.CONVERGED_PASSIVE_BPS):.0f}bps (will cross if a"
                 f" taker close turns profitable)"
             )
+            await self._cancel_stops_for(pos)
             self._auto_passive.add(pos.id)
             self.positions.set_exit_request(
                 pos.id, "passive", config.CONVERGED_PASSIVE_BPS
@@ -1318,6 +1353,8 @@ class Engine:
             # Operator switched it (e.g. /exit now) — release ownership.
             self._auto_passive.discard(pos.id)
             return
+        if not self.executor._books_fresh(pos.symbol):
+            return  # don't escalate/stand-down on a frozen book
         close = self.executor._close_basis_bps(pos.symbol)
         if close is None:
             return
@@ -1348,6 +1385,7 @@ class Engine:
                 f"🎯 position {pos.id} {pos.symbol}: basis {float(close):.1f}bps,"
                 f" taker close now nets ${float(pnl):+.2f} — crossing to lock it"
             )
+            await self._cancel_stops_for(pos)
             self.positions.set_exit_request(pos.id, "now", None)
             self.executor.start_exit(self.positions.get(pos.id))
 
@@ -1375,6 +1413,7 @@ class Engine:
             f"⏰ position {pos.id} {pos.symbol}: max hold"
             f" ({config.MAX_HOLD_HOURS}h) reached — force closing"
         )
+        await self._cancel_stops_for(pos)
         self.positions.set_exit_request(pos.id, "now", None)
         self.executor.start_exit(self.positions.get(pos.id))
 

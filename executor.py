@@ -478,6 +478,17 @@ class Executor:
             self._md.mexc_books.get(pair.mexc_symbol),
         )
 
+    def _books_fresh(self, symbol: str) -> bool:
+        """Both venues quoted within QUOTE_STALE_SECONDS. Guards safety auto-
+        closes from firing on a frozen book (e.g. a MEXC REST outage leaving the
+        last snapshot in place while the market moves)."""
+        aster, mexc = self._books(symbol)
+        if aster is None or mexc is None:
+            return False
+        stale_ms = config.QUOTE_STALE_SECONDS * 1000
+        now_ms = int(time.time() * 1000)
+        return (now_ms - aster.ts_ms) <= stale_ms and (now_ms - mexc.ts_ms) <= stale_ms
+
     def _entry_basis_bps(self, symbol: str) -> Decimal | None:
         aster, mexc = self._books(symbol)
         if aster is None or mexc is None:
