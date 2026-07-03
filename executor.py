@@ -427,12 +427,25 @@ class Executor:
         incremental notional, folding the fills into the same position."""
         self._spawn(position.id, self._run_entry(position, add_notional=add_notional))
 
-    def start_exit(self, position: pm.Position) -> None:
-        existing = self._tasks.get(position.id)
-        if existing and not existing.done():
-            # A passive exit being replaced (e.g. /exit ID now): stop it first.
-            existing.cancel()
+    async def start_exit(self, position: pm.Position) -> None:
+        await self._cancel_task(position.id)
         self._spawn(position.id, self._run_exit(position))
+
+    async def _cancel_task(self, position_id: int) -> None:
+        """Cancel a running task for this position and AWAIT its cleanup before
+        returning, so a replacement can't run concurrently with the old task's
+        CancelledError handler (which cancels resting orders and sells pending
+        spot) — that race could double-sell spot or drive perp_qty negative."""
+        existing = self._tasks.get(position_id)
+        if existing and not existing.done():
+            existing.cancel()
+            try:
+                await existing
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("cancelled task for position %s ended in error",
+                              position_id)
 
     def request_cancel(self, position_id: int) -> bool:
         """Abort a working ENTRY (no new fills; what's hedged stays open)."""
@@ -913,7 +926,10 @@ class Executor:
                 await hedge_unhedged()
                 await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
         except asyncio.CancelledError:
-            # Engine shutdown: leave resting orders for recovery to reconcile.
+            # Shutdown: leave any resting order for recovery to reconcile (it
+            # cancels sp_pent_ on active symbols at startup). Operator /remove
+            # cancels the resting order itself before marking CLOSED, and /exit
+            # can't reach an ENTERING position, so no other path orphans it.
             raise
 
         final = self._positions.get(position.id)

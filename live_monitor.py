@@ -115,7 +115,7 @@ class Engine:
         await self._refresh_books()
         await self._refresh_funding()
         await self._refresh_funding_stats()
-        self._resume_positions()
+        await self._resume_positions()
         try:
             await self._refresh_position_funding()
         except Exception:
@@ -165,11 +165,11 @@ class Engine:
             )
         return added, removed
 
-    def _resume_positions(self) -> None:
+    async def _resume_positions(self) -> None:
         for pos in self.positions.active():
             if pos.state == pm.EXITING:
                 log.info("resuming exit for position %s", pos.id)
-                self.executor.start_exit(pos)
+                await self.executor.start_exit(pos)
             elif pos.state == pm.UNWINDING:
                 journal(
                     self.conn,
@@ -614,7 +614,7 @@ class Engine:
             if command == "exit":
                 return await self._cmd_exit(args)
             if command == "cancel":
-                return self._cmd_cancel(args)
+                return await self._cmd_cancel(args)
             if command == "flatten":
                 return await self._cmd_flatten()
             if command == "recon":
@@ -747,7 +747,7 @@ class Engine:
             return f"position {pos.id} is {pos.state}, cannot exit"
         mode = args.get("mode", "now")
         if mode == "cancel":
-            return self._cancel_exit(pos)
+            return await self._cancel_exit(pos)
         await self._cancel_stops_for(pos)
         target = args.get("target_bps")
         target_dec = Decimal(str(target)) if target is not None else (
@@ -769,31 +769,31 @@ class Engine:
                 target_qty = pos.perp_qty - q
                 size_desc = f"{q} of {pos.perp_qty}"
         self.positions.set_exit_request(pos.id, mode, target_dec, target_qty)
-        self.executor.start_exit(self.positions.get(pos.id))
+        await self.executor.start_exit(self.positions.get(pos.id))
         desc = "aggressive (taker both legs)" if mode == "now" else (
             f"passive maker, target {target_dec}bps"
         )
         return f"position {pos.id}: exit started — {desc}, size {size_desc}"
 
-    def _cancel_exit(self, pos: pm.Position) -> str:
-        """Stop a working exit: cancel the task (its cleanup pulls any resting
-        maker order and balances the legs) and return the position to OPEN."""
+    async def _cancel_exit(self, pos: pm.Position) -> str:
+        """Stop a working exit: cancel the task and AWAIT its cleanup (which
+        pulls any resting maker order and records late fills) BEFORE flipping
+        the position back to OPEN, so the state can't say OPEN while the dying
+        task is still trading."""
         if pos.state != pm.EXITING and pos.exit_mode is None:
             return f"position {pos.id} has no working exit"
-        task = self.executor._tasks.get(pos.id)
-        if task and not task.done():
-            task.cancel()
+        await self.executor._cancel_task(pos.id)
         self.positions.set_exit_request(pos.id, None, None)
         self.positions.set_state(pos.id, pm.OPEN, "exit cancelled by operator")
         return f"position {pos.id}: exit cancelled, back to OPEN"
 
-    def _cmd_cancel(self, args: dict) -> str:
+    async def _cmd_cancel(self, args: dict) -> str:
         pos = self._resolve_position(args["position_id"])
         if isinstance(pos, str):
             return pos
         # /cancel handles whatever is working: an exit if EXITING, else an entry.
         if pos.state == pm.EXITING:
-            return self._cancel_exit(pos)
+            return await self._cancel_exit(pos)
         if self.executor.request_cancel(pos.id):
             return f"position {pos.id}: entry cancel requested"
         return f"position {pos.id}: no working entry or exit to cancel"
@@ -810,9 +810,9 @@ class Engine:
             return pos
         if pos.state in (pm.CLOSED, pm.CANCELLED):
             return f"position {pos.id} {pos.symbol} is already {pos.state}"
-        task = self.executor._tasks.get(pos.id)
-        if task and not task.done():
-            task.cancel()
+        # Await cleanup so a dying exit task can't record fills into the position
+        # after we mark it CLOSED below.
+        await self.executor._cancel_task(pos.id)
         self._auto_passive.discard(pos.id)
         self._liq_alerted.pop(pos.id, None)
         cancelled = 0
@@ -842,7 +842,7 @@ class Engine:
             elif pos.state == pm.OPEN:
                 await self._cancel_stops_for(pos)
                 self.positions.set_exit_request(pos.id, "now", None)
-                self.executor.start_exit(self.positions.get(pos.id))
+                await self.executor.start_exit(self.positions.get(pos.id))
                 count += 1
         return f"flatten: {count} positions being closed/cancelled"
 
@@ -1299,7 +1299,7 @@ class Engine:
                 )
                 await self._cancel_stops_for(pos)
                 self.positions.set_exit_request(pos.id, "now", None)
-                self.executor.start_exit(self.positions.get(pos.id))
+                await self.executor.start_exit(self.positions.get(pos.id))
                 return
         # Carry trades are held for funding and only the operator closes them:
         # skip the convergence auto-close and the max-hold timeout. The
@@ -1324,7 +1324,7 @@ class Engine:
                 )
                 await self._cancel_stops_for(pos)
                 self.positions.set_exit_request(pos.id, "now", None)
-                self.executor.start_exit(self.positions.get(pos.id))
+                await self.executor.start_exit(self.positions.get(pos.id))
                 return
             # Converged but a taker close isn't worth it yet: work it passively
             # at the convergence target (maker perp buy-back, 0 perp fee).
@@ -1344,7 +1344,7 @@ class Engine:
             self.positions.set_exit_request(
                 pos.id, "passive", config.CONVERGED_PASSIVE_BPS
             )
-            self.executor.start_exit(self.positions.get(pos.id))
+            await self.executor.start_exit(self.positions.get(pos.id))
             return
         if pos.opened_ms is not None:
             hold_hours = (time.time() * 1000 - pos.opened_ms) / 3_600_000
@@ -1369,7 +1369,7 @@ class Engine:
         # OPEN so it keeps collecting funding and max-hold is re-armed.
         if close > config.CONVERGED_PASSIVE_BPS + config.CONVERGED_PASSIVE_RESET_BPS:
             self._auto_passive.discard(pos.id)
-            self._cancel_exit(pos)
+            await self._cancel_exit(pos)
             journal(
                 self.conn,
                 f"position {pos.id}: basis recovered to {close:.1f}bps -> back"
@@ -1394,7 +1394,7 @@ class Engine:
             )
             await self._cancel_stops_for(pos)
             self.positions.set_exit_request(pos.id, "now", None)
-            self.executor.start_exit(self.positions.get(pos.id))
+            await self.executor.start_exit(self.positions.get(pos.id))
 
     def _aggressive_close_pnl(self, pos: pm.Position) -> Decimal | None:
         """Estimated net PnL of closing taker on both legs right now:
@@ -1422,7 +1422,7 @@ class Engine:
         )
         await self._cancel_stops_for(pos)
         self.positions.set_exit_request(pos.id, "now", None)
-        self.executor.start_exit(self.positions.get(pos.id))
+        await self.executor.start_exit(self.positions.get(pos.id))
 
 
 async def main() -> None:

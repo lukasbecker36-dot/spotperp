@@ -195,6 +195,27 @@ async def test_entry_hedge_ambiguous_does_not_unwind(env):
     assert final.spot_qty == 0       # spot never confirmed
 
 
+async def test_cancel_task_awaits_cleanup(env):
+    """start_exit/_cancel_task must AWAIT the replaced task's CancelledError
+    cleanup before returning, so a replacement can't trade concurrently with
+    the dying task's order-cancel / spot-sell cleanup."""
+    md, positions, executor, notifier, conn = env
+    cleanup_done = {"v": False}
+
+    async def slow_task():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)      # simulate cleanup work
+            cleanup_done["v"] = True
+            raise
+    executor._spawn(999, slow_task())
+    await asyncio.sleep(0.01)              # let it start
+
+    await executor._cancel_task(999)
+    assert cleanup_done["v"] is True       # cleanup finished before we returned
+
+
 async def test_passive_exit_closes_with_pnl(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)
@@ -203,7 +224,7 @@ async def test_passive_exit_closes_with_pnl(env):
     # passive exit with target 15bps: close basis is ~10bps < 15 -> not gated
     set_books(md, "100.0", "100.1", "99.9", "100.0")
     positions.set_exit_request(pos_id, "passive", Decimal(15))
-    executor.start_exit(positions.get(pos_id))
+    await executor.start_exit(positions.get(pos_id))
 
     # Paper maker BUY fills instantly at the bid (100.0); spot sells at bid (99.9)
     await wait_for_state(positions, pos_id, pm.CLOSED)
@@ -253,7 +274,7 @@ async def test_passive_exit_completes_when_bid_thin(env):
     # converged: close basis ~10bps, target 15 -> not gated; only 2 units bid.
     set_books(md, "100.0", "100.1", "99.9", "100.0", mexc_bid_qty="2")
     positions.set_exit_request(pos_id, "passive", Decimal(15))
-    executor.start_exit(positions.get(pos_id))
+    await executor.start_exit(positions.get(pos_id))
     await wait_for_state(positions, pos_id, pm.CLOSED)
     final = positions.get(pos_id)
     assert final.perp_qty == 0 and final.spot_qty == 0
@@ -265,7 +286,7 @@ async def test_passive_exit_respects_target_gate(env):
 
     # close basis is ~50bps (same as entry), target 5bps -> gated, no order
     positions.set_exit_request(pos_id, "passive", Decimal(5))
-    executor.start_exit(positions.get(pos_id))
+    await executor.start_exit(positions.get(pos_id))
     await asyncio.sleep(0.2)
     final = positions.get(pos_id)
     assert final.state == pm.EXITING
@@ -411,7 +432,7 @@ async def test_partial_aggressive_exit_leaves_residual_open(env):
     floor = full - Decimal("4.0")                     # stop at 5.95
     set_books(md, "100.0", "100.1", "99.9", "100.0")
     positions.set_exit_request(pos_id, "now", None, floor)
-    executor.start_exit(positions.get(pos_id))
+    await executor.start_exit(positions.get(pos_id))
 
     await wait_for_perp_qty(positions, pos_id, floor)  # closed 4, residual remains
     p = positions.get(pos_id)
@@ -428,12 +449,12 @@ async def test_partial_then_full_exit_closes(env):
     floor = full - Decimal("4.0")
     set_books(md, "100.0", "100.1", "99.9", "100.0")
     positions.set_exit_request(pos_id, "now", None, floor)
-    executor.start_exit(positions.get(pos_id))
+    await executor.start_exit(positions.get(pos_id))
     await wait_for_perp_qty(positions, pos_id, floor)
     assert positions.get(pos_id).state == pm.OPEN
     # now close the rest (no qty -> full)
     positions.set_exit_request(pos_id, "now", None, None)
-    executor.start_exit(positions.get(pos_id))
+    await executor.start_exit(positions.get(pos_id))
     await wait_for_state(positions, pos_id, pm.CLOSED)
     final = positions.get(pos_id)
     assert final.perp_qty == 0 and final.spot_qty == 0
@@ -454,7 +475,7 @@ async def test_passive_exit_holds_when_depth_missing(env):
     executor._trader.spot_depth = empty_depth
 
     positions.set_exit_request(pos_id, "passive", Decimal(0))
-    executor.start_exit(positions.get(pos_id))
+    await executor.start_exit(positions.get(pos_id))
     await asyncio.sleep(0.3)
     p = positions.get(pos_id)
     assert p.state == pm.EXITING            # still working, NOT closed
@@ -471,7 +492,7 @@ async def test_passive_exit_alerts_when_target_below_min_notional(env):
     # closeable size is well below the $5 min order.
     set_books(md, "100.0", "100.1", "99.9", "100.0", mexc_bid_qty="0.01")
     positions.set_exit_request(pos_id, "passive", Decimal(15))
-    executor.start_exit(positions.get(pos_id))
+    await executor.start_exit(positions.get(pos_id))
     await wait_for_message(notifier, "not reachable")
     p = positions.get(pos_id)
     assert p.state == pm.EXITING
@@ -517,7 +538,7 @@ async def test_aggressive_exit_closes_immediately(env):
     pos_id = await open_position(md, positions, executor)
 
     positions.set_exit_request(pos_id, "now", None)
-    executor.start_exit(positions.get(pos_id))
+    await executor.start_exit(positions.get(pos_id))
     await wait_for_state(positions, pos_id, pm.CLOSED)
     final = positions.get(pos_id)
     assert final.perp_qty == 0 and final.spot_qty == 0
