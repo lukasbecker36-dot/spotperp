@@ -122,6 +122,15 @@ def test_format_report_shows_mark_liq_and_warns_when_close(monkeypatch):
     assert "+8.0% to liq" in close and "⚠️" in close  # <15% -> warn
 
 
+def test_format_report_shows_funding_rates(monkeypatch):
+    monkeypatch.setattr(config, "ASTER_MAKER_FEE", Decimal("0.0"))
+    monkeypatch.setattr(config, "MEXC_TAKER_FEE", Decimal("0.0"))
+    out = recon.format_report(
+        [_pair(funding_now_8h_bps=5.2, funding_avg_8h_bps=4.8)], []
+    )
+    assert "fund rate now +5.2 / 24h +4.8 bps/8h" in out
+
+
 def test_format_report_liq_na_when_missing(monkeypatch):
     monkeypatch.setattr(config, "ASTER_MAKER_FEE", Decimal("0.0"))
     monkeypatch.setattr(config, "MEXC_TAKER_FEE", Decimal("0.0"))

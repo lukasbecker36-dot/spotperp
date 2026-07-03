@@ -89,6 +89,8 @@ class PairRecon:
     perp_base: Decimal         # perp_qty * qty_multiplier
     perp_mark: Decimal = Decimal(0)   # Aster mark price (liq triggers on this)
     perp_liq: Decimal = Decimal(0)    # Aster liquidation price (0 = none/unknown)
+    funding_now_8h_bps: float = 0.0   # current funding rate, projected to 8h
+    funding_avg_8h_bps: float = 0.0   # realised 24h funding, re-expressed per 8h
 
     @property
     def liq_distance_pct(self) -> Decimal | None:
@@ -163,6 +165,10 @@ def format_report(pairs: list[PairRecon], notes: list[str]) -> str:
         lines.append(
             f"  funding {float(p.funding_usd):+.2f}"
             f"   fees -{float(p.fees):.2f}"
+        )
+        lines.append(
+            f"  fund rate now {p.funding_now_8h_bps:+.1f}"
+            f" / 24h {p.funding_avg_8h_bps:+.1f} bps/8h"
         )
         lines.append(f"  NET {float(p.net_pnl):+.2f}")
         if abs(p.hedge_imbalance) > p.perp_base * _QTY_TOL:

@@ -1117,6 +1117,17 @@ class Engine:
             perp_mark = (aster_book.bid + aster_book.ask) / Decimal(2)
         perp_liq = _dec_or_zero(risk_row.get("liquidationPrice"))
 
+        # Funding rate: current (live premiumIndex, projected to 8h) and the
+        # realised 24h average re-expressed per 8h — same figures as /funding.
+        stat = self.md.funding_stats.get(pair.aster_symbol)
+        interval = stat.interval_hours if stat else config.FUNDING_INTERVAL_HOURS
+        live_rate = (self.md.funding.get(pair.aster_symbol) or {}).get("funding_rate")
+        if live_rate is not None and interval:
+            funding_now = float(live_rate * Decimal(10000) * Decimal(8) / Decimal(interval))
+        else:
+            funding_now = stat.current_8h_bps if stat else 0.0
+        funding_avg = stat.avg_24h_8h_bps if stat else 0.0
+
         spot_balance = balances.get(base, Decimal(0))
         spot_qty = min(spot_balance, perp_base)
         if spot_qty <= 0:
@@ -1170,6 +1181,8 @@ class Engine:
             perp_base=perp_base,
             perp_mark=perp_mark,
             perp_liq=perp_liq,
+            funding_now_8h_bps=funding_now,
+            funding_avg_8h_bps=funding_avg,
         )
 
     async def _safety_loop(self) -> None:
