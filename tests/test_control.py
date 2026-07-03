@@ -4,12 +4,32 @@ The bot is built via __new__ to skip the Telegram-credential __init__; only
 the subprocess-shelling helpers are exercised, with subprocess stubbed so no
 real git/systemctl runs.
 """
+import inspect
+import re
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 
 import control_bot
+
+
+def test_bot_commands_valid_telegram_format():
+    """Telegram rejects the whole setMyCommands if any entry is malformed."""
+    seen = set()
+    for c in control_bot.BOT_COMMANDS:
+        name, desc = c["command"], c["description"]
+        assert re.fullmatch(r"[a-z0-9_]{1,32}", name), f"bad name {name!r}"
+        assert 1 <= len(desc) <= 256, f"bad description length for {name}"
+        assert name not in seen, f"duplicate command {name}"
+        seen.add(name)
+
+
+def test_every_menu_command_is_dispatched():
+    """No menu command may be missing a handler (guards against drift/typos)."""
+    src = inspect.getsource(control_bot.ControlBot._dispatch)
+    for c in control_bot.BOT_COMMANDS:
+        assert f'"{c["command"]}"' in src, f'{c["command"]} not handled in _dispatch'
 
 
 def _bot() -> control_bot.ControlBot:

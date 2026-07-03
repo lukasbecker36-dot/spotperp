@@ -61,6 +61,41 @@ HELP = """Commands:
 /flatten YES — emergency close everything
 """
 
+# Telegram command menu / autocomplete (setMyCommands). Keep in sync with the
+# dispatcher in _dispatch(); grouped monitoring -> trading -> position mgmt ->
+# mode/service. Telegram limits: name 1-32 chars [a-z0-9_], description 1-256.
+BOT_COMMANDS = [
+    # monitoring
+    {"command": "screen", "description": "Top basis opportunities (5m avg)"},
+    {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
+    {"command": "positions", "description": "Open positions, P&L + liq proximity"},
+    {"command": "recon", "description": "Live venue P&L, funding rate + liq"},
+    {"command": "balance", "description": "USDT balance on each venue"},
+    {"command": "book", "description": "Order book both venues: SYMBOL"},
+    {"command": "status", "description": "Engine status and heartbeat"},
+    {"command": "pnl", "description": "Realised P&L summary"},
+    {"command": "trades", "description": "Recent closed trades"},
+    {"command": "log", "description": "Recent journal entries"},
+    # trading
+    {"command": "enter", "description": "Enter / size up: SYMBOL NOTIONAL [min_bps] [carry]"},
+    {"command": "exit", "description": "Exit: ID|SYMBOL now|passive [bps]"},
+    {"command": "cancel", "description": "Cancel working entry or exit: ID|SYMBOL"},
+    {"command": "stops", "description": "Liq-protection orders 1% below liq: SYMBOL"},
+    {"command": "flatten", "description": "Close all positions (YES)"},
+    # position management
+    {"command": "adopt", "description": "Import a venue carry trade: SYMBOL"},
+    {"command": "remove", "description": "Stop tracking a manually-closed pos: ID|SYMBOL YES"},
+    {"command": "refresh", "description": "Rebuild the cross-listed coin universe"},
+    # mode + service
+    {"command": "mode", "description": "Show paper/live mode"},
+    {"command": "paper", "description": "Switch to paper mode"},
+    {"command": "live", "description": "Switch to live mode (YES)"},
+    {"command": "start", "description": "Start the engine service"},
+    {"command": "stop", "description": "Stop the engine service (YES)"},
+    {"command": "restart", "description": "Restart the engine service"},
+    {"command": "update", "description": "Git pull + restart (deploy latest code)"},
+]
+
 
 class ControlBot:
     def __init__(self, session: aiohttp.ClientSession):
@@ -79,30 +114,10 @@ class ControlBot:
     # ── telegram plumbing ──
 
     async def _register_commands(self) -> None:
-        commands = [
-            {"command": "screen", "description": "Top basis opportunities"},
-            {"command": "funding", "description": "Top funding carry (24h avg)"},
-            {"command": "enter", "description": "Enter: SYMBOL NOTIONAL [min_bps] [carry]"},
-            {"command": "exit", "description": "Exit: ID|SYMBOL now|passive [bps]"},
-            {"command": "cancel", "description": "Cancel working entry or exit: ID|SYMBOL"},
-            {"command": "positions", "description": "Show open positions"},
-            {"command": "balance", "description": "USDT balance on each venue"},
-            {"command": "recon", "description": "Live exchange P&L (round-trip cost)"},
-            {"command": "adopt", "description": "Import venue carry trade: SYMBOL"},
-            {"command": "book", "description": "Order book both venues: SYMBOL"},
-            {"command": "status", "description": "Engine status and heartbeat"},
-            {"command": "pnl", "description": "Realised P&L summary"},
-            {"command": "trades", "description": "Recent closed trades"},
-            {"command": "log", "description": "Recent journal entries"},
-            {"command": "mode", "description": "Show paper/live mode"},
-            {"command": "paper", "description": "Switch to paper mode"},
-            {"command": "live", "description": "Switch to live mode (YES)"},
-            {"command": "flatten", "description": "Close all positions (YES)"},
-        ]
         url = f"https://api.telegram.org/bot{self._token}/setMyCommands"
-        async with self._session.post(url, json={"commands": commands}) as resp:
+        async with self._session.post(url, json={"commands": BOT_COMMANDS}) as resp:
             if resp.status == 200:
-                log.info("registered %d bot commands", len(commands))
+                log.info("registered %d bot commands", len(BOT_COMMANDS))
             else:
                 log.warning("setMyCommands failed: %s", await resp.text())
 
