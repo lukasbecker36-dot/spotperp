@@ -174,6 +174,27 @@ async def test_add_no_fill_leaves_position_open(env):
     assert final.perp_qty == before.perp_qty           # unchanged
 
 
+async def test_entry_hedge_ambiguous_does_not_unwind(env):
+    """An ambiguous spot hedge (maybe-filled) must NOT unwind the perp (could go
+    naked spot) nor retry (could double) — keep the perp fill and alert."""
+    from exchange_client import AmbiguousOrderError
+    md, positions, executor, notifier, conn = env
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    async def ambiguous(symbol, side, qty, cap):
+        raise AmbiguousOrderError("mexc", "timeout after place")
+    executor._trader.spot_taker = ambiguous
+
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True)
+    executor.start_entry(pos)
+    await wait_for_message(notifier, "AMBIGUOUS")
+    await wait_for_state(positions, pos.id, pm.OPEN)
+
+    final = positions.get(pos.id)
+    assert final.perp_qty > 0        # perp fill kept, not unwound
+    assert final.spot_qty == 0       # spot never confirmed
+
+
 async def test_passive_exit_closes_with_pnl(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)

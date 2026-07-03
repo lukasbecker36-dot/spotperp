@@ -128,7 +128,14 @@ class _BaseClient:
                 try:
                     payload = await resp.json(content_type=None)
                 except Exception:
-                    raise ExchangeError(venue, f"non-JSON response: {text[:300]}")
+                    # A 2xx with an unparseable body on an order endpoint means
+                    # the order MAY have been accepted — treat as ambiguous so
+                    # the caller reconciles instead of assuming it failed.
+                    err = AmbiguousOrderError if order_endpoint else ExchangeError
+                    raise err(
+                        venue,
+                        f"non-JSON response (HTTP {resp.status}): {text[:300]}",
+                    )
                 if resp.status >= 400:
                     code = payload.get("code") if isinstance(payload, dict) else None
                     msg = payload.get("msg") if isinstance(payload, dict) else text

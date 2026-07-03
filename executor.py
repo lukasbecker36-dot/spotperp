@@ -284,11 +284,18 @@ class LiveTrader(Trader):
             intents.resolve_intent(self._conn, intent_id, "failed", str(exc))
             raise
         # MEXC place responses can omit executed qty; query for the final state.
+        # If that re-query fails we CANNOT tell a filled IOC from an empty one,
+        # so surface it as ambiguous rather than reporting qty=0 (which would
+        # make the hedge loop re-buy a possibly-filled order = double size).
         if result.executed_qty == 0 and result.order_id:
             try:
                 result = await self._mexc.get_order(symbol, result.order_id)
-            except ExchangeError:
-                pass
+            except ExchangeError as exc:
+                intents.resolve_intent(self._conn, intent_id, "ambiguous")
+                raise AmbiguousOrderError(
+                    "mexc",
+                    f"order {result.order_id} placed but fill state unknown ({exc})",
+                )
         intents.resolve_intent(self._conn, intent_id, "done", result.raw)
         return TakerFill(qty=result.executed_qty, avg_price=result.avg_price)
 
@@ -577,6 +584,11 @@ class Executor:
                 fill = await self._trader.spot_taker(
                     pair.mexc_symbol, side, remaining, cap
                 )
+            except AmbiguousOrderError:
+                # The order may have filled — retrying would double it. Propagate
+                # so the caller alerts and leaves reconciliation to recovery /
+                # the operator rather than blindly unwinding or re-sending.
+                raise
             except ExchangeError as exc:
                 last_error = str(exc)
                 log.warning("spot hedge attempt %s failed: %s", attempt + 1, exc)
@@ -768,9 +780,21 @@ class Executor:
                 await self._unwind_perp(position, naked)
                 return
 
-            shortfall, err = await self._hedge_spot(
-                position, "BUY", unhedged * pair.qty_multiplier, "entry"
-            )
+            try:
+                shortfall, err = await self._hedge_spot(
+                    position, "BUY", unhedged * pair.qty_multiplier, "entry"
+                )
+            except AmbiguousOrderError as exc:
+                # Spot buy may or may not have filled. Do NOT unwind (could leave
+                # a naked spot long) and do NOT retry (could double). Leave the
+                # perp fill recorded and let recovery / the operator reconcile.
+                unhedged = Decimal(0)
+                await self._notifier.alert(
+                    f"🚨 position {position.id} {symbol}: spot hedge AMBIGUOUS"
+                    f" ({exc}) — perp leg is filled but spot fill is UNKNOWN."
+                    f" NOT unwinding/retrying; reconcile the hedge manually."
+                )
+                return
             naked = shortfall / pair.qty_multiplier
             unhedged = Decimal(0)
             if naked > 0:
@@ -998,6 +1022,17 @@ class Executor:
                 continue
             results = await asyncio.gather(*(j[1] for j in jobs), return_exceptions=True)
             for (venue, _), result in zip(jobs, results):
+                if isinstance(result, AmbiguousOrderError):
+                    # Maybe-filled taker leg: stop this close and alert rather
+                    # than looping and re-sending (perp is reduce-only so it's
+                    # safe there, but a re-sent spot SELL would oversell).
+                    await self._notifier.alert(
+                        f"🚨 position {position.id} {symbol}: {venue} exit leg"
+                        f" AMBIGUOUS ({result}) — stopping close, reconcile"
+                        f" manually before re-exiting"
+                    )
+                    await self._complete_exit(position.id, floor_perp)
+                    return
                 if isinstance(result, BaseException):
                     log.warning("exit leg %s failed: %r", venue, result)
                     continue
@@ -1056,7 +1091,18 @@ class Executor:
             if not force and to_sell * ref < config.MIN_HEDGE_NOTIONAL_USD:
                 return
             qty = min(to_sell, self._positions.get(position.id).spot_qty)
-            shortfall, err = await self._hedge_spot(position, "SELL", qty, "exit")
+            try:
+                shortfall, err = await self._hedge_spot(position, "SELL", qty, "exit")
+            except AmbiguousOrderError as exc:
+                # Spot sell may have filled; don't retry (could oversell). Stop
+                # this increment and alert for manual reconciliation.
+                to_sell = Decimal(0)
+                await self._notifier.alert(
+                    f"🚨 position {position.id} {symbol}: spot exit sale AMBIGUOUS"
+                    f" ({exc}) — perp bought back but spot sale UNKNOWN. Reconcile"
+                    f" the spot balance manually."
+                )
+                return
             to_sell = shortfall
             if shortfall > 0:
                 reason = f" — MEXC: {err}" if err else " (no fill / thin book)"
