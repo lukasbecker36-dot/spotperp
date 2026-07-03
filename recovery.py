@@ -1,10 +1,11 @@
 """Startup reconciliation after a crash or restart.
 
 Strategy (conservative):
-1. Cancel any resting Aster orders on symbols of active positions — entry and
-   passive-exit tasks always re-place their maker orders, so a stale resting
-   order is the only thing that could double-fill. Fills detected during the
-   cancel are recorded so they get hedged/accounted.
+1. Cancel stale entry/passive-exit maker orders (client ids sp_pent_/sp_pext_)
+   on symbols of active positions — those tasks re-place their maker orders, so
+   a stale resting one is the only thing that could double-fill. Protective
+   /stops orders (sp_stop_) and any manual orders are LEFT IN PLACE: a restart
+   must not strip liquidation protection.
 2. Mark unresolved intents as reconciled (the cancel sweep plus position
    comparison covers their effects).
 3. Re-derive position states: ENTERING with exposure -> OPEN (the monitor
@@ -51,6 +52,10 @@ async def reconcile(
                 log.exception("recovery: open_orders(%s) failed", symbol)
                 continue
             for order in open_orders:
+                # Only sweep our own stale entry/exit maker orders. Protective
+                # /stops (sp_stop_) and manual orders must survive a restart.
+                if not order.client_order_id.startswith(("sp_pent_", "sp_pext_")):
+                    continue
                 try:
                     final = await aster.cancel_order(symbol, order.order_id)
                 except ExchangeError:

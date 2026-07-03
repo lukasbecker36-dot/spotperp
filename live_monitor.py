@@ -1188,19 +1188,26 @@ class Engine:
     async def _safety_loop(self) -> None:
         while True:
             try:
-                seen_auto: set[int] = set()
-                for pos in self.positions.active():
-                    # Liquidation risk exists in any state while the perp short
-                    # is open, so check it independently of the basis logic.
-                    await self._check_liquidation(pos)
-                    if pos.state == pm.OPEN:
-                        await self._check_safety(pos)
-                    elif pos.state == pm.EXITING and pos.id in self._auto_passive:
-                        seen_auto.add(pos.id)
-                        await self._check_auto_passive(pos)
-                # Drop ids that are no longer in an auto passive exit (closed,
-                # cancelled, or escalated away).
-                self._auto_passive &= seen_auto
+                active = self.positions.active()
+                active_ids = {p.id for p in active}
+                for pos in active:
+                    # One broken symbol (e.g. dropped from the universe -> KeyError
+                    # in _close_basis_bps) must not disable checks for every other
+                    # position, so isolate each one.
+                    try:
+                        # Liquidation risk exists in any state while the perp short
+                        # is open, so check it independently of the basis logic.
+                        await self._check_liquidation(pos)
+                        if pos.state == pm.OPEN:
+                            await self._check_safety(pos)
+                        elif pos.state == pm.EXITING and pos.id in self._auto_passive:
+                            await self._check_auto_passive(pos)
+                    except Exception:
+                        log.exception("safety check failed for position %s", pos.id)
+                # Drop auto-passive ids whose position is no longer active (closed,
+                # cancelled). Intersecting with active_ids — NOT a "seen this sweep"
+                # set — keeps ids that _check_safety just added this same sweep.
+                self._auto_passive &= active_ids
             except Exception:
                 log.exception("safety loop error")
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS * 5)

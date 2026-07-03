@@ -460,7 +460,12 @@ class Executor:
         return self._md.pair_maps[symbol]
 
     def _books(self, symbol: str) -> tuple[BookTicker | None, BookTicker | None]:
-        pair = self._pair(symbol)
+        # A symbol can drop out of the universe (delist/halt) while a position is
+        # still open; degrade to (None, None) rather than KeyError so the safety
+        # loop and marks skip it instead of crashing.
+        pair = self._md.pair_maps.get(symbol)
+        if pair is None:
+            return (None, None)
         return (
             self._md.aster_books.get(pair.aster_symbol),
             self._md.mexc_books.get(pair.mexc_symbol),
