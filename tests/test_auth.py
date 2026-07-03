@@ -83,3 +83,14 @@ def test_nonce_is_strictly_increasing():
     nonces = [next_nonce_us() for _ in range(100)]
     assert nonces == sorted(nonces)
     assert len(set(nonces)) == len(nonces)
+
+
+def test_nonce_monotonic_across_clock_step_back(monkeypatch):
+    """An NTP correction that steps the clock backward must not produce a nonce
+    below one already issued (Aster would reject every signed call otherwise)."""
+    import auth
+    monkeypatch.setattr(auth.time, "time", lambda: 1_000_000.0)
+    high = next_nonce_us()
+    monkeypatch.setattr(auth.time, "time", lambda: 999_999.0)  # clock jumped back 1s
+    after = next_nonce_us()
+    assert after > high

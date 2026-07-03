@@ -45,22 +45,22 @@ def now_ms() -> int:
 
 
 _nonce_lock = threading.Lock()
-_last_sec = 0
-_nonce_seq = 0
+_last_nonce = 0
 
 
 def next_nonce_us() -> int:
-    """Strictly increasing microsecond nonce (Aster keeps the last 100 nonces
-    and rejects anything below the current minimum)."""
-    global _last_sec, _nonce_seq
+    """Strictly increasing microsecond nonce, monotonic even across a backward
+    clock step. Aster keeps the last 100 nonces and rejects anything below the
+    current minimum, so an NTP correction that steps the clock back would
+    otherwise reject EVERY signed request (incl. exits/unwinds) until wall-clock
+    passed the old high-water mark. Tracking the last issued value avoids that.
+    (Caveat: the lock is in-process; don't run a signing script against the same
+    Aster agent key while the engine is live.)"""
+    global _last_nonce
     with _nonce_lock:
-        now = int(time.time())
-        if now == _last_sec:
-            _nonce_seq += 1
-        else:
-            _last_sec = now
-            _nonce_seq = 0
-        return now * 1_000_000 + _nonce_seq
+        candidate = int(time.time() * 1_000_000)
+        _last_nonce = max(candidate, _last_nonce + 1)
+        return _last_nonce
 
 
 @dataclass(frozen=True)

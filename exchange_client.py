@@ -122,6 +122,20 @@ class _BaseClient:
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 text = await resp.text()
+                if resp.status in (429, 418):
+                    # Rate limited / IP-banned: the request was rejected before
+                    # processing (order NOT placed), so it's a definitive error —
+                    # but back off first so the caller's retry doesn't hammer us
+                    # straight into a longer 418 ban.
+                    retry_after = resp.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after else 2.0
+                    log.warning(
+                        "%s rate limited (HTTP %s), backing off %.1fs (weight=%s)",
+                        venue, resp.status, delay,
+                        resp.headers.get("X-MBX-USED-WEIGHT-1M"),
+                    )
+                    await asyncio.sleep(min(delay, 30.0))
+                    raise ExchangeError(venue, f"rate limited HTTP {resp.status}")
                 if resp.status >= 500:
                     err = AmbiguousOrderError if order_endpoint else ExchangeError
                     raise err(venue, f"HTTP {resp.status}: {text[:300]}")
@@ -438,12 +452,29 @@ class MexcClient(_BaseClient):
     def __init__(self, session: aiohttp.ClientSession, creds: MexcCredentials | None):
         super().__init__(config.MEXC_BASE, session)
         self._creds = creds
+        self._time_offset_ms = 0   # server_time - local_time, kept by sync_time()
+
+    async def sync_time(self) -> int:
+        """Measure the MEXC server-clock offset so signed requests carry a
+        timestamp the server accepts. Without this, >5s of local clock skew
+        (VPS drift / ntpd restart) makes EVERY signed call fail (code 700003),
+        including the hedge and exit. Returns the offset in ms; best-effort."""
+        try:
+            payload = await self._request("GET", "/api/v3/time", venue=self.VENUE)
+            server_ms = int(payload["serverTime"])
+        except (ExchangeError, KeyError, ValueError, TypeError):
+            log.exception("mexc time sync failed; keeping offset %s", self._time_offset_ms)
+            return self._time_offset_ms
+        self._time_offset_ms = server_ms - now_ms()
+        if abs(self._time_offset_ms) > 1000:
+            log.warning("mexc clock skew %sms — applying offset", self._time_offset_ms)
+        return self._time_offset_ms
 
     def _signed_query(self, params: dict[str, str]) -> str:
         if self._creds is None:
             raise ExchangeError(self.VENUE, "no credentials configured")
         signed = dict(params)
-        signed["timestamp"] = str(now_ms())
+        signed["timestamp"] = str(now_ms() + self._time_offset_ms)
         signed["recvWindow"] = "5000"
         return mexc_sign(signed, self._creds)
 

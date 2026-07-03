@@ -105,6 +105,8 @@ class Engine:
         if orphaned:
             journal(self.conn, f"abandoned {orphaned} command(s) left running by"
                     f" a prior crash", "WARN")
+        if not self.paper:
+            await self.mexc.sync_time()   # align the signing clock before trading
         await self._load_symbol_maps(initial=True)
         await recovery.reconcile(
             self.conn, self.positions, self.aster, self.mexc, self.notifier,
@@ -265,6 +267,11 @@ class Engine:
     async def _funding_loop(self) -> None:
         while True:
             await asyncio.sleep(config.FUNDING_REFRESH_SECONDS)
+            if not self.paper:
+                try:
+                    await self.mexc.sync_time()   # keep the signing clock aligned
+                except Exception:
+                    log.exception("mexc time re-sync failed")
             try:
                 await self._refresh_funding_stats()
             except Exception:
