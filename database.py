@@ -150,3 +150,27 @@ def pending_commands(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM commands WHERE status='pending' ORDER BY id"
     ).fetchall()
+
+
+def claim_command(conn: sqlite3.Connection, command_id: int) -> bool:
+    """Atomically move a command pending -> running so a crash mid-execution
+    can't replay it (pending_commands never returns 'running'). Returns True if
+    this call won the claim."""
+    cur = conn.execute(
+        "UPDATE commands SET status='running' WHERE id=? AND status='pending'",
+        (command_id,),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def abandon_running_commands(conn: sqlite3.Connection) -> int:
+    """On startup, fail any command left 'running' by a crash so it neither
+    replays nor blocks a waiting caller. Returns how many were abandoned."""
+    cur = conn.execute(
+        "UPDATE commands SET status='error', response='abandoned (engine restarted"
+        " mid-command)', resolved_ms=? WHERE status='running'",
+        (int(time.time() * 1000),),
+    )
+    conn.commit()
+    return cur.rowcount

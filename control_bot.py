@@ -497,7 +497,9 @@ class ControlBot:
             row = self._conn.execute(
                 "SELECT status, response FROM commands WHERE id=?", (command_id,)
             ).fetchone()
-            if row and row["status"] != "pending":
+            # 'pending' = not yet picked up, 'running' = engine is executing it;
+            # keep waiting until it reaches a terminal state.
+            if row and row["status"] not in ("pending", "running"):
                 return row["response"] or row["status"]
             await asyncio.sleep(0.5)
         return (

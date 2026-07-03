@@ -103,6 +103,11 @@ FUNDING_REFRESH_SECONDS = 900.0          # full funding-history sweep cadence
 FUNDING_FETCH_BATCH = 8                  # concurrent funding-history fetches
 FUNDING_HISTORY_LIMIT = 30               # prints per symbol (>= 24h on 1h funding)
 COMMAND_POLL_SECONDS = 1.0
+# Drop queued Telegram commands older than this before executing them: if the
+# engine was down when you sent /enter or /flatten, it must NOT fire minutes
+# later at a different market. Also the claim-before-execute window that stops
+# a crash mid-command from replaying it on restart.
+COMMAND_TTL_SECONDS = float(os.environ.get("COMMAND_TTL_SECONDS", "60"))
 ORDER_STATUS_POLL_SECONDS = 2.0
 REPRICE_MIN_INTERVAL_SECONDS = 3.0       # don't cancel/replace faster than this
 PASSIVE_UNREACHABLE_ALERT_SECONDS = 600  # throttle "passive target unreachable" alerts

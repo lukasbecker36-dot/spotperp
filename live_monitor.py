@@ -27,7 +27,13 @@ from auth import (
     load_env,
     load_mexc_credentials,
 )
-from database import journal, pending_commands, resolve_command
+from database import (
+    abandon_running_commands,
+    claim_command,
+    journal,
+    pending_commands,
+    resolve_command,
+)
 from exchange_client import AsterClient, ExchangeError, MexcClient
 from executor import Executor, LiveTrader, MarketData, PaperTrader
 from notify import Notifier
@@ -95,6 +101,10 @@ class Engine:
     async def start(self) -> None:
         mode = "paper" if self.paper else "LIVE"
         journal(self.conn, f"engine starting in {mode} mode")
+        orphaned = abandon_running_commands(self.conn)
+        if orphaned:
+            journal(self.conn, f"abandoned {orphaned} command(s) left running by"
+                    f" a prior crash", "WARN")
         await self._load_symbol_maps(initial=True)
         await recovery.reconcile(
             self.conn, self.positions, self.aster, self.mexc, self.notifier,
@@ -562,14 +572,33 @@ class Engine:
     async def _command_loop(self) -> None:
         while True:
             try:
-                for row in pending_commands(self.conn):
-                    response = await self._handle_command(
-                        row["command"], json.loads(row["args"])
-                    )
-                    resolve_command(self.conn, row["id"], "done", response)
+                await self._drain_commands()
             except Exception:
                 log.exception("command loop error")
             await asyncio.sleep(config.COMMAND_POLL_SECONDS)
+
+    async def _drain_commands(self) -> None:
+        now_ms = int(time.time() * 1000)
+        for row in pending_commands(self.conn):
+            age_s = (now_ms - row["created_ms"]) / 1000
+            if age_s > config.COMMAND_TTL_SECONDS:
+                # The engine was down when this was queued; firing a stale /enter
+                # or /flatten now would trade at the wrong market. Skip it.
+                resolve_command(
+                    self.conn, row["id"], "expired",
+                    f"skipped: {age_s:.0f}s old (engine was down when queued)",
+                )
+                journal(self.conn, f"command {row['id']} {row['command']}"
+                        f" expired ({age_s:.0f}s old)", "WARN")
+                continue
+            # Claim before executing so a crash mid-command can't replay it on
+            # restart (pending_commands never returns 'running').
+            if not claim_command(self.conn, row["id"]):
+                continue
+            response = await self._handle_command(
+                row["command"], json.loads(row["args"])
+            )
+            resolve_command(self.conn, row["id"], "done", response)
 
     async def _handle_command(self, command: str, args: dict) -> str:
         try:
