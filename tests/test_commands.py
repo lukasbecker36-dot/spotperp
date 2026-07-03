@@ -61,6 +61,24 @@ async def test_drain_expires_stale_commands(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_prune_old_rows_keeps_pending_and_recent(tmp_path):
+    import time as _t
+    from database import prune_old_rows, resolve_command
+    conn = database.init_db(tmp_path / "t.db")
+    old = enqueue_command(conn, "status", {})
+    resolve_command(conn, old, "done", "ok")
+    conn.execute(
+        "UPDATE commands SET resolved_ms=? WHERE id=?",
+        (int(_t.time() * 1000) - 30 * 86_400_000, old),  # 30 days old
+    )
+    fresh_pending = enqueue_command(conn, "enter", {})   # pending, recent
+    conn.commit()
+    prune_old_rows(conn)
+    ids = [r["id"] for r in conn.execute("SELECT id FROM commands").fetchall()]
+    assert old not in ids and fresh_pending in ids
+    conn.close()
+
+
 async def test_drain_executes_fresh_command(tmp_path, monkeypatch):
     import live_monitor
     monkeypatch.setattr(config, "COMMAND_TTL_SECONDS", 60)

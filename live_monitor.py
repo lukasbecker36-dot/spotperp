@@ -32,6 +32,7 @@ from database import (
     claim_command,
     journal,
     pending_commands,
+    prune_old_rows,
     resolve_command,
 )
 from exchange_client import AsterClient, ExchangeError, MexcClient
@@ -280,6 +281,10 @@ class Engine:
                 await self._refresh_position_funding()
             except Exception:
                 log.exception("position funding refresh error")
+            try:
+                prune_old_rows(self.conn)
+            except Exception:
+                log.exception("db prune error")
 
     async def _refresh_position_funding(self) -> None:
         """Set each open LIVE position's funding_usd to the actual FUNDING_FEE

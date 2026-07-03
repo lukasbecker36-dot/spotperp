@@ -65,41 +65,41 @@ def shell(monkeypatch):
     return calls, results
 
 
-def test_git_pull_success(shell):
+async def test_git_pull_success(shell):
     calls, results = shell
     results["rev-parse"] = _FakeProc(0, "claude/pensive-goldberg-q8221t\n", "")
     results["pull"] = _FakeProc(0, "Updating 0c32211..5313de9\nFast-forward\n", "")
-    ok, msg = _bot()._git_pull()
+    ok, msg = await _bot()._git_pull()
     assert ok is True
     assert "claude/pensive-goldberg-q8221t" in msg
     assert "Fast-forward" in msg
 
 
-def test_git_pull_failure(shell):
+async def test_git_pull_failure(shell):
     calls, results = shell
     results["rev-parse"] = _FakeProc(0, "main\n", "")
     results["pull"] = _FakeProc(1, "", "fatal: not possible to fast-forward")
-    ok, msg = _bot()._git_pull()
+    ok, msg = await _bot()._git_pull()
     assert ok is False
     assert "git pull failed" in msg
 
 
-def test_update_aborts_and_skips_restart_on_pull_failure(shell):
+async def test_update_aborts_and_skips_restart_on_pull_failure(shell):
     calls, results = shell
     results["rev-parse"] = _FakeProc(0, "main\n", "")
     results["pull"] = _FakeProc(1, "", "conflict")
-    reply = _bot()._update()
+    reply = await _bot()._update()
     assert "update aborted" in reply
     # No systemctl restart and no detached control restart were issued.
     assert not any("systemctl" in c for c in calls["run"])
     assert calls["popen"] == []
 
 
-def test_update_restarts_engine_then_control_detached(shell):
+async def test_update_restarts_engine_then_control_detached(shell):
     calls, results = shell
     results["rev-parse"] = _FakeProc(0, "main\n", "")
     results["pull"] = _FakeProc(0, "Already up to date.\n", "")
-    reply = _bot()._update()
+    reply = await _bot()._update()
 
     # Engine restarted synchronously via systemctl run.
     assert any(

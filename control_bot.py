@@ -167,7 +167,9 @@ class ControlBot:
                     log.warning("sendMessage failed: %s", await resp.text())
 
     async def _handle_update(self, update: dict) -> None:
-        message = update.get("message") or update.get("edited_message")
+        # Only act on NEW messages. Editing an old message (e.g. a historic
+        # "/flatten YES") would otherwise re-execute the command.
+        message = update.get("message")
         if not message:
             return
         chat_id = str(message.get("chat", {}).get("id", ""))
@@ -199,7 +201,7 @@ class ControlBot:
         if command == "funding":
             return self._cmd_funding(args)
         if command == "status":
-            return self._cmd_status()
+            return await self._cmd_status()
         if command == "positions":
             return self._cmd_positions()
         if command == "recon":
@@ -241,6 +243,8 @@ class ControlBot:
         if command == "enter":
             return await self._cmd_enter(args)
         if command == "cancel":
+            if not args:
+                return "usage: /cancel ID|SYMBOL — stop a working entry or exit"
             return await self._queue_and_wait("cancel", {"position_id": args[0]})
         if command == "exit":
             return await self._cmd_exit(args)
@@ -250,22 +254,22 @@ class ControlBot:
             return await self._queue_and_wait("flatten", {})
         if command == "paper":
             config.set_mode(live=False)
-            return self._systemctl("restart") + "\nmode set to paper, engine restarting"
+            return (await self._systemctl("restart")) + "\nmode set to paper, engine restarting"
         if command == "live":
             if not confirmed:
                 return "this enables REAL trading — repeat as: /live YES"
             config.set_mode(live=True)
-            return self._systemctl("restart") + "\nmode set to LIVE, engine restarting"
+            return (await self._systemctl("restart")) + "\nmode set to LIVE, engine restarting"
         if command == "start":
-            return self._systemctl("start")
+            return await self._systemctl("start")
         if command == "stop":
             if not confirmed:
                 return "this stops the engine — repeat as: /stop YES"
-            return self._systemctl("stop")
+            return await self._systemctl("stop")
         if command == "restart":
-            return self._systemctl("restart")
+            return await self._systemctl("restart")
         if command == "update":
-            return self._update()
+            return await self._update()
         return f"unknown command /{command}\n\n{HELP}"
 
     # ── read commands ──
@@ -340,7 +344,7 @@ class ControlBot:
         lines.append(f"entry/net = {win_m:.0f}m avg basis; short perp gets +funding")
         return "\n".join(lines)
 
-    def _cmd_status(self) -> str:
+    async def _cmd_status(self) -> str:
         try:
             hb = json.loads(config.HEARTBEAT_FILE.read_text())
             age = (time.time() * 1000 - hb["ts_ms"]) / 1000
@@ -351,10 +355,8 @@ class ControlBot:
             )
         except (FileNotFoundError, json.JSONDecodeError):
             engine = "engine: NO HEARTBEAT (not running?)"
-        service = subprocess.run(
-            ["systemctl", "is-active", ENGINE_SERVICE],
-            capture_output=True, text=True,
-        ).stdout.strip() or "unknown"
+        result = await self._run(["systemctl", "is-active", ENGINE_SERVICE])
+        service = result.stdout.strip() or "unknown"
         return f"{engine}\nservice: {service}\n\n{self._cmd_positions()}"
 
     def _cmd_positions(self) -> str:
@@ -509,44 +511,47 @@ class ControlBot:
 
     # ── service control ──
 
-    def _systemctl(self, action: str, service: str = ENGINE_SERVICE) -> str:
-        result = subprocess.run(
-            ["sudo", "systemctl", action, service],
-            capture_output=True, text=True,
+    @staticmethod
+    async def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+        # Off the event loop: systemctl restart / git pull can take seconds and
+        # would otherwise stall getUpdates and every other command.
+        return await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True
         )
+
+    async def _systemctl(self, action: str, service: str = ENGINE_SERVICE) -> str:
+        result = await self._run(["sudo", "systemctl", action, service])
         if result.returncode != 0:
             return f"systemctl {action} failed: {result.stderr.strip()}"
         return f"systemctl {action} {service}: ok"
 
-    def _git_pull(self) -> tuple[bool, str]:
+    async def _git_pull(self) -> tuple[bool, str]:
         """Fast-forward the deploy checkout to its tracked branch. Returns
         (ok, summary). Pins origin/<current-branch> so it works regardless of
         how tracking is configured on the server."""
         repo = str(config.PROJECT_ROOT)
-        head = subprocess.run(
-            ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True,
+        head = await self._run(
+            ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"]
         )
         if head.returncode != 0:
             return False, f"git branch lookup failed: {head.stderr.strip()}"
         branch = head.stdout.strip()
-        pull = subprocess.run(
-            ["git", "-C", repo, "pull", "--ff-only", "origin", branch],
-            capture_output=True, text=True,
+        pull = await self._run(
+            ["git", "-C", repo, "pull", "--ff-only", "origin", branch]
         )
         out = (pull.stdout + pull.stderr).strip()
         if pull.returncode != 0:
             return False, f"git pull failed ({branch}):\n{out}"
         return True, f"git pull {branch}: {out.splitlines()[-1] if out else 'ok'}"
 
-    def _update(self) -> str:
+    async def _update(self) -> str:
         """Pull the latest code and restart both services. The engine restarts
         synchronously; the control bot (this process) restarts detached after a
         short delay so this reply is delivered before systemd kills us."""
-        ok, pull_msg = self._git_pull()
+        ok, pull_msg = await self._git_pull()
         if not ok:
             return f"❌ update aborted — {pull_msg}\n(no restart)"
-        engine_msg = self._systemctl("restart", ENGINE_SERVICE)
+        engine_msg = await self._systemctl("restart", ENGINE_SERVICE)
         # Restart our own service out-of-band: a detached child survives this
         # process being killed, and the sleep lets the Telegram reply flush.
         subprocess.Popen(

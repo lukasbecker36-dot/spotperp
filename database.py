@@ -164,6 +164,27 @@ def claim_command(conn: sqlite3.Connection, command_id: int) -> bool:
     return cur.rowcount > 0
 
 
+def prune_old_rows(conn: sqlite3.Connection, *, journal_days: int = 14,
+                   ledger_days: int = 7) -> None:
+    """Delete resolved commands/intents and old journal lines so the DB (and
+    its WAL/backups) doesn't grow without bound. Positions and fills are the
+    permanent record and are never pruned."""
+    now = int(time.time() * 1000)
+    conn.execute(
+        "DELETE FROM journal WHERE ts_ms < ?", (now - journal_days * 86_400_000,)
+    )
+    cutoff = now - ledger_days * 86_400_000
+    conn.execute(
+        "DELETE FROM commands WHERE status != 'pending' AND"
+        " COALESCE(resolved_ms, created_ms) < ?", (cutoff,)
+    )
+    conn.execute(
+        "DELETE FROM intents WHERE status != 'pending' AND"
+        " COALESCE(resolved_ms, created_ms) < ?", (cutoff,)
+    )
+    conn.commit()
+
+
 def abandon_running_commands(conn: sqlite3.Connection) -> int:
     """On startup, fail any command left 'running' by a crash so it neither
     replays nor blocks a waiting caller. Returns how many were abandoned."""
