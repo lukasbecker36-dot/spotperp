@@ -972,6 +972,18 @@ class Executor:
                     f" adverse-selected as spot rallied. Consider a higher floor"
                     f" or a more liquid name."
                 )
+        elif run_filled > 0 or final.fees_usd > 0:
+            # Perp filled then was fully unwound (hedge abort / hedge failure):
+            # no net exposure, but there IS a realized loss (unwind slippage +
+            # fees). Book it so /pnl reflects every outcome, not just clean exits.
+            pnl = self._positions.finalize_pnl(position.id)
+            self._positions.set_state(position.id, pm.CANCELLED, "unwound after fill")
+            journal(self._conn, f"position {position.id}: entry unwound after fill,"
+                    f" realized={pnl}")
+            await self._notifier.alert(
+                f"position {position.id} {symbol}: entry unwound — realized"
+                f" ${float(pnl):+.2f} (unwind slippage + fees)"
+            )
         else:
             self._positions.set_state(position.id, pm.CANCELLED, "no fills")
             journal(self._conn, f"position {position.id}: entry ended with no fills")
@@ -1279,7 +1291,15 @@ class Executor:
 
     async def _finalize_close(self, position_id: int) -> None:
         pos = self._positions.get(position_id)
-        if pos.perp_qty > 0 or pos.spot_qty > 0:
+        # "Flat" means both legs are below one exchange step — sub-step dust can
+        # never be traded away, so testing raw qty > 0 wedges the position in
+        # EXITING forever (and re-alerts on every restart). Write the dust off.
+        pair = self._md.pair_maps.get(pos.symbol)
+        aster_info = self._md.aster_info.get(pair.aster_symbol) if pair else None
+        mexc_info = self._md.mexc_info.get(pair.mexc_symbol) if pair else None
+        perp_left = aster_info.round_qty(pos.perp_qty) if aster_info else pos.perp_qty
+        spot_left = mexc_info.round_qty(pos.spot_qty) if mexc_info else pos.spot_qty
+        if perp_left > 0 or spot_left > 0:
             journal(
                 self._conn,
                 f"position {position_id}: exit incomplete perp={pos.perp_qty}"
@@ -1291,6 +1311,13 @@ class Executor:
                 f" (perp={pos.perp_qty}, spot={pos.spot_qty}) — still EXITING"
             )
             return
+        if pos.perp_qty > 0 or pos.spot_qty > 0:
+            journal(
+                self._conn,
+                f"position {position_id}: closing with sub-step dust written off"
+                f" (perp={pos.perp_qty}, spot={pos.spot_qty})",
+                "WARN",
+            )
         await self._accrue_funding(pos)
         pnl = self._positions.finalize_pnl(position_id)
         self._positions.set_state(position_id, pm.CLOSED)

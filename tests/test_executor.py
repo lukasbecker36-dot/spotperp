@@ -506,6 +506,10 @@ async def test_entry_aborts_when_hedge_basis_collapses(env):
     final = positions.get(pos.id)
     assert final.spot_qty == 0           # never hedged into the bad basis
     assert final.perp_qty == 0           # perp fill was unwound
+    # The unwind slippage + fees are a real realized loss and must be booked
+    # (previously left NULL, so /pnl silently overstated results).
+    assert final.realized_pnl_usd is not None
+    assert final.realized_pnl_usd <= 0
 
 
 async def test_aggressive_exit_closes_immediately(env):
