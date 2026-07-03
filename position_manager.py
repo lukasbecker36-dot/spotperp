@@ -252,14 +252,21 @@ class PositionManager:
 
         sets: dict[str, str] = {"fees_usd": str(pos.fees_usd + fee_usd)}
         if phase == "entry":
+            # Weight the entry average by the qty of PRIOR entry fills, not the
+            # net held qty. Using net qty (reduced by an intervening partial
+            # exit) skews the average when a position is entered, partially
+            # exited, then added to — and finalize_pnl multiplies by the total
+            # entry qty, so the mismatch double-counts the partial-exit profit.
             if venue == "aster":
+                prior = self._phase_qty(position_id, "aster", "entry") - qty
                 sets["perp_entry_avg"] = str(
-                    update_avg(pos.perp_entry_avg, pos.perp_qty, qty, price)
+                    update_avg(pos.perp_entry_avg, prior, qty, price)
                 )
                 sets["perp_qty"] = str(pos.perp_qty + qty)
             else:
+                prior = self._phase_qty(position_id, "mexc", "entry") - qty
                 sets["spot_entry_avg"] = str(
-                    update_avg(pos.spot_entry_avg, pos.spot_qty, qty, price)
+                    update_avg(pos.spot_entry_avg, prior, qty, price)
                 )
                 sets["spot_qty"] = str(pos.spot_qty + qty)
         else:  # exit / unwind reduce the held quantities
