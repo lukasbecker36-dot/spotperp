@@ -73,9 +73,12 @@ async def reconcile(
                         f" fills ({final.executed_qty}) — check position vs venue"
                     )
 
-    # 2. close out the intent journal
+    # 2. reconcile the intent journal against the venue by client-order-id
+    #    (not just a blind 'failed'), so an order that DID land after a crash is
+    #    found and cancelled/surfaced rather than becoming a silent orphan on a
+    #    symbol the sweep above didn't cover (e.g. a position recovery cancels).
     for row in unresolved:
-        intents.resolve_intent(conn, row["id"], "failed", "reconciled at startup")
+        await _reconcile_intent(conn, aster, mexc, notifier, row, paper=paper)
 
     # 3. state fix-ups
     for pos in active:
@@ -93,6 +96,49 @@ async def reconcile(
     # 4. venue comparison
     if not paper and aster is not None and mexc is not None:
         await _compare_with_venues(conn, positions, aster, mexc, notifier)
+
+
+async def _reconcile_intent(
+    conn, aster, mexc, notifier, row, *, paper: bool
+) -> None:
+    """Query the venue for an unresolved intent's order by client id and act:
+    cancel it if it's still resting, alert if it filled, mark reconciled either
+    way. Falls back to 'failed' when we can't look it up (paper, no client id,
+    or lookup error) — same as the old blind behaviour, but only as a fallback."""
+    import json
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    client_id = payload.get("client_order_id")
+    symbol = payload.get("symbol")
+    client = aster if row["venue"] == "aster" else mexc
+    if paper or client is None or not client_id or not symbol:
+        intents.resolve_intent(conn, row["id"], "failed", "reconciled at startup")
+        return
+    try:
+        order = await client.get_order_by_client_id(symbol, client_id)
+    except ExchangeError:
+        log.exception("recovery: lookup %s failed", client_id)
+        intents.resolve_intent(conn, row["id"], "failed", "lookup failed at startup")
+        return
+    if order is None:
+        intents.resolve_intent(conn, row["id"], "failed", "never landed on venue")
+        return
+    if order.is_open:
+        try:
+            await client.cancel_order(symbol, order.order_id)
+        except ExchangeError:
+            log.exception("recovery: cancel orphan %s failed", order.order_id)
+        journal(conn, f"recovery: cancelled orphan order {client_id} on {symbol}"
+                f" (executed={order.executed_qty})", "WARN")
+    if order.executed_qty > 0:
+        await notifier.alert(
+            f"⚠️ recovery: intent order {client_id} on {symbol} had fills"
+            f" ({order.executed_qty} @ {order.avg_price}) — verify the position"
+            f" vs venue and /adopt if needed"
+        )
+    intents.resolve_intent(conn, row["id"], "reconciled", order.raw)
 
 
 async def _compare_with_venues(

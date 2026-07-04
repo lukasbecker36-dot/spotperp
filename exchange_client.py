@@ -361,6 +361,24 @@ class AsterClient(_BaseClient):
         )
         return self._parse_order(payload)
 
+    async def get_order_by_client_id(
+        self, symbol: str, client_order_id: str
+    ) -> OrderResult | None:
+        """Look an order up by our client id (for crash recovery). Returns None
+        if the venue has no such order (it never landed)."""
+        body = self._signed_body(
+            {"symbol": symbol, "origClientOrderId": client_order_id}
+        )
+        try:
+            payload = await self._request(
+                "GET", f"/fapi/v3/order?{body}", venue=self.VENUE
+            )
+        except ExchangeError as exc:
+            if exc.code in (-2013, "-2013"):   # "Order does not exist"
+                return None
+            raise
+        return self._parse_order(payload)
+
     async def cancel_order(self, symbol: str, order_id: str) -> OrderResult:
         body = self._signed_body({"symbol": symbol, "orderId": order_id})
         payload = await self._request(
@@ -616,6 +634,25 @@ class MexcClient(_BaseClient):
             headers=self._auth_headers(),
             venue=self.VENUE,
         )
+        return self._parse_order(payload)
+
+    async def get_order_by_client_id(
+        self, symbol: str, client_order_id: str
+    ) -> OrderResult | None:
+        """Look an order up by our client id (crash recovery). None if the venue
+        has no such order (it never landed)."""
+        query = self._signed_query(
+            {"symbol": symbol, "origClientOrderId": client_order_id}
+        )
+        try:
+            payload = await self._request(
+                "GET", f"/api/v3/order?{query}",
+                headers=self._auth_headers(), venue=self.VENUE,
+            )
+        except ExchangeError as exc:
+            if exc.code in (-2013, "-2013") or "does not exist" in str(exc).lower():
+                return None
+            raise
         return self._parse_order(payload)
 
     async def cancel_order(self, symbol: str, order_id: str) -> OrderResult:

@@ -57,9 +57,11 @@ def unresolved_intents(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def make_client_order_id(intent_id: int, leg: str) -> str:
-    """Deterministic client order id so recovery can find orphan orders.
+def make_client_order_id(position_id: int, leg: str) -> str:
+    """Deterministic client order id encoding the position and leg, so recovery
+    can find/cancel orphan orders and the sweep can match by leg prefix
+    (sp_pent_ entry maker, sp_pext_ exit maker, sp_stop_ protective stop).
 
     Aster allows ^[.A-Z:/a-z0-9_-]{1,36}$, MEXC similar; keep it short.
     """
-    return f"sp_{leg}_{intent_id}_{int(time.time())}"
+    return f"sp_{leg}_{position_id}_{int(time.time())}"
