@@ -48,7 +48,7 @@ HELP = """Commands:
 /exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins, omit=full
 /exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins, omit=full
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
-/stops SYMBOL — place liq-protection stop (perp) + sell limit (spot) ~1% below liq price
+/stops SYMBOL — place liq-protection stop (perp) + sell limit (spot) ~1% below liq price (auto-refreshes on size-up)
 /remove ID|SYMBOL YES — stop tracking a position closed manually on the exchange (DB only)
 /trades [n] — last closed trades
 /pnl — realised P&L summary

@@ -73,6 +73,7 @@ def engine(tmp_path, monkeypatch):
     eng._auto_passive = set()
     eng._position_risk = {}
     eng._liq_alerted = {}
+    eng._stops_qty = {}
     yield eng
     conn.close()
 
@@ -426,6 +427,44 @@ async def test_stops_places_reduce_only_perp_stop_and_spot_limit(engine):
     assert spot["side"] == "SELL" and spot["type"] == "LIMIT"
     assert spot["price"] == Decimal("148.5") and spot["quantity"] == Decimal("9.95")
     assert "below liq 150" in out
+
+
+async def test_stops_auto_refresh_on_size_up(engine):
+    """After a position grows (size-up), the safety loop re-places its /stops at
+    the new size so the added portion isn't left unprotected."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _StopClient()
+    engine.mexc = _StopClient()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "150"}
+    }
+    await engine._place_stops(engine.positions.get(pid))
+    assert engine._stops_qty[pid] == Decimal("9.95")
+    before = len(engine.aster.placed)
+
+    # Grow the position (as a size-up fill would).
+    engine.positions.record_fill(pid, "aster", "entry", "SELL", Decimal(5), Decimal(100), Decimal(0))
+    engine.positions.record_fill(pid, "mexc", "entry", "BUY", Decimal(5), Decimal(100), Decimal(0))
+
+    await engine._check_stops_resize(engine.positions.get(pid))
+    assert engine._stops_qty[pid] == Decimal("14.95")           # tracks new size
+    assert len(engine.aster.placed) > before                    # re-placed
+    assert engine.aster.placed[-1]["quantity"] == Decimal("14.95")
+    assert any("auto-refreshed" in m for m in engine.notifier.messages)
+
+
+async def test_stops_resize_noop_when_size_unchanged(engine):
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _StopClient()
+    engine.mexc = _StopClient()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "150"}
+    }
+    engine._stops_qty[pid] = Decimal("9.95")                     # matches current
+    await engine._check_stops_resize(engine.positions.get(pid))
+    assert engine.aster.placed == []                            # nothing re-placed
 
 
 async def test_stops_requires_live_mode(engine):

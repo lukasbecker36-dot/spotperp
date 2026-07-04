@@ -96,6 +96,10 @@ class Engine:
         # Throttle for the near-liquidation alert: position id -> last-alert
         # monotonic time. Popped when the position recovers above the threshold.
         self._liq_alerted: dict[int, float] = {}
+        # Perp qty each position's /stops orders were placed for, so the safety
+        # loop can auto-refresh them after a resize. In-memory: lost on restart
+        # (stops themselves survive; re-run /stops to re-arm auto-refresh).
+        self._stops_qty: dict[int, Decimal] = {}
 
     # ── startup ──
 
@@ -539,6 +543,25 @@ class Engine:
             return None
         return float(liq), float((liq - mark_px) / mark_px * Decimal(100))
 
+    async def _check_stops_resize(self, pos: pm.Position) -> None:
+        """Re-place a position's /stops if its size changed since they were set
+        (e.g. a /enter size-up), so the added portion isn't left unprotected."""
+        if self.paper or pos.id not in self._stops_qty:
+            return
+        pair = self.md.pair_maps.get(pos.symbol)
+        info = self.md.aster_info.get(pair.aster_symbol) if pair else None
+        if info is None:
+            return
+        current = info.round_qty(pos.perp_qty)
+        if current == self._stops_qty[pos.id]:
+            return
+        prior = self._stops_qty[pos.id]
+        await self._place_stops(pos)   # updates self._stops_qty to `current`
+        await self.notifier.alert(
+            f"🔁 position {pos.id} {pos.symbol}: size changed {prior} -> {current}"
+            f" — /stops auto-refreshed to cover the new size"
+        )
+
     async def _check_liquidation(self, pos: pm.Position) -> None:
         """Alert (throttled) when a live perp short's mark is within
         LIQ_ALERT_PCT of its liquidation price. Re-arms once it recovers."""
@@ -737,6 +760,7 @@ class Engine:
         when a close begins so the spot LIMIT stops locking the balance (which
         makes the exit's spot sell fail 'insufficient balance') and the perp
         STOP doesn't fire mid-close. No-op in paper / when no pair."""
+        self._stops_qty.pop(pos.id, None)   # no longer managing stops for it
         if self.paper:
             return 0
         pair = self.md.pair_maps.get(pos.symbol)
@@ -820,6 +844,7 @@ class Engine:
         await self.executor._cancel_task(pos.id)
         self._auto_passive.discard(pos.id)
         self._liq_alerted.pop(pos.id, None)
+        self._stops_qty.pop(pos.id, None)
         cancelled = 0
         pair = self.md.pair_maps.get(pos.symbol)
         if pair is not None and not self.paper:
@@ -908,7 +933,8 @@ class Engine:
         buy STOP_MARKET on the Aster perp STOP_LIQ_BUFFER_PCT below the liq
         price (triggers on the mark, closing the short before liquidation), and
         a resting sell LIMIT on MEXC spot at the same level (full size on both).
-        Re-running refreshes: prior /stops orders are cancelled first."""
+        Re-running refreshes: prior /stops orders are cancelled first. Once
+        placed, the safety loop auto-refreshes them if the position is resized."""
         if self.paper:
             return "stops need LIVE mode — they place real protective orders"
         pos = self._resolve_position(str(args.get("symbol", "")))
@@ -916,6 +942,11 @@ class Engine:
             return pos
         if pos.state not in (pm.OPEN, pm.EXITING):
             return f"position {pos.id} is {pos.state}, no stops placed"
+        return await self._place_stops(pos)
+
+    async def _place_stops(self, pos: pm.Position) -> str:
+        """(Re)place the protective orders at the position's CURRENT size and
+        record that size so a later resize (e.g. /enter size-up) auto-refreshes."""
         pair = self.md.pair_maps.get(pos.symbol)
         if pair is None:
             return f"{pos.symbol}: not cross-listed"
@@ -969,8 +1000,12 @@ class Engine:
         except ExchangeError as exc:
             lines.append(f"spot limit FAILED: {exc}")
 
+        # Track the size these stops cover so the safety loop re-places them if
+        # the position is later resized (a size-up otherwise leaves the added
+        # portion unprotected until the operator remembers to re-run /stops).
+        self._stops_qty[pos.id] = perp_qty
         journal(self.conn, f"position {pos.id}: /stops liq={liq} stop={perp_stop}"
-                f" (cancelled {cancelled} prior)")
+                f" qty={perp_qty} (cancelled {cancelled} prior)")
         head = (f"stops for #{pos.id} {pos.symbol}: {float(config.STOP_LIQ_BUFFER_PCT):.0f}%"
                 f" below liq {recon._p(liq)}")
         if cancelled:
@@ -1268,6 +1303,7 @@ class Engine:
                         await self._check_liquidation(pos)
                         if pos.state == pm.OPEN:
                             await self._check_safety(pos)
+                            await self._check_stops_resize(pos)
                         elif pos.state == pm.EXITING and pos.id in self._auto_passive:
                             await self._check_auto_passive(pos)
                     except Exception:
