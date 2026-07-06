@@ -515,6 +515,8 @@ class Engine:
                 "close_bps": float(close_bps),
                 "funding_usd": float(funding_est),
                 "upnl_usd": float(upnl),
+                # Current USD size of the perp leg (closeable value at the bid).
+                "notional_usd": float(pos.perp_qty * aster.bid),
             }
             # Liquidation proximity for the short perp (live mode only).
             liq_stats = self._liq_stats(pos)

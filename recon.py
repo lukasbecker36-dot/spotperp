@@ -102,6 +102,11 @@ class PairRecon:
         return (self.perp_liq - self.perp_mark) / self.perp_mark * Decimal(100)
 
     @property
+    def notional_usd(self) -> Decimal:
+        """Current USD size of the perp leg (closeable value at the Aster bid)."""
+        return self.perp_qty * self.perp_exit
+
+    @property
     def perp_pnl(self) -> Decimal:
         return (self.perp_entry - self.perp_exit) * self.perp_qty
 
@@ -138,12 +143,14 @@ def format_report(pairs: list[PairRecon], notes: list[str]) -> str:
         return "no matched perp/spot pairs open on the venues"
     lines: list[str] = ["live recon P&L (maker Aster / taker MEXC, in+out)"]
     total = Decimal(0)
+    total_notional = Decimal(0)
     for p in pairs:
         total += p.net_pnl
+        total_notional += p.notional_usd
         held = f"{float(p.held_hours):.1f}h" if p.held_hours is not None else "?"
         est = "~" if p.spot_entry_est else ""
         lines.append("")
-        lines.append(f"{p.symbol}  ({held} held)")
+        lines.append(f"{p.symbol}  (~${float(p.notional_usd):,.0f}, {held} held)")
         lines.append(
             f"  perp {_p(p.perp_entry)}->{_p(p.perp_exit)}"
             f"  {float(p.perp_pnl):+.2f}"
@@ -176,7 +183,10 @@ def format_report(pairs: list[PairRecon], notes: list[str]) -> str:
                 f"  ⚠️ hedge imbalance {float(p.hedge_imbalance):+.4f} {p.base_asset}"
             )
     lines.append("")
-    lines.append(f"TOTAL NET P&L  ${float(total):+.2f}")
+    lines.append(
+        f"TOTAL  ~${float(total_notional):,.0f} notional |"
+        f" NET P&L ${float(total):+.2f}"
+    )
     for note in notes:
         lines.append(note)
     return "\n".join(lines)

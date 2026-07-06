@@ -370,6 +370,8 @@ class ControlBot:
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             marks, marks_fresh = {}, False
         lines = ["active positions:"]
+        total_notional = 0.0
+        total_upnl = 0.0
         for p in active:
             entry = (
                 f"{float(p.entry_basis_bps):.1f}" if p.entry_basis_bps else "-"
@@ -397,8 +399,12 @@ class ControlBot:
                     d = m["liq_dist_pct"]
                     warn = " ⚠️" if d < float(config.LIQ_ALERT_PCT) else ""
                     liq = f" | liq +{d:.0f}%{warn}"
+                notional = m.get("notional_usd")
+                size = f" | ~${notional:,.0f}" if notional else ""
+                total_notional += notional or 0.0
+                total_upnl += m["upnl_usd"]
                 lines.append(
-                    f"   basis {entry} -> {m['close_bps']:.1f}bps"
+                    f"   basis {entry} -> {m['close_bps']:.1f}bps{size}"
                     f" | uPnL ${m['upnl_usd']:+.2f}"
                     f" (funding ${m['funding_usd']:+.2f},"
                     f" fees ${float(p.fees_usd):.2f}){liq}"
@@ -407,6 +413,10 @@ class ControlBot:
                 lines.append(f"   basis {entry} -> ? ({m['skip']})")
             else:
                 lines.append(f"   basis {entry} -> ? (no live mark)")
+        if total_notional:
+            lines.append(
+                f"total: ~${total_notional:,.0f} notional | uPnL ${total_upnl:+.2f}"
+            )
         return "\n".join(lines)
 
     def _cmd_trades(self, args: list[str]) -> str:

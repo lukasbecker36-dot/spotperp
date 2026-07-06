@@ -87,7 +87,8 @@ def test_format_report_totals(monkeypatch):
     )
     out = recon.format_report([p], [])
     assert "BTCUSDT" in out
-    assert "TOTAL NET P&L  $+2.00" in out  # +1 perp + 0 spot + 1 funding
+    assert "NET P&L $+2.00" in out  # +1 perp + 0 spot + 1 funding
+    assert "notional" in out        # USD size shown
 
 
 def _pair(**kw):
