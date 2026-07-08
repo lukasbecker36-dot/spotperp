@@ -458,18 +458,41 @@ async def _wait_state(engine, pid, state, timeout=5.0):
 
 
 async def test_hedge_break_warns_but_waits_for_confirmation(engine):
-    """First sighting of a venue perp deficit alerts but must NOT trade until
-    the confirmation window has elapsed."""
+    """First sighting of a venue perp deficit alerts and TAKES OVER the position
+    (returns True so basis auto-closes are skipped) but must NOT trade until the
+    confirmation window has elapsed."""
     pid = await _make_live_open(engine)
     _arm_adl(engine, "0")                       # venue: perp gone
-    acted = await engine._check_hedge_integrity(engine.positions.get(pid))
-    assert acted is False
+    took_over = await engine._check_hedge_integrity(engine.positions.get(pid))
+    assert took_over is True                    # owns the position, skips basis checks
     assert pid in engine._hedge_break
     assert any("possible ADL" in m for m in engine.notifier.messages)
     pos = engine.positions.get(pid)
-    assert pos.state == pm.OPEN and pos.perp_qty == Decimal("9.95")  # untouched
-    # Immediately again (default 30s window not elapsed): still nothing.
-    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is False
+    assert pos.state == pm.OPEN and pos.perp_qty == Decimal("9.95")  # untraded
+    assert pos.exit_mode is None
+    # Immediately again (default 30s window not elapsed): still owns, still no trade.
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
+    assert engine.positions.get(pid).exit_mode is None
+
+
+async def test_hedge_break_suppresses_converged_tp(engine):
+    """Regression (CASHCAT): during the confirmation window the convergence TP
+    must NOT close the position — closing 'both legs' when the perp is already
+    ADL'd prices a phantom perp buy-back and books a wrong P&L. The guard owns
+    the position, so the safety loop skips the basis checks."""
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "0")                       # perp gone on venue
+    # A basis at which the converged TP would otherwise fire (profitable taker).
+    set_books(engine.md, "99.0", "99.1", "99.9", "100.0")
+    engine._position_risk_ts = _time.monotonic()
+
+    took_over = await engine._check_hedge_integrity(engine.positions.get(pid))
+    assert took_over is True
+    if not took_over:                            # mirror the safety-loop routing
+        await engine._check_safety(engine.positions.get(pid))
+    pos = engine.positions.get(pid)
+    assert pos.exit_mode is None                 # converged-TP suppressed
+    assert pos.state == pm.OPEN
 
 
 async def test_hedge_break_ignores_stale_risk_data(engine):

@@ -620,9 +620,14 @@ class Engine:
                 f" {config.HEDGE_BREAK_CONFIRM_SECONDS:.0f}s before rebalancing"
                 f" the spot leg."
             )
-            return False
+            # Take over the position for the whole confirmation window: return
+            # True so the caller SKIPS the basis auto-closes. Otherwise the
+            # convergence TP / adverse stop can fire on the (now nonsensical)
+            # basis and close the position out from under the guard — pricing a
+            # perp buy-back that can't happen because the perp is already gone.
+            return True
         if now - first < config.HEDGE_BREAK_CONFIRM_SECONDS:
-            return False
+            return True
 
         # Confirmed on fresh data for the full window: act.
         self._hedge_break.pop(pos.id, None)
