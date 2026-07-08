@@ -133,7 +133,6 @@ async def test_start_add_grows_open_position(env):
     assert before.perp_qty == Decimal("9.95")          # $1000 / 100.5
 
     # Same +50bps book; add $500 -> ~4.975 more contracts at 100.5.
-    positions.add_target_notional(pos_id, Decimal(500))
     executor.start_add(positions.get(pos_id), Decimal(500))
     await wait_for_message(notifier, "added")
     await wait_for_state(positions, pos_id, pm.OPEN)
@@ -141,7 +140,9 @@ async def test_start_add_grows_open_position(env):
     final = positions.get(pos_id)
     assert final.perp_qty == Decimal("14.925")
     assert final.state == pm.OPEN
-    assert final.target_notional == Decimal(1500)
+    # target_notional snaps to the actual filled size (perp qty x entry price),
+    # so cancelled/partial adds can't inflate it.
+    assert final.target_notional == final.perp_qty * final.perp_entry_avg
     assert final.spot_qty == final.perp_qty            # still fully hedged
     assert final.perp_entry_avg == Decimal("100.5")    # blended (same price)
     assert final.entry_basis_bps == pytest.approx(Decimal(50), abs=Decimal("0.5"))
@@ -159,7 +160,6 @@ async def test_add_no_fill_leaves_position_open(env):
 
     # Floor above the live 50bps basis so the add never places.
     positions.set_min_entry_bps(pos_id, Decimal(80))
-    positions.add_target_notional(pos_id, Decimal(500))
     # Short entry timeout so the no-fill add returns quickly.
     old = config.ENTRY_TIMEOUT_MINUTES
     config.ENTRY_TIMEOUT_MINUTES = 0
@@ -172,6 +172,9 @@ async def test_add_no_fill_leaves_position_open(env):
     final = positions.get(pos_id)
     assert final.state == pm.OPEN
     assert final.perp_qty == before.perp_qty           # unchanged
+    # A no-fill add must NOT inflate target_notional (the reported bug: repeated
+    # cancelled size-ups kept growing 'target now $X').
+    assert final.target_notional == final.perp_qty * final.perp_entry_avg
 
 
 async def test_entry_hedge_ambiguous_does_not_unwind(env):

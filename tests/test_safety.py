@@ -565,19 +565,21 @@ async def test_enter_on_open_position_sizes_up(engine):
             break
         await asyncio.sleep(0.02)
     final = engine.positions.get(pos_id)
-    assert final.target_notional == Decimal(1500)
     assert final.perp_qty > before.perp_qty            # grew, same position
+    # target_notional reflects the ACTUAL filled size, not a pre-bumped request.
+    assert final.target_notional == final.perp_qty * final.perp_entry_avg
     assert len([p for p in engine.positions.active() if p.symbol == "BTCUSDT"]) == 1
 
 
 async def test_enter_add_over_cap_rejected(engine, monkeypatch):
     """An add that would push the position past the per-leg cap is refused and
-    leaves the position untouched."""
+    leaves the position (and its target_notional) untouched."""
     monkeypatch.setattr(config, "MAX_NOTIONAL_PER_LEG_USD", Decimal(1200))
-    pos_id = await open_position(engine)           # $1000 target
-    result = engine._cmd_enter({"symbol": "BTC", "notional": "500"})  # -> 1500 > 1200
+    pos_id = await open_position(engine)           # ~$1000 filled
+    before_target = engine.positions.get(pos_id).target_notional
+    result = engine._cmd_enter({"symbol": "BTC", "notional": "500"})  # -> ~1500 > 1200
     assert "over the" in result and "per-leg cap" in result
-    assert engine.positions.get(pos_id).target_notional == Decimal(1000)
+    assert engine.positions.get(pos_id).target_notional == before_target
 
 
 class _AsterStub:

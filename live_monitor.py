@@ -694,15 +694,22 @@ class Engine:
             if pos.state != pm.OPEN:
                 return (f"{symbol} position #{pos.id} is {pos.state} (still working)"
                         f" — wait for it to settle or /cancel {pos.id} first")
-            new_total = pos.target_notional + notional
-            if new_total > config.MAX_NOTIONAL_PER_LEG_USD:
-                return (f"add would take {symbol} to ${new_total} notional, over the"
-                        f" ${config.MAX_NOTIONAL_PER_LEG_USD} per-leg cap")
+            # Cap against the ACTUAL current filled size (perp qty x live price),
+            # not target_notional — target_notional must never be pre-bumped by a
+            # requested add, or cancelled adds inflate it and later adds size
+            # against phantom exposure.
+            pair = self.md.pair_maps.get(symbol)
+            aster = self.md.aster_books.get(pair.aster_symbol) if pair else None
+            cur_notional = (
+                pos.perp_qty * aster.bid if aster and aster.bid > 0
+                else pos.target_notional
+            )
+            if cur_notional + notional > config.MAX_NOTIONAL_PER_LEG_USD:
+                return (f"add would take {symbol} to ~${float(cur_notional + notional):,.0f}"
+                        f" notional, over the ${config.MAX_NOTIONAL_PER_LEG_USD} per-leg cap")
             if min_bps is not None:
                 self.positions.set_min_entry_bps(pos.id, min_bps)
-            self.positions.add_target_notional(pos.id, notional)
-            pos = self.positions.get(pos.id)
-            self.executor.start_add(pos, notional)
+            self.executor.start_add(self.positions.get(pos.id), notional)
             floor = (
                 min_bps if min_bps is not None
                 else (pos.min_entry_bps if pos.min_entry_bps is not None
@@ -710,8 +717,8 @@ class Engine:
             )
             return (
                 f"sizing up #{pos.id} {symbol} [{pos.trade_kind}]: adding ${notional}"
-                f" (target now ${pos.target_notional}) — SELL perp (maker) / BUY spot"
-                f" on fill, basis floor {float(floor):.1f}bps"
+                f" to ~${float(cur_notional):,.0f} current — SELL perp (maker) / BUY"
+                f" spot on fill, basis floor {float(floor):.1f}bps"
             )
 
         pos = self.positions.create(

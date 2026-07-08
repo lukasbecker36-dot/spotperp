@@ -940,9 +940,17 @@ class Executor:
                     (final.perp_entry_avg / pair.qty_multiplier - final.spot_entry_avg)
                     / final.spot_entry_avg * BPS
                 )
+            # Snap target_notional to the ACTUAL filled size (perp qty x entry
+            # price), so a partially-filled or cancelled add can't leave it
+            # inflated — it always reflects real exposure for the cap/display.
+            actual_notional = (
+                final.perp_qty * final.perp_entry_avg
+                if final.perp_entry_avg else final.target_notional
+            )
             self._conn.execute(
-                "UPDATE positions SET entry_basis_bps=? WHERE id=?",
-                (str(entry_basis) if entry_basis is not None else None, position.id),
+                "UPDATE positions SET entry_basis_bps=?, target_notional=? WHERE id=?",
+                (str(entry_basis) if entry_basis is not None else None,
+                 str(actual_notional), position.id),
             )
             self._conn.commit()
             self._positions.set_state(position.id, pm.OPEN)
