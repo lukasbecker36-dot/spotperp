@@ -84,6 +84,27 @@ LIQ_ALERT_THROTTLE_SECONDS = float(os.environ.get("LIQ_ALERT_THROTTLE_SECONDS", 
 # reduce-only buy STOP_MARKET on Aster (triggers on the mark, closing the short
 # before liquidation) and a resting sell LIMIT on MEXC at the same level.
 STOP_LIQ_BUFFER_PCT = Decimal(os.environ.get("STOP_LIQ_BUFFER_PCT", "1"))
+
+# ── Hedge-integrity guard (ADL protection) ──
+# The venue can close/reduce the perp leg WITHOUT any order of ours: auto-
+# deleveraging (a profitable short gets force-closed against liquidated longs),
+# venue liquidation, or a manual close on the exchange UI. That leaves the spot
+# leg naked long. The safety loop compares each live position's DB perp qty to
+# Aster positionRisk and, when the venue shows less:
+#   1. alerts immediately, then confirms the deficit continuously for
+#      HEDGE_BREAK_CONFIRM_SECONDS using only FRESH positionRisk data (a stale
+#      cache or API outage never triggers action);
+#   2. reconciles the DB perp to venue reality (synthetic exit fill at mark);
+#   3. sells the now-unhedged spot down to the surviving perp size in tranches
+#      of ADL_SELL_TRANCHE_PCT every ADL_SELL_INTERVAL_SECONDS (market-selling
+#      a plunged microcap in one clip would eat the book).
+HEDGE_BREAK_CONFIRM_SECONDS = float(os.environ.get("HEDGE_BREAK_CONFIRM_SECONDS", "30"))
+HEDGE_BREAK_RISK_FRESH_SECONDS = float(
+    os.environ.get("HEDGE_BREAK_RISK_FRESH_SECONDS", "45")
+)
+HEDGE_BREAK_TOLERANCE_PCT = Decimal(os.environ.get("HEDGE_BREAK_TOLERANCE_PCT", "1"))
+ADL_SELL_TRANCHE_PCT = Decimal(os.environ.get("ADL_SELL_TRANCHE_PCT", "10"))
+ADL_SELL_INTERVAL_SECONDS = float(os.environ.get("ADL_SELL_INTERVAL_SECONDS", "10"))
 MAX_HOLD_HOURS = 168                     # 1 week max hold
 # Aster perp margin applied to each symbol before its first live entry: 1x
 # isolated keeps the short fully margined (liquidation only on a ~100% move),

@@ -100,6 +100,11 @@ class Engine:
         # loop can auto-refresh them after a resize. In-memory: lost on restart
         # (stops themselves survive; re-run /stops to re-arm auto-refresh).
         self._stops_qty: dict[int, Decimal] = {}
+        # Hedge-integrity guard: position id -> monotonic time the perp-leg
+        # deficit was first observed (with fresh venue data). Cleared when the
+        # legs match again; acted on after HEDGE_BREAK_CONFIRM_SECONDS.
+        self._hedge_break: dict[int, float] = {}
+        self._position_risk_ts = 0.0   # last SUCCESSFUL positionRisk refresh
 
     # ── startup ──
 
@@ -268,6 +273,9 @@ class Engine:
         self._position_risk = {
             r["symbol"]: r for r in risk if r.get("symbol")
         }
+        # Freshness marker: the hedge-integrity guard only trusts (and only
+        # counts confirmation time against) a recently-SUCCESSFUL snapshot.
+        self._position_risk_ts = time.monotonic()
 
     async def _funding_loop(self) -> None:
         while True:
@@ -544,6 +552,95 @@ class Engine:
         if liq <= 0 or mark_px <= 0:
             return None
         return float(liq), float((liq - mark_px) / mark_px * Decimal(100))
+
+    async def _check_hedge_integrity(self, pos: pm.Position) -> bool:
+        """Detect the perp leg being closed/reduced ON THE VENUE with no order
+        of ours (ADL, liquidation, manual close) — which leaves the spot leg
+        naked — and rebalance. Returns True when it took over the position (the
+        caller must then skip the basis safety checks this sweep).
+
+        Guards against acting on bad data: requires a recent SUCCESSFUL
+        positionRisk refresh, and the deficit must persist continuously for
+        HEDGE_BREAK_CONFIRM_SECONDS before anything is traded."""
+        if self.paper or pos.paper or pos.state != pm.OPEN:
+            return False
+        if pos.perp_qty <= 0 or pos.spot_qty <= 0:
+            return False
+        if self.executor.has_task(pos.id):
+            # An entry/add is working — fills are still being recorded, so a
+            # transient DB-vs-venue gap is expected. Don't accumulate.
+            self._hedge_break.pop(pos.id, None)
+            return False
+        pair = self.md.pair_maps.get(pos.symbol)
+        info = self.md.aster_info.get(pair.aster_symbol) if pair else None
+        if pair is None or info is None:
+            return False
+        now = time.monotonic()
+        if now - self._position_risk_ts > config.HEDGE_BREAK_RISK_FRESH_SECONDS:
+            return False   # can't trust the venue snapshot; never act on stale
+        row = self._position_risk.get(pair.aster_symbol)
+        venue_perp = abs(_dec_or_zero(row.get("positionAmt"))) if row else Decimal(0)
+        tolerance = max(
+            info.step_size,
+            pos.perp_qty * config.HEDGE_BREAK_TOLERANCE_PCT / Decimal(100),
+        )
+        deficit = pos.perp_qty - venue_perp
+        if deficit <= tolerance:
+            if self._hedge_break.pop(pos.id, None) is not None:
+                journal(self.conn, f"position {pos.id}: perp leg matches venue"
+                        f" again — hedge-break timer reset")
+            return False
+
+        first = self._hedge_break.get(pos.id)
+        if first is None:
+            self._hedge_break[pos.id] = now
+            journal(self.conn, f"position {pos.id}: VENUE PERP DEFICIT"
+                    f" db={pos.perp_qty} venue={venue_perp}", "ERROR")
+            await self.notifier.alert(
+                f"⚠️ position {pos.id} {pos.symbol}: Aster shows the perp short"
+                f" at {venue_perp} but we hold {pos.perp_qty} — possible ADL /"
+                f" liquidation / manual close. Confirming for"
+                f" {config.HEDGE_BREAK_CONFIRM_SECONDS:.0f}s before rebalancing"
+                f" the spot leg."
+            )
+            return False
+        if now - first < config.HEDGE_BREAK_CONFIRM_SECONDS:
+            return False
+
+        # Confirmed on fresh data for the full window: act.
+        self._hedge_break.pop(pos.id, None)
+        mark = _dec_or_zero(row.get("markPrice")) if row else Decimal(0)
+        if mark <= 0:
+            book = self.md.aster_books.get(pair.aster_symbol)
+            mark = book.bid if book and book.bid > 0 else pos.perp_entry_avg or Decimal(0)
+        # Reconcile the DB perp to venue reality: the venue closed `deficit`
+        # contracts without us. Book a synthetic exit at the mark — the true
+        # ADL fill price lives on the venue (check trade history / /recon).
+        self.positions.record_fill(
+            pos.id, "aster", "exit", "BUY", deficit, mark, Decimal(0),
+            order_id="ADL",
+        )
+        journal(self.conn, f"position {pos.id}: HEDGE BROKEN — reconciled"
+                f" {deficit} perp @ ~{mark} (venue {venue_perp} remains),"
+                f" selling spot down in tranches", "ERROR")
+        await self.notifier.alert(
+            f"🚨 position {pos.id} {pos.symbol}: perp leg reduced on venue by"
+            f" {deficit} (ADL/liquidation/manual) — booked at ~mark {mark},"
+            f" now selling the unhedged spot in"
+            f" {float(config.ADL_SELL_TRANCHE_PCT):.0f}% tranches every"
+            f" {config.ADL_SELL_INTERVAL_SECONDS:.0f}s. Verify the real close"
+            f" price on Aster; /recon is venue-truth. Protective /stops were"
+            f" cancelled — re-run /stops if a position remains."
+        )
+        await self._cancel_stops_for(pos)   # the spot sell LIMIT locks balance
+        floor = venue_perp if venue_perp > tolerance else Decimal(0)
+        self.positions.set_exit_request(
+            pos.id, "now", None, floor if floor > 0 else None
+        )
+        await self.executor.start_spot_rebalance(
+            self.positions.get(pos.id), floor
+        )
+        return True
 
     async def _check_stops_resize(self, pos: pm.Position) -> None:
         """Re-place a position's /stops if its size changed since they were set
@@ -1311,6 +1408,8 @@ class Engine:
                         # is open, so check it independently of the basis logic.
                         await self._check_liquidation(pos)
                         if pos.state == pm.OPEN:
+                            if await self._check_hedge_integrity(pos):
+                                continue   # guard took over; skip basis checks
                             await self._check_safety(pos)
                             await self._check_stops_resize(pos)
                         elif pos.state == pm.EXITING and pos.id in self._auto_passive:

@@ -431,6 +431,65 @@ class Executor:
         await self._cancel_task(position.id)
         self._spawn(position.id, self._run_exit(position))
 
+    async def start_spot_rebalance(
+        self, position: pm.Position, floor_perp: Decimal
+    ) -> None:
+        """Sell the position's UNHEDGED spot down to floor_perp-worth (the perp
+        still alive on the venue after an ADL/liquidation/manual reduction) in
+        small tranches. floor_perp=0 closes the spot leg entirely."""
+        await self._cancel_task(position.id)
+        self._spawn(position.id, self._run_spot_selldown(position, floor_perp))
+
+    async def _run_spot_selldown(
+        self, position: pm.Position, floor_perp: Decimal
+    ) -> None:
+        """Tranche seller for a broken hedge: ADL_SELL_TRANCHE_PCT of the excess
+        every ADL_SELL_INTERVAL_SECONDS (one market clip into a just-plunged
+        microcap book would eat it). The DB perp side has already been
+        reconciled to the venue by the caller; on restart mid-way, the position
+        is EXITING with exit_mode 'now' + floor, so _resume_positions resumes a
+        normal aggressive exit that finishes the job in one clip."""
+        symbol = position.symbol
+        pair = self._pair(symbol)
+        mexc_info = self._md.mexc_info[pair.mexc_symbol]
+        self._positions.set_state(position.id, pm.EXITING)
+        floor_spot = mexc_info.round_qty(floor_perp * pair.qty_multiplier)
+        pos = self._positions.get(position.id)
+        initial_excess = pos.spot_qty - floor_spot
+        tranche = mexc_info.round_qty(
+            initial_excess * config.ADL_SELL_TRANCHE_PCT / Decimal(100)
+        )
+        journal(self._conn, f"position {position.id}: spot sell-down of"
+                f" {initial_excess} to floor {floor_spot} (tranche {tranche})")
+        deadline = time.monotonic() + config.EXIT_TIMEOUT_MINUTES * 60
+        while time.monotonic() < deadline:
+            pos = self._positions.get(position.id)
+            remaining = pos.spot_qty - floor_spot
+            if mexc_info.round_qty(remaining) <= 0:
+                break
+            qty = min(tranche, remaining) if tranche > 0 else remaining
+            # A sub-min-notional tranche (or tail) can't be sold on its own —
+            # fold it into the remainder in one final clip.
+            book = self._md.mexc_books.get(pair.mexc_symbol)
+            ref = book.bid if book and book.bid > 0 else Decimal(0)
+            if ref > 0 and remaining * ref <= mexc_info.min_notional * 2:
+                qty = remaining
+            try:
+                shortfall, err = await self._hedge_spot(
+                    position, "SELL", qty, "exit"
+                )
+            except AmbiguousOrderError as exc:
+                await self._notifier.alert(
+                    f"🚨 position {position.id} {symbol}: spot sell-down tranche"
+                    f" AMBIGUOUS ({exc}) — stopping; reconcile the spot balance"
+                    f" manually, then /exit or /remove"
+                )
+                return   # leave EXITING; operator decides
+            if shortfall > 0 and err:
+                log.warning("sell-down tranche short %s: %s", shortfall, err)
+            await asyncio.sleep(config.ADL_SELL_INTERVAL_SECONDS)
+        await self._complete_exit(position.id, floor_perp)
+
     async def _cancel_task(self, position_id: int) -> None:
         """Cancel a running task for this position and AWAIT its cleanup before
         returning, so a replacement can't run concurrently with the old task's

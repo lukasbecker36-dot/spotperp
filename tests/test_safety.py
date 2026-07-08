@@ -74,6 +74,8 @@ def engine(tmp_path, monkeypatch):
     eng._position_risk = {}
     eng._liq_alerted = {}
     eng._stops_qty = {}
+    eng._hedge_break = {}
+    eng._position_risk_ts = 0.0
     yield eng
     conn.close()
 
@@ -427,6 +429,107 @@ async def test_stops_places_reduce_only_perp_stop_and_spot_limit(engine):
     assert spot["side"] == "SELL" and spot["type"] == "LIMIT"
     assert spot["price"] == Decimal("148.5") and spot["quantity"] == Decimal("9.95")
     assert "below liq 150" in out
+
+
+import time as _time
+
+
+def _arm_adl(engine, position_amt: str):
+    """Point the engine at a fresh venue snapshot showing `position_amt`."""
+    engine.paper = False
+    engine.aster = _StopClient()
+    engine.mexc = _StopClient()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "positionAmt": position_amt,
+                    "markPrice": "100", "liquidationPrice": "200"}
+    }
+    engine._position_risk_ts = _time.monotonic()
+
+
+async def _wait_state(engine, pid, state, timeout=5.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if engine.positions.get(pid).state == state:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"never reached {state}, is {engine.positions.get(pid).state}"
+    )
+
+
+async def test_hedge_break_warns_but_waits_for_confirmation(engine):
+    """First sighting of a venue perp deficit alerts but must NOT trade until
+    the confirmation window has elapsed."""
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "0")                       # venue: perp gone
+    acted = await engine._check_hedge_integrity(engine.positions.get(pid))
+    assert acted is False
+    assert pid in engine._hedge_break
+    assert any("possible ADL" in m for m in engine.notifier.messages)
+    pos = engine.positions.get(pid)
+    assert pos.state == pm.OPEN and pos.perp_qty == Decimal("9.95")  # untouched
+    # Immediately again (default 30s window not elapsed): still nothing.
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is False
+
+
+async def test_hedge_break_ignores_stale_risk_data(engine):
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "0")
+    engine._position_risk_ts = _time.monotonic() - 999   # stale snapshot
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is False
+    assert pid not in engine._hedge_break                # no timer started
+
+
+async def test_hedge_break_timer_resets_when_venue_matches_again(engine):
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "0")
+    await engine._check_hedge_integrity(engine.positions.get(pid))
+    assert pid in engine._hedge_break
+    _arm_adl(engine, "-9.95")                   # venue matches again
+    await engine._check_hedge_integrity(engine.positions.get(pid))
+    assert pid not in engine._hedge_break
+
+
+async def test_full_adl_sells_spot_down_and_closes(engine, monkeypatch):
+    """Perp fully ADL'd on venue: after confirmation the DB perp is reconciled
+    (synthetic exit at mark) and the naked spot is sold off in tranches until
+    the position is CLOSED with realized P&L booked."""
+    monkeypatch.setattr(config, "HEDGE_BREAK_CONFIRM_SECONDS", 0.0)
+    monkeypatch.setattr(config, "ADL_SELL_INTERVAL_SECONDS", 0.01)
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "0")
+    await engine._check_hedge_integrity(engine.positions.get(pid))  # warn+arm
+    acted = await engine._check_hedge_integrity(engine.positions.get(pid))
+    assert acted is True
+    await _wait_state(engine, pid, pm.CLOSED)
+    final = engine.positions.get(pid)
+    assert final.perp_qty == 0 and final.spot_qty == 0
+    assert final.realized_pnl_usd is not None       # ADL loss/gain is booked
+    assert any("perp leg reduced on venue" in m for m in engine.notifier.messages)
+
+
+async def test_partial_adl_rebalances_to_surviving_perp(engine, monkeypatch):
+    """ADL reduced (not closed) the perp: spot is sold down to match the
+    surviving perp and the position stays OPEN at the reduced size."""
+    monkeypatch.setattr(config, "HEDGE_BREAK_CONFIRM_SECONDS", 0.0)
+    monkeypatch.setattr(config, "ADL_SELL_INTERVAL_SECONDS", 0.01)
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "-4.95")                   # 5.0 of 9.95 ADL'd away
+    await engine._check_hedge_integrity(engine.positions.get(pid))
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
+    # Wait for the sell-down to finish (position starts OPEN, so wait on the
+    # actual rebalance outcome, not the state).
+    deadline = asyncio.get_event_loop().time() + 5.0
+    while asyncio.get_event_loop().time() < deadline:
+        p = engine.positions.get(pid)
+        if p.spot_qty == Decimal("4.95") and p.state == pm.OPEN and p.exit_mode is None:
+            break
+        await asyncio.sleep(0.02)
+    final = engine.positions.get(pid)
+    assert final.perp_qty == Decimal("4.95")    # reconciled to venue
+    assert final.spot_qty == Decimal("4.95")    # hedge restored
+    assert final.state == pm.OPEN
+    assert final.exit_mode is None              # exit request cleared
 
 
 async def test_stops_auto_refresh_on_size_up(engine):
