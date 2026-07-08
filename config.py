@@ -75,6 +75,15 @@ CONVERGED_PASSIVE_BPS = Decimal(os.environ.get("CONVERGED_PASSIVE_BPS", "0.0"))
 CONVERGED_PASSIVE_RESET_BPS = Decimal(
     os.environ.get("CONVERGED_PASSIVE_RESET_BPS", "5.0")
 )
+# Don't let the convergence auto-close fire until a position has been held this
+# long. Right after entry the closeable (bid/bid) basis is dominated by the
+# bid-ask SPREAD, not real convergence — on a wide microcap it's already <= 0
+# the instant you enter, so the TP would round-trip both spreads for a loss
+# (CASHCAT: entered +243bps, "converged" -91.7bps and closed within a minute).
+# Adverse-widen stop and max-hold still apply from the start. 0 disables.
+CONVERGENCE_MIN_HOLD_MINUTES = float(
+    os.environ.get("CONVERGENCE_MIN_HOLD_MINUTES", "15")
+)
 # Alert (and flag in /positions & /recon) when a perp short's mark is within
 # this % of its liquidation price. Re-alerts at most every throttle window
 # while still in danger; re-arms once it recovers back above the threshold.

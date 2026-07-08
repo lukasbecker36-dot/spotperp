@@ -1488,6 +1488,16 @@ class Engine:
         # adverse-widen stop above still applies (perp-liquidation protection).
         if pos.trade_kind == "carry":
             return
+        # Don't auto-close within the min-hold: right after entry the bid/bid
+        # closeable basis is mostly the bid-ask spread, not convergence, so the
+        # TP would round-trip both spreads at a loss on a wide name. (Adverse
+        # stop above and max-hold below still apply from the start.)
+        held_min = (
+            (time.time() * 1000 - pos.opened_ms) / 60_000
+            if pos.opened_ms else 1e9
+        )
+        if held_min < config.CONVERGENCE_MIN_HOLD_MINUTES:
+            return
         # Two-tier convergence auto-close (see config.CONVERGED_PASSIVE_BPS).
         # While still in premium (close above the passive trigger) just hold and
         # collect funding; max-hold below still bounds the carry.

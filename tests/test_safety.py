@@ -52,6 +52,10 @@ def engine(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "POLL_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(config, "REPRICE_MIN_INTERVAL_SECONDS", 0.0)
     monkeypatch.setattr(config, "MIN_HEDGE_NOTIONAL_USD", Decimal("1"))
+    # Convergence tests open a position and check the auto-close in the same
+    # instant; default the min-hold off so they behave as before (its own test
+    # sets it explicitly).
+    monkeypatch.setattr(config, "CONVERGENCE_MIN_HOLD_MINUTES", 0.0)
 
     conn = database.init_db(tmp_path / "test.db")
     md = MarketData()
@@ -136,6 +140,26 @@ async def test_converged_tp_fires_when_profitable(engine):
     pos = engine.positions.get(pos_id)
     assert pos.exit_mode == "now"
     assert any("taking profit" in m for m in engine.notifier.messages)
+
+
+async def test_converged_tp_waits_for_min_hold(engine, monkeypatch):
+    """The convergence auto-close must not fire within the min-hold — right
+    after entry a converged+profitable-looking basis is a spread artifact
+    (CASHCAT). It fires once the position has been held long enough."""
+    monkeypatch.setattr(config, "CONVERGENCE_MIN_HOLD_MINUTES", 15.0)
+    pos_id = await open_position(engine)         # opened just now
+    set_books(engine.md, "99.0", "99.1", "99.9", "100.0")  # converged + profitable
+    await engine._check_safety(engine.positions.get(pos_id))
+    assert engine.positions.get(pos_id).exit_mode is None   # too soon — held
+
+    # Backdate the open past the min-hold: now the same basis closes it.
+    engine.conn.execute(
+        "UPDATE positions SET opened_ms=? WHERE id=?",
+        (int(_time.time() * 1000) - 20 * 60_000, pos_id),
+    )
+    engine.conn.commit()
+    await engine._check_safety(engine.positions.get(pos_id))
+    assert engine.positions.get(pos_id).exit_mode == "now"
 
 
 async def test_carry_trade_skips_converged_tp(engine):
