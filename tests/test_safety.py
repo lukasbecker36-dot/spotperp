@@ -76,6 +76,7 @@ def engine(tmp_path, monkeypatch):
     eng._stops_qty = {}
     eng._hedge_break = {}
     eng._position_risk_ts = 0.0
+    eng._position_risk_wall_ms = 0
     yield eng
     conn.close()
 
@@ -435,7 +436,8 @@ import time as _time
 
 
 def _arm_adl(engine, position_amt: str):
-    """Point the engine at a fresh venue snapshot showing `position_amt`."""
+    """Point the engine at a fresh venue snapshot showing `position_amt`, taken
+    AFTER the position opened (so it isn't dismissed as post-entry cache lag)."""
     engine.paper = False
     engine.aster = _StopClient()
     engine.mexc = _StopClient()
@@ -444,6 +446,7 @@ def _arm_adl(engine, position_amt: str):
                     "markPrice": "100", "liquidationPrice": "200"}
     }
     engine._position_risk_ts = _time.monotonic()
+    engine._position_risk_wall_ms = int(_time.time() * 1000) + 60_000
 
 
 async def _wait_state(engine, pid, state, timeout=5.0):
@@ -493,6 +496,27 @@ async def test_hedge_break_suppresses_converged_tp(engine):
     pos = engine.positions.get(pid)
     assert pos.exit_mode is None                 # converged-TP suppressed
     assert pos.state == pm.OPEN
+
+
+async def test_hedge_break_ignores_pre_open_snapshot(engine):
+    """Regression (CASHCAT): a just-entered perp lags the risk poll, so a
+    snapshot taken BEFORE the position opened showing 0 must NOT read as an
+    ADL — no warning, no timer."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _StopClient()
+    engine.mexc = _StopClient()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "positionAmt": "0", "markPrice": "100"}
+    }
+    engine._position_risk_ts = _time.monotonic()
+    # Snapshot predates the position opening (cache lag right after entry).
+    engine._position_risk_wall_ms = engine.positions.get(pid).opened_ms - 5_000
+
+    took_over = await engine._check_hedge_integrity(engine.positions.get(pid))
+    assert took_over is False
+    assert pid not in engine._hedge_break
+    assert not any("possible ADL" in m for m in engine.notifier.messages)
 
 
 async def test_hedge_break_ignores_stale_risk_data(engine):

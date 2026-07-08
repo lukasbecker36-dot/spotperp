@@ -104,7 +104,8 @@ class Engine:
         # deficit was first observed (with fresh venue data). Cleared when the
         # legs match again; acted on after HEDGE_BREAK_CONFIRM_SECONDS.
         self._hedge_break: dict[int, float] = {}
-        self._position_risk_ts = 0.0   # last SUCCESSFUL positionRisk refresh
+        self._position_risk_ts = 0.0        # last SUCCESSFUL refresh (monotonic)
+        self._position_risk_wall_ms = 0     # ...and its wall-clock time
 
     # ── startup ──
 
@@ -290,9 +291,13 @@ class Engine:
         self._position_risk = {
             r["symbol"]: r for r in risk if r.get("symbol")
         }
-        # Freshness marker: the hedge-integrity guard only trusts (and only
-        # counts confirmation time against) a recently-SUCCESSFUL snapshot.
+        # Freshness markers: the hedge-integrity guard only trusts (and counts
+        # confirmation time against) a recently-SUCCESSFUL snapshot. The wall
+        # clock is used to check the snapshot postdates a position's opening —
+        # a freshly-entered perp lags the ~15s risk poll and would otherwise
+        # look like an ADL (the CASHCAT false positive).
         self._position_risk_ts = time.monotonic()
+        self._position_risk_wall_ms = int(time.time() * 1000)
 
     async def _funding_loop(self) -> None:
         while True:
@@ -595,6 +600,12 @@ class Engine:
         now = time.monotonic()
         if now - self._position_risk_ts > config.HEDGE_BREAK_RISK_FRESH_SECONDS:
             return False   # can't trust the venue snapshot; never act on stale
+        # The snapshot must postdate the position opening: a just-entered perp
+        # lags the ~15s risk poll, so an older snapshot showing 0 is cache lag,
+        # not an ADL (the CASHCAT false positive — enter then "perp at 0").
+        if pos.opened_ms is None or self._position_risk_wall_ms < pos.opened_ms:
+            self._hedge_break.pop(pos.id, None)
+            return False
         row = self._position_risk.get(pair.aster_symbol)
         venue_perp = abs(_dec_or_zero(row.get("positionAmt"))) if row else Decimal(0)
         tolerance = max(
