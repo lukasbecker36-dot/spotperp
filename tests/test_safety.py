@@ -532,6 +532,54 @@ async def test_partial_adl_rebalances_to_surviving_perp(engine, monkeypatch):
     assert final.exit_mode is None              # exit request cleared
 
 
+class _RiskClient(_StopClient):
+    """Stub venue client whose position_risk returns the given rows."""
+    def __init__(self, rows):
+        super().__init__()
+        self._rows = rows
+
+    async def position_risk(self):
+        return self._rows
+
+
+async def test_startup_hedge_check_arms_guard_for_overnight_adl(engine):
+    """An ADL that happened while the engine was DOWN must be caught at boot:
+    the startup check fetches fresh venue risk, warns immediately, and arms the
+    confirmation timer (the safety loop then acts one window later)."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    # Venue reports the perp gone; engine has NO cached risk (fresh boot).
+    engine.aster = _RiskClient(
+        [{"symbol": "BTCUSDT", "positionAmt": "0", "markPrice": "100"}]
+    )
+    engine.mexc = _StopClient()
+    engine._position_risk = {}
+    engine._position_risk_ts = 0.0
+
+    await engine._startup_hedge_check()
+
+    assert pid in engine._hedge_break                     # timer armed at boot
+    assert any("possible ADL" in m for m in engine.notifier.messages)
+    pos = engine.positions.get(pid)
+    assert pos.state == pm.OPEN and pos.perp_qty > 0      # nothing traded yet
+
+
+async def test_startup_hedge_check_quiet_when_hedged(engine):
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _RiskClient(
+        [{"symbol": "BTCUSDT", "positionAmt": "-9.95", "markPrice": "100"}]
+    )
+    engine.mexc = _StopClient()
+    engine._position_risk = {}
+    engine._position_risk_ts = 0.0
+
+    await engine._startup_hedge_check()
+
+    assert pid not in engine._hedge_break
+    assert not any("possible ADL" in m for m in engine.notifier.messages)
+
+
 async def test_stops_auto_refresh_on_size_up(engine):
     """After a position grows (size-up), the safety loop re-places its /stops at
     the new size so the added portion isn't left unprotected."""

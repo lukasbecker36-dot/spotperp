@@ -126,6 +126,7 @@ class Engine:
         await self._refresh_funding()
         await self._refresh_funding_stats()
         await self._resume_positions()
+        await self._startup_hedge_check()
         try:
             await self._refresh_position_funding()
         except Exception:
@@ -186,6 +187,22 @@ class Engine:
                     f"position {pos.id} stuck UNWINDING at startup — manual check",
                     "ERROR",
                 )
+
+    async def _startup_hedge_check(self) -> None:
+        """Catch a hedge that broke while the engine was DOWN (e.g. an
+        overnight ADL): fetch venue risk now and run the integrity check once,
+        so the warning fires within seconds of boot and the sell-down follows
+        one confirmation window later — instead of waiting for the loops to
+        notice. The 30s confirmation still applies (the safety loop re-checks
+        against further fresh snapshots before acting)."""
+        if self.paper:
+            return
+        await self._refresh_position_risk()
+        for pos in self.positions.active():
+            try:
+                await self._check_hedge_integrity(pos)
+            except Exception:
+                log.exception("startup hedge check failed for position %s", pos.id)
 
     # ── loops ──
 
