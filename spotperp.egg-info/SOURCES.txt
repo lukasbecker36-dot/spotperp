@@ -22,10 +22,15 @@ spotperp.egg-info/requires.txt
 spotperp.egg-info/top_level.txt
 tests/test_auth.py
 tests/test_book.py
+tests/test_commands.py
+tests/test_control.py
+tests/test_exchange.py
 tests/test_executor.py
 tests/test_funding.py
+tests/test_notify.py
 tests/test_position_manager.py
 tests/test_recon.py
+tests/test_recovery.py
 tests/test_safety.py
 tests/test_screener.py
 tests/test_sizing.py

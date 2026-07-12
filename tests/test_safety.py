@@ -78,6 +78,8 @@ def engine(tmp_path, monkeypatch):
     eng._position_risk = {}
     eng._liq_alerted = {}
     eng._stops_qty = {}
+    eng._stops_orders = {}
+    eng._stop_grace = {}
     eng._hedge_break = {}
     eng._position_risk_ts = 0.0
     eng._position_risk_wall_ms = 0
@@ -457,6 +459,23 @@ async def test_stops_places_reduce_only_perp_stop_and_spot_limit(engine):
 
 
 import time as _time
+from types import SimpleNamespace
+
+
+def _order(executed="0", avg="0", open_=True):
+    return SimpleNamespace(
+        executed_qty=Decimal(executed), avg_price=Decimal(avg), is_open=open_,
+    )
+
+
+class _GraceClient(_StopClient):
+    """_StopClient plus get_order lookups for stop-fire tests."""
+    def __init__(self, orders=None, **kw):
+        super().__init__(**kw)
+        self._orders = orders or {}
+
+    async def get_order(self, symbol, order_id):
+        return self._orders[order_id]
 
 
 def _arm_adl(engine, position_amt: str):
@@ -577,6 +596,83 @@ async def test_full_adl_sells_spot_down_and_closes(engine, monkeypatch):
     assert final.perp_qty == 0 and final.spot_qty == 0
     assert final.realized_pnl_usd is not None       # ADL loss/gain is booked
     assert any("perp leg reduced on venue" in m for m in engine.notifier.messages)
+
+
+async def test_stop_fire_prefers_resting_spot_limit(engine, monkeypatch):
+    """When the perp deficit is OUR OWN /stops STOP_MARKET having fired, the
+    perp is reconciled at the stop's REAL fill price and the resting MEXC sell
+    LIMIT is kept working (grace) — NOT cancelled and market-dumped."""
+    monkeypatch.setattr(config, "HEDGE_BREAK_CONFIRM_SECONDS", 0.0)
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "0")                       # venue: perp gone
+    engine.aster = _GraceClient(
+        orders={"A1": _order(executed="9.95", avg="148.5", open_=False)}
+    )
+    engine.mexc = _GraceClient(orders={"M1": _order(open_=True)})  # unfilled, resting
+    engine._stops_orders[pid] = {"aster_id": "A1", "mexc_id": "M1"}
+
+    await engine._check_hedge_integrity(engine.positions.get(pid))   # warn+arm
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
+
+    final = engine.positions.get(pid)
+    assert final.perp_qty == 0
+    assert final.perp_exit_avg == Decimal("148.5")   # REAL stop fill, not mark
+    assert engine.mexc.cancelled == []               # spot limit left working
+    assert pid in engine._stop_grace
+    assert final.state == pm.EXITING
+    assert not engine.executor.has_task(pid)         # no market sell-down yet
+    assert any("STOP FIRED" in m for m in engine.notifier.messages)
+
+
+async def test_stop_grace_completes_when_limit_fills(engine):
+    """During grace the MEXC limit fills at the stop price: fills are recorded
+    and the position closes cleanly — no market selling at all."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    # Perp side already reconciled (stop fired) -> perp_qty 0.
+    engine.positions.record_fill(
+        pid, "aster", "exit", "BUY", Decimal("9.95"), Decimal("148.5"),
+        Decimal(0), order_id="A1",
+    )
+    engine.positions.set_state(pid, pm.EXITING)
+    engine.mexc = _GraceClient(
+        orders={"M1": _order(executed="9.95", avg="148.5", open_=False)}
+    )
+    engine._stop_grace[pid] = {
+        "until": _time.monotonic() + 60, "mexc_id": "M1",
+        "recorded": Decimal(0), "floor": Decimal(0),
+    }
+    await engine._check_stop_grace(engine.positions.get(pid))
+    await _wait_state(engine, pid, pm.CLOSED)
+    final = engine.positions.get(pid)
+    assert final.spot_qty == 0
+    assert final.spot_exit_avg == Decimal("148.5")   # sold at the stop price
+    assert pid not in engine._stop_grace
+    assert final.realized_pnl_usd is not None
+
+
+async def test_stop_grace_timeout_falls_back_to_tranches(engine, monkeypatch):
+    """Grace expires with the limit unfilled: cancel it and tranche-sell the
+    remainder at market."""
+    monkeypatch.setattr(config, "ADL_SELL_INTERVAL_SECONDS", 0.01)
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.positions.record_fill(
+        pid, "aster", "exit", "BUY", Decimal("9.95"), Decimal("148.5"),
+        Decimal(0), order_id="A1",
+    )
+    engine.positions.set_state(pid, pm.EXITING)
+    engine.aster = _GraceClient()
+    engine.mexc = _GraceClient(orders={"M1": _order(open_=True)})  # never fills
+    engine._stop_grace[pid] = {
+        "until": _time.monotonic() - 1, "mexc_id": "M1",   # already expired
+        "recorded": Decimal(0), "floor": Decimal(0),
+    }
+    await engine._check_stop_grace(engine.positions.get(pid))
+    assert "M1" in engine.mexc.cancelled            # remnant limit pulled
+    assert pid not in engine._stop_grace
+    await _wait_state(engine, pid, pm.CLOSED)       # tranche sell-down finished
+    assert engine.positions.get(pid).spot_qty == 0
 
 
 async def test_partial_adl_rebalances_to_surviving_perp(engine, monkeypatch):

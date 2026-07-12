@@ -114,6 +114,13 @@ HEDGE_BREAK_RISK_FRESH_SECONDS = float(
 HEDGE_BREAK_TOLERANCE_PCT = Decimal(os.environ.get("HEDGE_BREAK_TOLERANCE_PCT", "1"))
 ADL_SELL_TRANCHE_PCT = Decimal(os.environ.get("ADL_SELL_TRANCHE_PCT", "10"))
 ADL_SELL_INTERVAL_SECONDS = float(os.environ.get("ADL_SELL_INTERVAL_SECONDS", "10"))
+# When the perp deficit is explained by OUR OWN /stops STOP_MARKET having fired
+# (not an ADL), the MEXC sell LIMIT twin is already resting at the chosen stop
+# price — leave it working for this long before cancelling it and falling back
+# to tranche market sells. Aster's stop triggers on the Aster mark; MEXC often
+# reaches the level seconds later, and market-dumping immediately realises the
+# venue price gap at the worst possible moment.
+STOP_SPOT_GRACE_SECONDS = float(os.environ.get("STOP_SPOT_GRACE_SECONDS", "120"))
 MAX_HOLD_HOURS = 168                     # 1 week max hold
 # Aster perp margin applied to each symbol before its first live entry: 1x
 # isolated keeps the short fully margined (liquidation only on a ~100% move),

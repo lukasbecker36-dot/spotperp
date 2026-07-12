@@ -100,10 +100,17 @@ class Engine:
         # loop can auto-refresh them after a resize. In-memory: lost on restart
         # (stops themselves survive; re-run /stops to re-arm auto-refresh).
         self._stops_qty: dict[int, Decimal] = {}
+        # Venue order ids of each position's /stops legs, so the hedge guard can
+        # recognise its OWN stop firing (query the real fill) vs an ADL.
+        self._stops_orders: dict[int, dict] = {}
         # Hedge-integrity guard: position id -> monotonic time the perp-leg
         # deficit was first observed (with fresh venue data). Cleared when the
         # legs match again; acted on after HEDGE_BREAK_CONFIRM_SECONDS.
         self._hedge_break: dict[int, float] = {}
+        # Stop-fired grace: position id -> {"until", "mexc_id", "recorded",
+        # "floor"} while the resting MEXC sell LIMIT is given time to fill at
+        # the stop price before falling back to tranche market sells.
+        self._stop_grace: dict[int, dict] = {}
         self._position_risk_ts = 0.0        # last SUCCESSFUL refresh (monotonic)
         self._position_risk_wall_ms = 0     # ...and its wall-clock time
 
@@ -181,6 +188,9 @@ class Engine:
         for pos in self.positions.active():
             if pos.state == pm.EXITING:
                 log.info("resuming exit for position %s", pos.id)
+                # A leftover /stops (or stop-grace) MEXC sell LIMIT would lock
+                # the spot balance the resumed exit needs to sell.
+                await self._cancel_stops_for(pos)
                 await self.executor.start_exit(pos)
             elif pos.state == pm.UNWINDING:
                 journal(
@@ -646,34 +656,179 @@ class Engine:
         if mark <= 0:
             book = self.md.aster_books.get(pair.aster_symbol)
             mark = book.bid if book and book.bid > 0 else pos.perp_entry_avg or Decimal(0)
-        # Reconcile the DB perp to venue reality: the venue closed `deficit`
-        # contracts without us. Book a synthetic exit at the mark — the true
-        # ADL fill price lives on the venue (check trade history / /recon).
-        self.positions.record_fill(
-            pos.id, "aster", "exit", "BUY", deficit, mark, Decimal(0),
-            order_id="ADL",
-        )
-        journal(self.conn, f"position {pos.id}: HEDGE BROKEN — reconciled"
-                f" {deficit} perp @ ~{mark} (venue {venue_perp} remains),"
-                f" selling spot down in tranches", "ERROR")
-        await self.notifier.alert(
-            f"🚨 position {pos.id} {pos.symbol}: perp leg reduced on venue by"
-            f" {deficit} (ADL/liquidation/manual) — booked at ~mark {mark},"
-            f" now selling the unhedged spot in"
-            f" {float(config.ADL_SELL_TRANCHE_PCT):.0f}% tranches every"
-            f" {config.ADL_SELL_INTERVAL_SECONDS:.0f}s. Verify the real close"
-            f" price on Aster; /recon is venue-truth. Protective /stops were"
-            f" cancelled — re-run /stops if a position remains."
-        )
-        await self._cancel_stops_for(pos)   # the spot sell LIMIT locks balance
+
+        # Was this OUR OWN /stops STOP_MARKET firing rather than an ADL? If the
+        # stop order executed, reconcile the perp at its REAL fill price and
+        # treat the resting MEXC sell LIMIT as the preferred spot exit.
+        stop_ids = self._stops_orders.get(pos.id) or {}
+        stop_order = None
+        if stop_ids.get("aster_id"):
+            try:
+                o = await self.aster.get_order(
+                    pair.aster_symbol, stop_ids["aster_id"]
+                )
+                if o.executed_qty > 0:
+                    stop_order = o
+            except ExchangeError:
+                log.exception("stop-order lookup failed for position %s", pos.id)
+
+        if stop_order is not None:
+            fill_qty = min(deficit, stop_order.executed_qty)
+            price = stop_order.avg_price if stop_order.avg_price > 0 else mark
+            self.positions.record_fill(
+                pos.id, "aster", "exit", "BUY", fill_qty, price, Decimal(0),
+                order_id=stop_ids["aster_id"],
+            )
+            if deficit > fill_qty:   # stop covered part; rest was external
+                self.positions.record_fill(
+                    pos.id, "aster", "exit", "BUY", deficit - fill_qty, mark,
+                    Decimal(0), order_id="ADL",
+                )
+            journal(self.conn, f"position {pos.id}: liq-protection STOP FIRED,"
+                    f" {fill_qty} @ {price} (venue {venue_perp} remains)", "ERROR")
+        else:
+            # Genuine ADL/liquidation/manual: book at mark — the true close
+            # price lives on the venue (check trade history / /recon).
+            self.positions.record_fill(
+                pos.id, "aster", "exit", "BUY", deficit, mark, Decimal(0),
+                order_id="ADL",
+            )
+            journal(self.conn, f"position {pos.id}: HEDGE BROKEN — reconciled"
+                    f" {deficit} perp @ ~{mark} (venue {venue_perp} remains)",
+                    "ERROR")
+
+        # Record whatever the MEXC stop-limit already sold (its fills were
+        # otherwise invisible to the DB — the sell-down would then try to sell
+        # spot we no longer hold).
+        mexc_order = None
+        if stop_ids.get("mexc_id"):
+            try:
+                mexc_order = await self.mexc.get_order(
+                    pair.mexc_symbol, stop_ids["mexc_id"]
+                )
+            except ExchangeError:
+                log.exception("stop-limit lookup failed for position %s", pos.id)
+            if mexc_order is not None and mexc_order.executed_qty > 0:
+                self.positions.record_fill(
+                    pos.id, "mexc", "exit", "SELL", mexc_order.executed_qty,
+                    mexc_order.avg_price, Decimal(0),
+                    order_id=stop_ids["mexc_id"],
+                )
+
         floor = venue_perp if venue_perp > tolerance else Decimal(0)
         self.positions.set_exit_request(
             pos.id, "now", None, floor if floor > 0 else None
+        )
+        self._stops_qty.pop(pos.id, None)
+        self._stops_orders.pop(pos.id, None)
+
+        mexc_info = self.md.mexc_info.get(pair.mexc_symbol)
+        fresh = self.positions.get(pos.id)
+        floor_spot = (
+            mexc_info.round_qty(floor * pair.qty_multiplier)
+            if mexc_info else floor * pair.qty_multiplier
+        )
+        excess = fresh.spot_qty - floor_spot
+        if mexc_info and mexc_info.round_qty(excess) <= 0:
+            # The stop-limit already sold everything needed: just finish.
+            await self.notifier.alert(
+                f"✅ position {pos.id} {pos.symbol}: perp stop fired and the"
+                f" MEXC stop-limit already covered the spot — closing out"
+            )
+            await self.executor._complete_exit(pos.id, floor)
+            return True
+
+        if (
+            stop_order is not None
+            and mexc_order is not None and mexc_order.is_open
+        ):
+            # Our stop fired and its spot twin is still resting AT THE CHOSEN
+            # STOP PRICE. Don't cancel it and market-dump — give it a grace
+            # window to fill at that price (MEXC often lags Aster's mark by
+            # seconds). Tracked by _check_stop_grace in the safety loop.
+            self._stop_grace[pos.id] = {
+                "until": time.monotonic() + config.STOP_SPOT_GRACE_SECONDS,
+                "mexc_id": stop_ids["mexc_id"],
+                "recorded": mexc_order.executed_qty,
+                "floor": floor,
+            }
+            self.positions.set_state(pos.id, pm.EXITING)
+            await self.notifier.alert(
+                f"🛑 position {pos.id} {pos.symbol}: liq-protection STOP FIRED"
+                f" on Aster (perp closed @ ~{stop_order.avg_price}). The MEXC"
+                f" sell LIMIT is still resting at the stop price — giving it"
+                f" {config.STOP_SPOT_GRACE_SECONDS:.0f}s to fill there before"
+                f" falling back to tranche market sells."
+            )
+            return True
+
+        # ADL path (or no usable resting spot order): cancel any remnants and
+        # tranche-sell the excess at market.
+        await self._cancel_stops_for(pos)   # the spot sell LIMIT locks balance
+        await self.notifier.alert(
+            f"🚨 position {pos.id} {pos.symbol}: perp leg reduced on venue by"
+            f" {deficit} — now selling the unhedged spot in"
+            f" {float(config.ADL_SELL_TRANCHE_PCT):.0f}% tranches every"
+            f" {config.ADL_SELL_INTERVAL_SECONDS:.0f}s. Verify the real close"
+            f" price on Aster; /recon is venue-truth."
         )
         await self.executor.start_spot_rebalance(
             self.positions.get(pos.id), floor
         )
         return True
+
+    async def _check_stop_grace(self, pos: pm.Position) -> None:
+        """Manage a stop-fired position while its MEXC sell LIMIT rests at the
+        stop price: record fill increments, finish when it completes, and fall
+        back to tranche market sells if the grace window expires unfilled."""
+        info = self._stop_grace.get(pos.id)
+        if info is None:
+            return
+        pair = self.md.pair_maps.get(pos.symbol)
+        mexc_info = self.md.mexc_info.get(pair.mexc_symbol) if pair else None
+        if pair is None or mexc_info is None:
+            return
+        try:
+            order = await self.mexc.get_order(pair.mexc_symbol, info["mexc_id"])
+        except ExchangeError:
+            log.exception("stop-grace lookup failed for position %s", pos.id)
+            return   # transient; try next sweep (grace clock keeps running)
+        delta = order.executed_qty - info["recorded"]
+        if delta > 0:
+            self.positions.record_fill(
+                pos.id, "mexc", "exit", "SELL", delta, order.avg_price,
+                Decimal(0), order_id=info["mexc_id"],
+            )
+            info["recorded"] = order.executed_qty
+        fresh = self.positions.get(pos.id)
+        floor = info["floor"]
+        floor_spot = mexc_info.round_qty(floor * pair.qty_multiplier)
+        if mexc_info.round_qty(fresh.spot_qty - floor_spot) <= 0:
+            self._stop_grace.pop(pos.id, None)
+            await self.notifier.alert(
+                f"✅ position {pos.id} {pos.symbol}: spot stop-limit filled at"
+                f" the stop price — closing out"
+            )
+            await self.executor._complete_exit(pos.id, floor)
+            return
+        if time.monotonic() < info["until"] and order.is_open:
+            return   # still resting at the stop price; keep waiting
+        # Grace over (or the order is gone): cancel any remnant and fall back
+        # to tranche market sells for what's left.
+        self._stop_grace.pop(pos.id, None)
+        if order.is_open:
+            try:
+                await self.mexc.cancel_order(pair.mexc_symbol, info["mexc_id"])
+            except ExchangeError:
+                log.exception("stop-grace cancel failed for position %s", pos.id)
+        await self.notifier.alert(
+            f"⏳ position {pos.id} {pos.symbol}: spot stop-limit didn't fill"
+            f" within {config.STOP_SPOT_GRACE_SECONDS:.0f}s — selling the"
+            f" remainder in tranches at market"
+        )
+        await self.executor.start_spot_rebalance(
+            self.positions.get(pos.id), floor
+        )
 
     async def _check_stops_resize(self, pos: pm.Position) -> None:
         """Re-place a position's /stops if its size changed since they were set
@@ -900,6 +1055,8 @@ class Engine:
         makes the exit's spot sell fail 'insufficient balance') and the perp
         STOP doesn't fire mid-close. No-op in paper / when no pair."""
         self._stops_qty.pop(pos.id, None)   # no longer managing stops for it
+        self._stops_orders.pop(pos.id, None)
+        self._stop_grace.pop(pos.id, None)
         if self.paper:
             return 0
         pair = self.md.pair_maps.get(pos.symbol)
@@ -984,6 +1141,8 @@ class Engine:
         self._auto_passive.discard(pos.id)
         self._liq_alerted.pop(pos.id, None)
         self._stops_qty.pop(pos.id, None)
+        self._stops_orders.pop(pos.id, None)
+        self._stop_grace.pop(pos.id, None)
         cancelled = 0
         pair = self.md.pair_maps.get(pos.symbol)
         if pair is not None and not self.paper:
@@ -1119,6 +1278,7 @@ class Engine:
 
         cancelled = await self._cancel_stop_orders(pair)
         lines: list[str] = []
+        aster_id = mexc_id = None
         try:
             r = await self.aster.place_order(
                 pair.aster_symbol, "BUY", "STOP_MARKET",
@@ -1126,6 +1286,7 @@ class Engine:
                 working_type="MARK_PRICE",
                 client_order_id=intents.make_client_order_id(pos.id, "stop"),
             )
+            aster_id = r.order_id
             lines.append(f"perp STOP buy {perp_qty} trigger {recon._p(perp_stop)} (id {r.order_id})")
         except ExchangeError as exc:
             lines.append(f"perp stop FAILED: {exc}")
@@ -1135,6 +1296,7 @@ class Engine:
                 quantity=spot_qty, price=spot_price,
                 client_order_id=intents.make_client_order_id(pos.id, "stop"),
             )
+            mexc_id = r.order_id
             lines.append(f"spot SELL limit {spot_qty} @ {recon._p(spot_price)} (id {r.order_id})")
         except ExchangeError as exc:
             lines.append(f"spot limit FAILED: {exc}")
@@ -1143,6 +1305,10 @@ class Engine:
         # the position is later resized (a size-up otherwise leaves the added
         # portion unprotected until the operator remembers to re-run /stops).
         self._stops_qty[pos.id] = perp_qty
+        # ...and the venue order ids, so the hedge guard can tell OUR OWN stop
+        # firing apart from an ADL and read the real fill prices. In-memory:
+        # after a restart the guard degrades to the mark-price ADL path.
+        self._stops_orders[pos.id] = {"aster_id": aster_id, "mexc_id": mexc_id}
         journal(self.conn, f"position {pos.id}: /stops liq={liq} stop={perp_stop}"
                 f" qty={perp_qty} (cancelled {cancelled} prior)")
         head = (f"stops for #{pos.id} {pos.symbol}: {float(config.STOP_LIQ_BUFFER_PCT):.0f}%"
@@ -1437,6 +1603,11 @@ class Engine:
                     # in _close_basis_bps) must not disable checks for every other
                     # position, so isolate each one.
                     try:
+                        if pos.id in self._stop_grace:
+                            # Stop fired; the spot stop-limit is working at the
+                            # chosen price — this owns the position until done.
+                            await self._check_stop_grace(pos)
+                            continue
                         # Liquidation risk exists in any state while the perp short
                         # is open, so check it independently of the basis logic.
                         await self._check_liquidation(pos)
