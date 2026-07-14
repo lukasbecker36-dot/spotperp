@@ -120,21 +120,44 @@ class Model:
         return s.entry_bps + self.mexc_frac * s.spread()
 
 
-def load_logs(paths: list[str]) -> dict[str, list[Sample]]:
+def load_logs(paths: list[str], symbol_filter: set[str] | None = None) -> dict[str, list[Sample]]:
     by_symbol: dict[str, list[Sample]] = {}
-    for p in paths:
+    total_rows = 0
+    for pi, p in enumerate(sorted(paths), 1):
+        rows_here = 0
+        # Fixed column order (positional) avoids DictReader's per-row dict build,
+        # which is the bottleneck on multi-million-row logs. Header decides layout.
         with open(p, newline="") as f:
-            for row in csv.DictReader(f):
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                continue
+            idx = {name: k for k, name in enumerate(header)}
+            try:
+                ts_i, sym_i, e_i, c_i, fnd_i, dep_i = (
+                    idx["ts_ms"], idx["symbol"], idx["entry_bps"],
+                    idx["close_bps"], idx["funding_8h_bps"], idx["max_notional_usd"],
+                )
+            except KeyError:
+                continue
+            for row in reader:
                 try:
-                    by_symbol.setdefault(row["symbol"], []).append(Sample(
-                        ts_ms=int(row["ts_ms"]),
-                        entry_bps=float(row["entry_bps"]),
-                        close_bps=float(row["close_bps"]),
-                        funding_8h_bps=float(row["funding_8h_bps"]),
-                        depth_usd=float(row["max_notional_usd"]),
+                    sym = row[sym_i]
+                    if symbol_filter is not None and sym not in symbol_filter:
+                        continue
+                    by_symbol.setdefault(sym, []).append(Sample(
+                        ts_ms=int(row[ts_i]),
+                        entry_bps=float(row[e_i]),
+                        close_bps=float(row[c_i]),
+                        funding_8h_bps=float(row[fnd_i]),
+                        depth_usd=float(row[dep_i]),
                     ))
-                except (KeyError, ValueError):
+                    rows_here += 1
+                except (IndexError, ValueError):
                     continue  # malformed line (partial write) — skip
+        total_rows += rows_here
+        print(f"  [{pi}/{len(paths)}] {Path(p).name}: {rows_here:,} rows"
+              f" ({total_rows:,} total)", file=sys.stderr, flush=True)
     for series in by_symbol.values():
         series.sort(key=lambda s: s.ts_ms)
     return by_symbol
@@ -260,13 +283,15 @@ def main() -> None:
                     help="also print a per-symbol table at this threshold")
     args = ap.parse_args()
 
-    data = load_logs(args.logs)
+    want = None
     if args.symbols:
         want = {
             s.strip().upper() + ("" if s.strip().upper().endswith("USDT") else "USDT")
             for s in args.symbols.split(",")
         }
-        data = {k: v for k, v in data.items() if k in want}
+    print(f"loading {len(args.logs)} log file(s)"
+          f"{f' for {sorted(want)}' if want else ''}...", file=sys.stderr, flush=True)
+    data = load_logs(args.logs, symbol_filter=want)
     if not data:
         print("no data — check the log paths / symbol filter")
         return
