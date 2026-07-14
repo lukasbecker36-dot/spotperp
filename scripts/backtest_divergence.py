@@ -50,6 +50,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import array  # noqa: E402
 import config  # noqa: E402  (fees / output dir defaults)
 
 BPS = 10000.0
@@ -57,16 +58,29 @@ SAMPLE_GAP_RESET_MS = 3 * int(config.BASIS_LOG_SECONDS) * 1000
 FUNDING_STEP_CAP_HOURS = 1.0
 
 
-@dataclass
-class Sample:
-    ts_ms: int
-    entry_bps: float    # ask/ask  (maker perp entry + taker spot buy)
-    close_bps: float    # bid/bid  (maker perp exit + taker spot sell)
-    funding_8h_bps: float
-    depth_usd: float
+class Series:
+    """Per-symbol time series as packed columnar arrays. Millions of rows fit
+    in ~40 bytes each (5 x 8-byte columns) vs ~250 for a Python object — the
+    difference between fitting in the 4GB box and OOM-thrashing on 11M rows."""
 
-    def spread(self) -> float:
-        return max(0.0, self.entry_bps - self.close_bps)
+    __slots__ = ("ts", "entry", "close", "funding", "depth")
+
+    def __init__(self):
+        self.ts = array.array("q")       # int64 ms
+        self.entry = array.array("d")    # ask/ask  (maker perp + taker spot buy)
+        self.close = array.array("d")    # bid/bid  (maker perp + taker spot sell)
+        self.funding = array.array("d")  # funding_8h_bps
+        self.depth = array.array("d")    # top-of-book USD
+
+    def __len__(self):
+        return len(self.ts)
+
+    def append(self, ts, e, c, f, d):
+        self.ts.append(ts)
+        self.entry.append(e)
+        self.close.append(c)
+        self.funding.append(f)
+        self.depth.append(d)
 
 
 @dataclass
@@ -109,19 +123,22 @@ class Model:
         self.fees_bps = fees_bps
         self.mexc_frac = mexc_frac  # None = maker-taker (uses logged directly)
 
-    def entry_edge(self, s: Sample) -> float:
+    def entry_edge(self, entry: float, close: float) -> float:
         if self.mexc_frac is None:
-            return s.entry_bps
-        return s.close_bps - self.mexc_frac * s.spread()
+            return entry
+        return close - self.mexc_frac * max(0.0, entry - close)
 
-    def exit_measure(self, s: Sample) -> float:
+    def exit_measure(self, entry: float, close: float) -> float:
         if self.mexc_frac is None:
-            return s.close_bps
-        return s.entry_bps + self.mexc_frac * s.spread()
+            return close
+        return entry + self.mexc_frac * max(0.0, entry - close)
 
 
-def load_logs(paths: list[str], symbol_filter: set[str] | None = None) -> dict[str, list[Sample]]:
-    by_symbol: dict[str, list[Sample]] = {}
+def load_logs(
+    paths: list[str], symbol_filter: set[str] | None = None, every: int = 1,
+) -> dict[str, Series]:
+    by_symbol: dict[str, Series] = {}
+    seen: dict[str, int] = {}   # per-symbol row counter for downsampling
     total_rows = 0
     for pi, p in enumerate(sorted(paths), 1):
         rows_here = 0
@@ -145,38 +162,46 @@ def load_logs(paths: list[str], symbol_filter: set[str] | None = None) -> dict[s
                     sym = row[sym_i]
                     if symbol_filter is not None and sym not in symbol_filter:
                         continue
-                    by_symbol.setdefault(sym, []).append(Sample(
-                        ts_ms=int(row[ts_i]),
-                        entry_bps=float(row[e_i]),
-                        close_bps=float(row[c_i]),
-                        funding_8h_bps=float(row[fnd_i]),
-                        depth_usd=float(row[dep_i]),
-                    ))
+                    if every > 1:
+                        k = seen.get(sym, 0)
+                        seen[sym] = k + 1
+                        if k % every != 0:
+                            continue
+                    s = by_symbol.get(sym)
+                    if s is None:
+                        s = by_symbol[sym] = Series()
+                    s.append(int(row[ts_i]), float(row[e_i]), float(row[c_i]),
+                             float(row[fnd_i]), float(row[dep_i]))
                     rows_here += 1
                 except (IndexError, ValueError):
                     continue  # malformed line (partial write) — skip
         total_rows += rows_here
         print(f"  [{pi}/{len(paths)}] {Path(p).name}: {rows_here:,} rows"
               f" ({total_rows:,} total)", file=sys.stderr, flush=True)
-    for series in by_symbol.values():
-        series.sort(key=lambda s: s.ts_ms)
+    # No sort: the engine writes ticks chronologically and each symbol appears
+    # once per tick, so appending across name-sorted (=chronological) daily
+    # files yields per-symbol series already in ts order. The gap logic below
+    # tolerates the occasional out-of-order row without corrupting results.
     return by_symbol
 
 
 def simulate(
-    symbol: str, series: list[Sample], model: Model, *,
+    symbol: str, series: Series, model: Model, *,
     threshold: float, exit_bps: float, confirm: int,
     min_depth: float, max_hold_hours: float,
+    gap_reset_ms: int = SAMPLE_GAP_RESET_MS,
 ) -> list[Trade]:
     trades: list[Trade] = []
-    n = len(series)
+    ts, ent, cls, fnd, dep = (
+        series.ts, series.entry, series.close, series.funding, series.depth,
+    )
+    n = len(ts)
     streak = 0
     i = 0
     while i < n - 1:
-        s = series[i]
-        if i > 0 and s.ts_ms - series[i - 1].ts_ms > SAMPLE_GAP_RESET_MS:
+        if i > 0 and ts[i] - ts[i - 1] > gap_reset_ms:
             streak = 0
-        if model.entry_edge(s) >= threshold and s.depth_usd >= min_depth:
+        if model.entry_edge(ent[i], cls[i]) >= threshold and dep[i] >= min_depth:
             streak += 1
         else:
             streak = 0
@@ -185,42 +210,37 @@ def simulate(
             continue
         # Confirmed: execute on the NEXT sample at its prices (no look-ahead).
         entry_i = i + 1
-        e = series[entry_i]
         streak = 0
-        entry_edge = model.entry_edge(e)
+        entry_edge = model.entry_edge(ent[entry_i], cls[entry_i])
         if entry_edge < threshold:
             i = entry_i        # signal decayed before we could trade — miss
             continue
         funding = 0.0
         exit_i = None
         outcome = "unresolved"
-        deadline = e.ts_ms + max_hold_hours * 3_600_000
+        deadline = ts[entry_i] + max_hold_hours * 3_600_000
         j = entry_i
         while j + 1 < n:
             j += 1
-            step_h = min(
-                (series[j].ts_ms - series[j - 1].ts_ms) / 3_600_000,
-                FUNDING_STEP_CAP_HOURS,
-            )
-            funding += series[j].funding_8h_bps / 8.0 * step_h
-            if series[j].ts_ms > deadline:
+            step_h = min((ts[j] - ts[j - 1]) / 3_600_000, FUNDING_STEP_CAP_HOURS)
+            funding += fnd[j] / 8.0 * step_h
+            if ts[j] > deadline:
                 exit_i, outcome = j, "timeout"
                 break
-            if model.exit_measure(series[j]) <= exit_bps:
+            if model.exit_measure(ent[j], cls[j]) <= exit_bps:
                 # Exit executes on the next sample after the signal print.
                 if j + 1 < n:
                     exit_i, outcome = j + 1, "converged"
                 break
-        exit_s = series[exit_i] if exit_i is not None else None
         trades.append(Trade(
             symbol=symbol,
-            entry_ts=e.ts_ms,
-            exit_ts=exit_s.ts_ms if exit_s else None,
+            entry_ts=ts[entry_i],
+            exit_ts=ts[exit_i] if exit_i is not None else None,
             entry_edge=entry_edge,
-            exit_edge=model.exit_measure(exit_s) if exit_s else None,
+            exit_edge=model.exit_measure(ent[exit_i], cls[exit_i]) if exit_i is not None else None,
             funding_bps=funding,
             fees_bps=model.fees_bps,
-            depth_usd=e.depth_usd,
+            depth_usd=dep[entry_i],
             outcome=outcome,
         ))
         i = (exit_i if exit_i is not None else n) + 1
@@ -281,7 +301,12 @@ def main() -> None:
                     help="comma-separated filter, e.g. PLAY,BTW")
     ap.add_argument("--per-symbol-threshold", type=float, default=None,
                     help="also print a per-symbol table at this threshold")
+    ap.add_argument("--every", type=int, default=1,
+                    help="keep only 1-in-N samples per symbol (downsample) to cut"
+                         " memory/time on huge logs; e.g. 5 = ~5min resolution")
     args = ap.parse_args()
+    every = max(1, args.every)
+    gap_reset_ms = 3 * every * int(config.BASIS_LOG_SECONDS) * 1000
 
     want = None
     if args.symbols:
@@ -291,14 +316,14 @@ def main() -> None:
         }
     print(f"loading {len(args.logs)} log file(s)"
           f"{f' for {sorted(want)}' if want else ''}...", file=sys.stderr, flush=True)
-    data = load_logs(args.logs, symbol_filter=want)
+    data = load_logs(args.logs, symbol_filter=want, every=every)
     if not data:
         print("no data — check the log paths / symbol filter")
         return
     n_samples = sum(len(v) for v in data.values())
     span_h = (
-        max(s.ts_ms for v in data.values() for s in v)
-        - min(s.ts_ms for v in data.values() for s in v)
+        max(v.ts[-1] for v in data.values() if len(v))
+        - min(v.ts[0] for v in data.values() if len(v))
     ) / 3_600_000
 
     mexc_taker = float(config.MEXC_TAKER_FEE * 10000)
@@ -333,7 +358,7 @@ def main() -> None:
                 t = simulate(
                     sym, series, model, threshold=thr, exit_bps=args.exit_bps,
                     confirm=args.confirm, min_depth=args.min_depth,
-                    max_hold_hours=args.max_hold_hours,
+                    max_hold_hours=args.max_hold_hours, gap_reset_ms=gap_reset_ms,
                 )
                 all_trades.extend(t)
                 if args.per_symbol_threshold == thr:
