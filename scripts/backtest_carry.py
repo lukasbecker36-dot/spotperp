@@ -85,7 +85,7 @@ def simulate_carry(
     symbol: str, series: Series, *,
     threshold: float, exit_funding: float, exit_basis: float,
     confirm: int, min_depth: float, max_hold_hours: float, fees_bps: float,
-    gap_reset_ms: int,
+    gap_reset_ms: int, maker_fill_frac: float = 0.0,
 ) -> list[Carry]:
     trades: list[Carry] = []
     ts, ent, cls, fnd, dep = (
@@ -109,7 +109,11 @@ def simulate_carry(
         if fnd[entry_i] < threshold:
             i = entry_i               # funding decayed before we entered
             continue
-        basis_in = ent[entry_i]
+        # maker perp entry: frac=0 fills at the ask (earns full spread,
+        # optimistic); frac=1 fills at the bid (gives up the whole perp
+        # spread to adverse selection, pessimistic). The spread proxy is
+        # (entry_bps - close_bps) at entry: ask/ask minus bid/bid basis.
+        basis_in = ent[entry_i] - maker_fill_frac * (ent[entry_i] - cls[entry_i])
         funding = 0.0
         deadline = ts[entry_i] + max_hold_hours * 3_600_000
         exit_i = None
@@ -183,6 +187,12 @@ def main() -> None:
     ap.add_argument("--max-hold-hours", type=float, default=168.0)
     ap.add_argument("--slippage-bps", type=float, default=4.0,
                     help="extra round-trip cost beyond the touch (default 4)")
+    ap.add_argument("--maker-fill-frac", type=float, default=0.0,
+                    help="share of the perp bid-ask the maker leg GIVES UP at"
+                         " entry (0=earns full spread/optimistic, 1=fills at"
+                         " the bid/pessimistic). Sensitivity knob: the default"
+                         " basis P&L assumes the maker earns its spread; raise"
+                         " this to see if funding alone still carries the edge.")
     ap.add_argument("--symbols", default=None, help="comma-separated filter")
     ap.add_argument("--per-symbol-threshold", type=float, default=None)
     ap.add_argument("--every", type=int, default=1,
@@ -220,8 +230,12 @@ def main() -> None:
                  f" confirm {args.confirm} | depth>= ${args.min_depth:,.0f} |"
                  f" exit fund<= {args.exit_funding} basis<= {args.exit_basis} |"
                  f" max hold {args.max_hold_hours:.0f}h")
+    mf = args.maker_fill_frac
+    mf_note = ("maker EARNS full spread = OPTIMISTIC" if mf <= 0
+               else "maker FILLS AT BID = PESSIMISTIC" if mf >= 1
+               else f"maker gives up {mf:.0%} of the perp spread")
     lines.append("NET = funding collected + basis drift (entry - exit basis) - fees."
-                 " basis P&L assumes maker perp EARNS its spread = OPTIMISTIC.")
+                 f" maker-fill-frac {mf:.2f} ({mf_note}).")
     lines.append("annBps = net annualised per unit notional (net x 8760 / hold_h).")
     hdr = (f"{'fund_thr':>8}{'trades':>7}{'win%':>6}{'medNet':>8}{'meanNet':>8}"
            f"{'p25':>7}{'medFund':>8}{'medBasis':>9}{'medHold_h':>10}"
@@ -238,6 +252,7 @@ def main() -> None:
                 exit_basis=args.exit_basis, confirm=args.confirm,
                 min_depth=args.min_depth, max_hold_hours=args.max_hold_hours,
                 fees_bps=fees, gap_reset_ms=gap_reset_ms,
+                maker_fill_frac=args.maker_fill_frac,
             )
             allt.extend(t)
             if args.per_symbol_threshold == thr and t:

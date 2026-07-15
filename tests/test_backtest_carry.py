@@ -80,6 +80,36 @@ def test_carry_depth_filter_blocks_thin_names(tmp_path):
     assert trades == []
 
 
+def test_carry_maker_fill_frac_haircuts_basis_in(tmp_path):
+    """maker_fill_frac shifts the entry basis from the ask toward the bid:
+    frac=0 enters at entry_bps (20), frac=1 at close_bps (12), frac=0.5 halfway.
+    Higher frac => lower basis_in => lower basis P&L (funding must carry more)."""
+    ts = 1_000_000_000_000
+    rows = [[ts + i * 3_600_000, "MFUSDT", "20.0", "12.0", "30.0", "5000"]
+            for i in range(8)]
+    rows += [[ts + i * 3_600_000, "MFUSDT", "20.0", "12.0", "0.0", "5000"]
+             for i in range(8, 11)]
+    p = tmp_path / "mf.csv"
+    _write(p, rows)
+    series = bd.load_logs([str(p)])["MFUSDT"]
+
+    def run(frac):
+        return bc.simulate_carry(
+            "MFUSDT", series, threshold=10, exit_funding=0.0,
+            exit_basis=float("-inf"), confirm=3, min_depth=200,
+            max_hold_hours=168, fees_bps=14.0, gap_reset_ms=10_800_000,
+            maker_fill_frac=frac,
+        )[0]
+
+    opt, half, pess = run(0.0), run(0.5), run(1.0)
+    assert opt.basis_in == 20.0          # fills at the ask
+    assert half.basis_in == 16.0         # 20 - 0.5*(20-12)
+    assert pess.basis_in == 12.0         # fills at the bid, gives up whole spread
+    # exit basis identical -> basis P&L strictly shrinks as frac rises
+    assert opt.basis_pnl > half.basis_pnl > pess.basis_pnl
+    assert opt.net_bps > pess.net_bps
+
+
 def test_carry_net_formula():
     t = bc.Carry(
         symbol="X", entry_ts=0, exit_ts=3_600_000 * 24,
