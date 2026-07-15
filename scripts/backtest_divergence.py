@@ -44,9 +44,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def open_log(path: str):
+    """Open a basis log for text reading, transparently handling gzip.
+
+    Old daily logs are gzipped to save disk (~5-10x); .gz and plain .csv can
+    be mixed freely in one run."""
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", newline="")
+    return open(path, newline="")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -144,7 +155,7 @@ def load_logs(
         rows_here = 0
         # Fixed column order (positional) avoids DictReader's per-row dict build,
         # which is the bottleneck on multi-million-row logs. Header decides layout.
-        with open(p, newline="") as f:
+        with open_log(p) as f:
             reader = csv.reader(f)
             header = next(reader, None)
             if not header:

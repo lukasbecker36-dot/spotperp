@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import gzip
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -58,7 +59,9 @@ class Trade:
 def load_logs(paths: list[str]) -> dict[str, list[Sample]]:
     series: dict[str, list[Sample]] = defaultdict(list)
     for path in paths:
-        with open(path, newline="") as f:
+        opener = (lambda p: gzip.open(p, "rt", newline="")) if str(path).endswith(
+            ".gz") else (lambda p: open(p, newline=""))
+        with opener(path) as f:
             for row in csv.DictReader(f):
                 try:
                     series[row["symbol"]].append(Sample(
