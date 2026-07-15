@@ -21,6 +21,8 @@ spotperp.egg-info/dependency_links.txt
 spotperp.egg-info/requires.txt
 spotperp.egg-info/top_level.txt
 tests/test_auth.py
+tests/test_backtest_carry.py
+tests/test_backtest_divergence.py
 tests/test_book.py
 tests/test_commands.py
 tests/test_control.py
