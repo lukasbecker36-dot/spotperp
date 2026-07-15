@@ -26,6 +26,23 @@ systemctl daemon-reload
 systemctl enable --now basis-trade.service basis-trade-control.service
 ```
 
+### Log rotation (gzip old basis logs)
+
+The engine writes `output/basis_log_YYYYMMDD.csv` every `BASIS_LOG_SECONDS`
+and never rotates them (~15-18 MB/day, unbounded). A daily timer gzips every
+day except today's live file (~5-10x smaller); the backtest readers handle
+`.csv` and `.csv.gz` transparently.
+
+```bash
+cp deploy/basis-trade-logrotate.service /etc/systemd/system/
+cp deploy/basis-trade-logrotate.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now basis-trade-logrotate.timer
+
+systemctl start basis-trade-logrotate.service   # gzip existing old days now
+systemctl list-timers basis-trade-logrotate     # confirm it's scheduled
+```
+
 If the bot runs as a non-root user, allow it to control the engine service
 without a password (needed for `/start`, `/stop`, `/restart`, `/paper`, `/live`):
 

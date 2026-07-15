@@ -1,0 +1,7 @@
+[Unit]
+Description=Gzip old basis logs (keep today's uncompressed for the live writer)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/basis-trade
+ExecStart=/opt/basis-trade/scripts/gzip_old_logs.sh /opt/basis-trade/output

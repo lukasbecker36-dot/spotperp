@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily gzip of old basis logs
+
+[Timer]
+# Just after 00:10 UTC, once the engine has rolled to a new day's file.
+OnCalendar=*-*-* 00:10:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
