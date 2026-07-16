@@ -369,55 +369,66 @@ class ControlBot:
             marks_fresh = (time.time() * 1000 - hb["ts_ms"]) < 120_000
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             marks, marks_fresh = {}, False
-        lines = ["active positions:"]
+        blocks = []
         total_notional = 0.0
         total_upnl = 0.0
         for p in active:
-            entry = (
-                f"{float(p.entry_basis_bps):.1f}" if p.entry_basis_bps else "-"
-            )
+            open_basis = self._basis_bps(p.perp_entry_avg, p.spot_entry_avg)
+            if open_basis is None and p.entry_basis_bps is not None:
+                open_basis = float(p.entry_basis_bps)
+            ob = f"{open_basis:+.1f}" if open_basis is not None else "-"
             held = (
-                f"{(time.time() * 1000 - p.opened_ms) / 3600000:.1f}h"
-                if p.opened_ms
-                else "-"
+                f"{(time.time() * 1000 - p.opened_ms) / 3_600_000:.1f}h"
+                if p.opened_ms else "-"
             )
             kind_tag = " ⚓carry" if p.trade_kind == "carry" else ""
-            lines.append(
-                f"#{p.id} {p.symbol} [{p.state}]{kind_tag}"
-                f" perp={p.perp_qty} spot={p.spot_qty}"
-                f" held={held}"
-                f"{' exit=' + p.exit_mode if p.exit_mode else ''}"
-                f"{' (paper)' if p.paper else ''}"
-            )
-            if not marks_fresh:
-                lines.append(f"   basis {entry} -> ? (engine heartbeat stale)")
-                continue
-            m = marks.get(str(p.id))
+            head = (f"#{p.id} {p.symbol} [{p.state}]{kind_tag}  held {held}"
+                    f"{' · exit ' + p.exit_mode if p.exit_mode else ''}"
+                    f"{' (paper)' if p.paper else ''}")
+            venue = [
+                f"  Aster perp  sell {self._fmt_px(p.perp_entry_avg)}"
+                f"  buy —(open)",
+                f"  MEXC spot   buy  {self._fmt_px(p.spot_entry_avg)}"
+                f"  sell —(open)",
+            ]
+            m = marks.get(str(p.id)) if marks_fresh else None
             if m and "upnl_usd" in m:
+                now_basis = m["close_bps"]
+                drift = (f"{open_basis - now_basis:+.1f}"
+                         if open_basis is not None else "-")
                 liq = ""
                 if m.get("liq_dist_pct") is not None:
                     d = m["liq_dist_pct"]
                     warn = " ⚠️" if d < float(config.LIQ_ALERT_PCT) else ""
                     liq = f" | liq +{d:.0f}%{warn}"
                 notional = m.get("notional_usd")
-                size = f" | ~${notional:,.0f}" if notional else ""
+                size = f"~${notional:,.0f}" if notional else "~$?"
                 total_notional += notional or 0.0
                 total_upnl += m["upnl_usd"]
-                lines.append(
-                    f"   basis {entry} -> {m['close_bps']:.1f}bps{size}"
-                    f" | uPnL ${m['upnl_usd']:+.2f}"
-                    f" (funding ${m['funding_usd']:+.2f},"
-                    f" fees ${float(p.fees_usd):.2f}){liq}"
-                )
-            elif m and "skip" in m:
-                lines.append(f"   basis {entry} -> ? ({m['skip']})")
+                tail = [
+                    f"  basis  entry {ob}  now {now_basis:+.1f}"
+                    f"  captured {drift} bps",
+                    f"  size {size}  funding ${m['funding_usd']:+.2f}"
+                    f"  commission ${float(p.fees_usd):.2f}"
+                    f"  →  uPnL ${m['upnl_usd']:+.2f}{liq}",
+                ]
             else:
-                lines.append(f"   basis {entry} -> ? (no live mark)")
+                if not marks_fresh:
+                    why = "engine heartbeat stale"
+                elif m and "skip" in m:
+                    why = m["skip"]
+                else:
+                    why = "no live mark"
+                tail = [
+                    f"  basis  entry {ob}  now ? ({why})",
+                    f"  commission ${float(p.fees_usd):.2f}",
+                ]
+            blocks.append("\n".join([head, *venue, *tail]))
+        out = "active positions:\n\n" + "\n\n".join(blocks)
         if total_notional:
-            lines.append(
-                f"total: ~${total_notional:,.0f} notional | uPnL ${total_upnl:+.2f}"
-            )
-        return "\n".join(lines)
+            out += (f"\n\ntotal: ~${total_notional:,.0f} notional"
+                    f" | uPnL ${total_upnl:+.2f}")
+        return out
 
     @staticmethod
     def _fmt_px(px: Decimal | None) -> str:
