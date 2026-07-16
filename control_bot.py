@@ -50,7 +50,7 @@ HELP = """Commands:
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
 /stops SYMBOL — place liq-protection stop (perp) + sell limit (spot) ~1% below liq price (auto-refreshes on size-up)
 /remove ID|SYMBOL YES — stop tracking a position closed manually on the exchange (DB only)
-/trades [n] — last closed trades
+/trades [n] — last closed trades (avg venue prices, open/close basis, funding, commission, P&L; default 5)
 /pnl — realised P&L summary
 /log [n] — last journal lines
 /mode — show paper/live
@@ -419,20 +419,64 @@ class ControlBot:
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def _fmt_px(px: Decimal | None) -> str:
+        """Price with enough significant figures for both $60k coins and
+        sub-cent microcaps."""
+        if px is None:
+            return "-"
+        f = float(px)
+        if f == 0:
+            return "0"
+        if f >= 100:
+            return f"{f:,.2f}"
+        if f >= 1:
+            return f"{f:.4f}"
+        return f"{f:.6g}"
+
+    @staticmethod
+    def _basis_bps(perp: Decimal | None, spot: Decimal | None) -> float | None:
+        """Executed basis = (perp - spot) / spot in bps."""
+        if perp is None or spot is None or spot == 0:
+            return None
+        return float((perp - spot) / spot) * 10000
+
     def _cmd_trades(self, args: list[str]) -> str:
-        n = int(args[0]) if args else 10
+        n = int(args[0]) if args else 5
         closed = self._positions.closed(n)
         if not closed:
             return "no closed trades"
-        lines = ["last trades:"]
+        blocks = []
         for p in closed:
-            pnl = f"${float(p.realized_pnl_usd):.2f}" if p.realized_pnl_usd is not None else "-"
-            lines.append(
-                f"#{p.id} {p.symbol} {p.state} pnl={pnl}"
-                f" fees=${float(p.fees_usd):.2f} funding=${float(p.funding_usd):.2f}"
-                f"{' (paper)' if p.paper else ''}"
-            )
-        return "\n".join(lines)
+            # Premium trade: SHORT perp on Aster (sell to open / buy to close),
+            # LONG spot on MEXC (buy to open / sell to close).
+            open_basis = self._basis_bps(p.perp_entry_avg, p.spot_entry_avg)
+            if open_basis is None and p.entry_basis_bps is not None:
+                open_basis = float(p.entry_basis_bps)
+            close_basis = self._basis_bps(p.perp_exit_avg, p.spot_exit_avg)
+            pnl = (f"${float(p.realized_pnl_usd):+.2f}"
+                   if p.realized_pnl_usd is not None else "-")
+            when = (time.strftime("%m-%d %H:%M", time.localtime(p.closed_ms / 1000))
+                    if p.closed_ms else "-")
+            held = (f"{(p.closed_ms - p.opened_ms) / 3_600_000:.1f}h"
+                    if p.closed_ms and p.opened_ms else "-")
+            ob = f"{open_basis:+.1f}" if open_basis is not None else "-"
+            cb = f"{close_basis:+.1f}" if close_basis is not None else "-"
+            drift = (f"{open_basis - close_basis:+.1f}"
+                     if open_basis is not None and close_basis is not None else "-")
+            blocks.append("\n".join([
+                f"#{p.id} {p.symbol} {p.state}"
+                f"{' (paper)' if p.paper else ''}  {when} · held {held}",
+                f"  Aster perp  sell {self._fmt_px(p.perp_entry_avg)}"
+                f"  buy {self._fmt_px(p.perp_exit_avg)}",
+                f"  MEXC spot   buy  {self._fmt_px(p.spot_entry_avg)}"
+                f"  sell {self._fmt_px(p.spot_exit_avg)}",
+                f"  basis  open {ob}  close {cb}  captured {drift} bps",
+                f"  funding ${float(p.funding_usd):+.2f}"
+                f"  commission ${float(p.fees_usd):.2f}"
+                f"  →  P&L {pnl}",
+            ]))
+        return "last trades:\n\n" + "\n\n".join(blocks)
 
     def _cmd_pnl(self) -> str:
         s = self._positions.pnl_summary()
