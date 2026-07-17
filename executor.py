@@ -603,6 +603,17 @@ class Executor:
         mult = self._pair(symbol).qty_multiplier
         return (aster.bid / mult - mexc.bid) / mexc.bid * BPS
 
+    @staticmethod
+    def _executed_basis_bps(
+        perp_avg: Decimal | None, spot_avg: Decimal | None
+    ) -> Decimal | None:
+        """Realised basis from the exit-fill VWAPs (perp buy-back vs spot sell):
+        (perp - spot) / spot in bps. Cumulative over the position's exit fills,
+        so on a first partial it is exactly this run's basis."""
+        if perp_avg is None or spot_avg is None or spot_avg == 0:
+            return None
+        return (perp_avg - spot_avg) / spot_avg * BPS
+
     def _fee_usd(self, venue: str, maker: bool, qty: Decimal, price: Decimal) -> Decimal:
         if venue == "aster":
             rate = config.ASTER_MAKER_FEE if maker else config.ASTER_TAKER_FEE
@@ -1360,13 +1371,15 @@ class Executor:
         if floor_perp > 0 and (pos.perp_qty > 0 or pos.spot_qty > 0):
             self._positions.set_exit_request(position_id, None, None, None)
             self._positions.set_state(position_id, pm.OPEN, "partial exit complete")
+            xb = self._executed_basis_bps(pos.perp_exit_avg, pos.spot_exit_avg)
+            xb_txt = f" @ {float(xb):+.1f}bps" if xb is not None else ""
             journal(
                 self._conn,
-                f"position {position_id}: PARTIAL EXIT done, perp={pos.perp_qty}"
+                f"position {position_id}: PARTIAL EXIT done{xb_txt}, perp={pos.perp_qty}"
                 f" spot={pos.spot_qty} remain",
             )
             await self._notifier.alert(
-                f"✂️ position {position_id} {pos.symbol}: partial exit done —"
+                f"✂️ position {position_id} {pos.symbol}: partial exit done{xb_txt} —"
                 f" {pos.perp_qty} perp / {pos.spot_qty} spot remain (OPEN)"
             )
         else:
@@ -1404,9 +1417,11 @@ class Executor:
         await self._accrue_funding(pos)
         pnl = self._positions.finalize_pnl(position_id)
         self._positions.set_state(position_id, pm.CLOSED)
-        journal(self._conn, f"position {position_id}: CLOSED pnl={pnl}")
+        xb = self._executed_basis_bps(pos.perp_exit_avg, pos.spot_exit_avg)
+        xb_txt = f" @ {float(xb):+.1f}bps" if xb is not None else ""
+        journal(self._conn, f"position {position_id}: CLOSED{xb_txt} pnl={pnl}")
         await self._notifier.alert(
-            f"🏁 position {position_id} {pos.symbol} CLOSED, realised PnL"
+            f"🏁 position {position_id} {pos.symbol} CLOSED{xb_txt}, realised PnL"
             f" ${float(pnl):.2f} ({'paper' if self._paper else 'LIVE'})"
         )
 
