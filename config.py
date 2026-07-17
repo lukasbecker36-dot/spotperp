@@ -87,7 +87,7 @@ CONVERGENCE_MIN_HOLD_MINUTES = float(
 # Alert (and flag in /positions & /recon) when a perp short's mark is within
 # this % of its liquidation price. Re-alerts at most every throttle window
 # while still in danger; re-arms once it recovers back above the threshold.
-LIQ_ALERT_PCT = Decimal(os.environ.get("LIQ_ALERT_PCT", "15"))
+LIQ_ALERT_PCT = Decimal(os.environ.get("LIQ_ALERT_PCT", "30"))
 LIQ_ALERT_THROTTLE_SECONDS = float(os.environ.get("LIQ_ALERT_THROTTLE_SECONDS", "1800"))
 # /stops places protective orders this % below the perp liquidation price: a
 # reduce-only buy STOP_MARKET on Aster (triggers on the mark, closing the short
