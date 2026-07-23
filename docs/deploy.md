@@ -48,7 +48,8 @@ systemctl list-timers basis-trade-logrotate     # confirm it's scheduled
 A Claude review of open positions (basis / funding / liq proximity) and the top
 funding opportunities, delivered to Telegram. It only ever sends messages — it
 cannot place, size or close orders. Trigger on demand with `/review`, or on a
-4-hour schedule via the timer below. Requires `ANTHROPIC_API_KEY` in `.env` and
+schedule via the timer below (07:30 UK then every 4h to 23:30 — 07:30, 11:30,
+15:30, 19:30, 23:30 — nothing overnight). Requires `ANTHROPIC_API_KEY` in `.env` and
 outbound HTTPS to `api.anthropic.com`; without the key it simply replies that it
 is not configured.
 
@@ -60,7 +61,12 @@ systemctl enable --now basis-trade-advisor.timer
 
 systemctl start basis-trade-advisor.service     # send one review now (test)
 journalctl -u basis-trade-advisor -n 20         # check it ran
+systemctl list-timers basis-trade-advisor       # confirm next run (UK schedule)
 ```
+
+The schedule uses a timezone suffix (`Europe/London`) in `OnCalendar`, which
+needs systemd >= v252 (`systemctl --version`). On older systemd, drop the
+suffix from the timer and set the hours in the box's own local time.
 
 If the bot runs as a non-root user, allow it to control the engine service
 without a password (needed for `/start`, `/stop`, `/restart`, `/paper`, `/live`):

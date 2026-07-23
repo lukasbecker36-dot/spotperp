@@ -1,11 +1,13 @@
 [Unit]
-Description=Run the AI advisor review every 4 hours
+Description=Run the AI advisor review at 07:30 UK then every 4h until 23:30
 
 [Timer]
-# Every 4 hours on the clock (00:00, 04:00, ... UTC). Persistent catches up a
-# missed run after downtime; RandomizedDelay avoids hitting the API on the dot.
-OnCalendar=*-*-* 00/4:00:00 UTC
-RandomizedDelaySec=120
+# UK local time (Europe/London, DST-aware): first check 07:30, then every 4h
+# — 07:30, 11:30, 15:30, 19:30, 23:30 — and nothing overnight (the 03:30 slot
+# is omitted) until 07:30 again. Persistent catches up a run missed to downtime.
+# NOTE: the timezone suffix in OnCalendar needs systemd >= v252. On older
+# systemd, drop "Europe/London" and set hours in the box's local time instead.
+OnCalendar=*-*-* 07,11,15,19,23:30:00 Europe/London
 Persistent=true
 
 [Install]
