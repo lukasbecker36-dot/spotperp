@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from decimal import Decimal
 
@@ -129,22 +130,31 @@ def build_context(conn) -> dict:
     }
 
 
+def _api_key() -> str:
+    """Read the key from the live environment (populated by load_env at process
+    start), falling back to the import-time config value. config.ANTHROPIC_API_KEY
+    is captured when config is first imported — often BEFORE load_env() runs — so
+    reading it directly can wrongly report the key as unset even when .env has it."""
+    return os.environ.get("ANTHROPIC_API_KEY") or config.ANTHROPIC_API_KEY
+
+
 async def _call_claude(session: aiohttp.ClientSession, context: dict) -> str:
-    if not config.ANTHROPIC_API_KEY:
-        return ("advisor not configured: set ANTHROPIC_API_KEY in .env to enable"
-                " the AI review.")
+    api_key = _api_key()
+    if not api_key:
+        return ("advisor not configured: set ANTHROPIC_API_KEY in .env (and"
+                " restart the control bot) to enable the AI review.")
     user_msg = (
         "Here is the current book state as JSON. Review it and advise.\n\n"
         + json.dumps(context, indent=1)
     )
     payload = {
-        "model": config.ADVISOR_MODEL,
+        "model": os.environ.get("ADVISOR_MODEL") or config.ADVISOR_MODEL,
         "max_tokens": config.ADVISOR_MAX_TOKENS,
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_msg}],
     }
     headers = {
-        "x-api-key": config.ANTHROPIC_API_KEY,
+        "x-api-key": api_key,
         "anthropic-version": ANTHROPIC_VERSION,
         "content-type": "application/json",
     }
