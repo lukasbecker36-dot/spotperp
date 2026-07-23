@@ -75,6 +75,24 @@ def test_context_survives_missing_snapshots(wired):
     assert ctx["open_positions"][0]["current_basis_bps"] is None
 
 
+def test_run_window_gate(monkeypatch):
+    monkeypatch.setattr(config, "ADVISOR_TIMEZONE", "Europe/London")
+    monkeypatch.setattr(config, "ADVISOR_RUN_HOURS", [7, 11, 15, 19, 23])
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    hour = datetime.now(ZoneInfo("Europe/London")).hour
+    assert advisor._in_run_window() == (hour in [7, 11, 15, 19, 23])
+    # empty hours => never in window
+    monkeypatch.setattr(config, "ADVISOR_RUN_HOURS", [])
+    assert advisor._in_run_window() is False
+
+
+def test_run_window_fails_open_on_bad_tz(monkeypatch):
+    monkeypatch.setattr(config, "ADVISOR_TIMEZONE", "Not/AZone")
+    monkeypatch.setattr(config, "ADVISOR_RUN_HOURS", [7])
+    assert advisor._in_run_window() is True  # unknown tz -> run rather than go silent
+
+
 def test_stale_heartbeat_marked_not_fresh(wired):
     conn, tmp = wired
     pid = _open_position(conn)

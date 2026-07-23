@@ -210,6 +210,15 @@ ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-opus-4-8")
 ADVISOR_MAX_TOKENS = int(os.environ.get("ADVISOR_MAX_TOKENS", "1200"))
 # How many top funding-carry opportunities to show the advisor as alternatives.
 ADVISOR_TOP_OPPORTUNITIES = int(os.environ.get("ADVISOR_TOP_OPPORTUNITIES", "12"))
+# Scheduled runs only fire when the local hour (ADVISOR_TIMEZONE) is one of
+# these — 07:30 then every 4h to 23:30 UK, nothing overnight. The timer wakes
+# hourly and the advisor self-gates, so this works on any systemd version and
+# whatever the box's own clock is set to. /review ignores the gate entirely.
+ADVISOR_TIMEZONE = os.environ.get("ADVISOR_TIMEZONE", "Europe/London")
+ADVISOR_RUN_HOURS = [
+    int(h) for h in os.environ.get("ADVISOR_RUN_HOURS", "7,11,15,19,23").split(",")
+    if h.strip()
+]
 
 # ── Mode ──
 def paper_mode() -> bool:

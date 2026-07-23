@@ -8,4 +8,6 @@ Type=oneshot
 WorkingDirectory=/opt/basis-trade
 EnvironmentFile=-/opt/basis-trade/.env
 EnvironmentFile=-/opt/basis-trade/data/mode.env
+# No --force here: the hourly timer relies on advisor.py self-gating to the UK
+# run schedule. Run `advisor.py --force` by hand to send a review immediately.
 ExecStart=/opt/basis-trade/.venv/bin/python advisor.py

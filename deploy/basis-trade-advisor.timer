@@ -1,13 +1,14 @@
 [Unit]
-Description=Run the AI advisor review at 07:30 UK then every 4h until 23:30
+Description=Wake the AI advisor hourly; it self-gates to the UK run schedule
 
 [Timer]
-# UK local time (Europe/London, DST-aware): first check 07:30, then every 4h
-# — 07:30, 11:30, 15:30, 19:30, 23:30 — and nothing overnight (the 03:30 slot
-# is omitted) until 07:30 again. Persistent catches up a run missed to downtime.
-# NOTE: the timezone suffix in OnCalendar needs systemd >= v252. On older
-# systemd, drop "Europe/London" and set hours in the box's local time instead.
-OnCalendar=*-*-* 07,11,15,19,23:30:00 Europe/London
+# Wake every hour at :30. advisor.py itself decides whether to run, firing only
+# when the ADVISOR_TIMEZONE hour is a configured run hour (default UK 07:30,
+# 11:30, 15:30, 19:30, 23:30 — nothing overnight). Gating in Python keeps this
+# working on any systemd version and whatever the box's clock is set to, and it
+# follows DST via the tz database. Persistent catches up a run missed to
+# downtime.
+OnCalendar=*-*-* *:30:00
 Persistent=true
 
 [Install]

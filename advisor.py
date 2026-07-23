@@ -184,6 +184,22 @@ async def review_text(session: aiohttp.ClientSession, conn=None) -> str:
     return f"{header}\n\n{advice}"
 
 
+def _in_run_window() -> bool:
+    """True when the current time in ADVISOR_TIMEZONE falls on one of the
+    configured run hours. The timer wakes hourly; this is the actual schedule
+    gate, so it needs no systemd timezone support and follows DST via the tz
+    database. On a missing tz db it fails OPEN (runs) rather than going silent."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        hour = datetime.now(ZoneInfo(config.ADVISOR_TIMEZONE)).hour
+    except Exception:
+        log.warning("timezone %s unavailable — running ungated",
+                    config.ADVISOR_TIMEZONE)
+        return True
+    return hour in config.ADVISOR_RUN_HOURS
+
+
 async def _run() -> None:
     load_env()
     async with aiohttp.ClientSession() as session:
@@ -197,6 +213,13 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    import sys
+    forced = "--force" in sys.argv[1:] or "--now" in sys.argv[1:]
+    if not forced and not _in_run_window():
+        from datetime import datetime
+        log.info("outside run window (hours %s %s) — skipping",
+                 config.ADVISOR_RUN_HOURS, config.ADVISOR_TIMEZONE)
+        return
     import asyncio
     asyncio.run(_run())
 

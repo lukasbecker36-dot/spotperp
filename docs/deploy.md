@@ -59,14 +59,17 @@ cp deploy/basis-trade-advisor.timer   /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now basis-trade-advisor.timer
 
-systemctl start basis-trade-advisor.service     # send one review now (test)
-journalctl -u basis-trade-advisor -n 20         # check it ran
-systemctl list-timers basis-trade-advisor       # confirm next run (UK schedule)
+.venv/bin/python advisor.py --force              # send one review now (test)
+journalctl -u basis-trade-advisor -n 20         # check a scheduled run
+systemctl list-timers basis-trade-advisor       # timer wakes hourly at :30
 ```
 
-The schedule uses a timezone suffix (`Europe/London`) in `OnCalendar`, which
-needs systemd >= v252 (`systemctl --version`). On older systemd, drop the
-suffix from the timer and set the hours in the box's own local time.
+The timer wakes every hour at :30 and `advisor.py` self-gates to the UK run
+schedule (`ADVISOR_TIMEZONE` / `ADVISOR_RUN_HOURS`, default 07/11/15/19/23),
+so it works on any systemd version, follows DST via the tz database, and needs
+nothing special from the box's own clock. Most hourly wakes log "outside run
+window" and exit. Use `advisor.py --force` to bypass the gate for a manual test;
+`/review` in Telegram is always ungated.
 
 If the bot runs as a non-root user, allow it to control the engine service
 without a password (needed for `/start`, `/stop`, `/restart`, `/paper`, `/live`):
