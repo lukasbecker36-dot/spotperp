@@ -1,0 +1,11 @@
+[Unit]
+Description=Basis Trade AI advisor (Claude review of book -> Telegram, advisory only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/basis-trade
+EnvironmentFile=-/opt/basis-trade/.env
+EnvironmentFile=-/opt/basis-trade/data/mode.env
+ExecStart=/opt/basis-trade/.venv/bin/python advisor.py

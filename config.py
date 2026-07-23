@@ -199,6 +199,18 @@ ENTRY_MAX_CLIP_NOTIONAL_USD: Decimal | None = (
 # ── Funding ──
 FUNDING_INTERVAL_HOURS = 8
 
+# ── AI advisor (advisory only — never trades) ──
+# A periodic Claude review of open positions (basis / funding / liq proximity)
+# and top funding opportunities, delivered to Telegram. Reads the same snapshot
+# files the bot's /funding, /positions and /screen commands use; it only ever
+# SENDS MESSAGES — it cannot place, size or close orders. Trigger on demand with
+# /review, or on a schedule via deploy/basis-trade-advisor.timer.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-opus-4-8")
+ADVISOR_MAX_TOKENS = int(os.environ.get("ADVISOR_MAX_TOKENS", "1200"))
+# How many top funding-carry opportunities to show the advisor as alternatives.
+ADVISOR_TOP_OPPORTUNITIES = int(os.environ.get("ADVISOR_TOP_OPPORTUNITIES", "12"))
+
 # ── Mode ──
 def paper_mode() -> bool:
     """Read paper/live flag. data/mode.env wins over the environment."""

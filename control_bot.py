@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation
 
 import aiohttp
 
+import advisor
 import config
 import database
 import screener
@@ -37,6 +38,7 @@ HELP = """Commands:
 /screen [n] — top basis opportunities
 /funding [n] — top funding carry (24h avg, 8h-equiv)
 /status — engine heartbeat + open positions
+/review — AI review of positions + opportunities (advisory only, never trades)
 /positions — active positions detail (bot DB)
 /balance — USDT balance on each venue (Aster perp + MEXC spot)
 /recon — live exchange P&L: pairs open on the venues now, full round-trip cost
@@ -73,6 +75,7 @@ BOT_COMMANDS = [
     {"command": "balance", "description": "USDT balance on each venue"},
     {"command": "book", "description": "Order book both venues: SYMBOL"},
     {"command": "status", "description": "Engine status and heartbeat"},
+    {"command": "review", "description": "AI review of book + opportunities (advisory)"},
     {"command": "pnl", "description": "Realised P&L summary"},
     {"command": "trades", "description": "Recent closed trades"},
     {"command": "log", "description": "Recent journal entries"},
@@ -202,6 +205,8 @@ class ControlBot:
             return self._cmd_funding(args)
         if command == "status":
             return await self._cmd_status()
+        if command == "review":
+            return await advisor.review_text(self._session, self._conn)
         if command == "positions":
             return self._cmd_positions()
         if command == "recon":

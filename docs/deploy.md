@@ -43,6 +43,25 @@ systemctl start basis-trade-logrotate.service   # gzip existing old days now
 systemctl list-timers basis-trade-logrotate     # confirm it's scheduled
 ```
 
+### AI advisor (optional, advisory only)
+
+A Claude review of open positions (basis / funding / liq proximity) and the top
+funding opportunities, delivered to Telegram. It only ever sends messages — it
+cannot place, size or close orders. Trigger on demand with `/review`, or on a
+4-hour schedule via the timer below. Requires `ANTHROPIC_API_KEY` in `.env` and
+outbound HTTPS to `api.anthropic.com`; without the key it simply replies that it
+is not configured.
+
+```bash
+cp deploy/basis-trade-advisor.service /etc/systemd/system/
+cp deploy/basis-trade-advisor.timer   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now basis-trade-advisor.timer
+
+systemctl start basis-trade-advisor.service     # send one review now (test)
+journalctl -u basis-trade-advisor -n 20         # check it ran
+```
+
 If the bot runs as a non-root user, allow it to control the engine service
 without a password (needed for `/start`, `/stop`, `/restart`, `/paper`, `/live`):
 
