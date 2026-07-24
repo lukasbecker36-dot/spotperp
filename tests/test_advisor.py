@@ -47,6 +47,7 @@ def test_context_marshals_position_and_marks(wired):
     tmp.joinpath("funding.json").write_text(json.dumps({
         "ts_ms": 1, "rows": [
             {"symbol": "BTWUSDT", "current_8h_bps": 34.0, "avg_24h_8h_bps": 28.0,
+             "entry_bps": 45.0, "close_bps": -5.0, "spread_cost_bps": 50.0,
              "net_edge_bps": 12.0, "max_notional_usd": 1200.0, "next_funding_h": 1.5},
         ],
     }))
@@ -60,8 +61,12 @@ def test_context_marshals_position_and_marks(wired):
     assert p["current_basis_bps"] == 8.0
     assert p["liq_distance_pct"] == 24.0
     assert p["upnl_usd"] == 4.65
-    assert ctx["top_opportunities"][0]["symbol"] == "BTWUSDT"
-    assert ctx["top_opportunities"][0]["funding_now_8h_bps"] == 34.0
+    opp = ctx["top_opportunities"][0]
+    assert opp["symbol"] == "BTWUSDT"
+    assert opp["funding_now_8h_bps"] == 34.0
+    assert opp["entry_basis_bps"] == 45.0
+    assert opp["exit_basis_bps"] == -5.0        # exit basis surfaced for vetting
+    assert opp["depth_usd"] == 1200.0
 
 
 def test_context_survives_missing_snapshots(wired):

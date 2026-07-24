@@ -54,7 +54,20 @@ words, plain text for Telegram (no markdown tables).
 Ignore holding time and any max-hold limit entirely. A position being old is NOT \
 a reason to exit — never suggest closing or reducing just because it has been \
 held a long time. Judge every position purely on its basis, funding carry, and \
-liquidation risk; a profitable carry should run as long as those stay healthy."""
+liquidation risk; a profitable carry should run as long as those stay healthy.
+
+Before recommending ANY new entry from top_opportunities, vet its order-book \
+reality, not just its funding:
+- depth_usd is the tradeable top-of-book size. If it is below the notional you \
+would suggest, do not recommend it (or cap the size to the depth).
+- entry_basis_bps is the basis you enter at (perp ask vs spot ask); \
+exit_basis_bps is the basis you could close at RIGHT NOW (perp bid vs spot \
+bid). On thin/wide names entry_basis looks rich purely because the spread is \
+wide, while exit_basis is already deeply negative — a spread mirage you cannot \
+exit profitably. If exit_basis_bps is hugely negative (roughly < -30bps, or \
+spread_cost_bps is very large relative to funding), DO NOT recommend entering, \
+and say why. Prefer opportunities where funding carries the trade AND \
+exit_basis_bps is not deeply negative."""
 
 
 def _f(x, default=None):
@@ -107,6 +120,9 @@ def build_context(conn) -> dict:
                 "symbol": r.get("symbol"),
                 "funding_now_8h_bps": _f(r.get("current_8h_bps")),
                 "funding_24h_avg_8h_bps": _f(r.get("avg_24h_8h_bps")),
+                "entry_basis_bps": _f(r.get("entry_bps")),
+                "exit_basis_bps": _f(r.get("close_bps")),
+                "spread_cost_bps": _f(r.get("spread_cost_bps")),
                 "net_edge_bps": _f(r.get("net_edge_bps")),
                 "depth_usd": _f(r.get("max_notional_usd")),
                 "next_funding_h": _f(r.get("next_funding_h")),

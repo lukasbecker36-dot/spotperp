@@ -479,6 +479,8 @@ class Engine:
                 "realized_24h_bps": stat.realized_24h_bps,
                 "next_funding_h": next_funding_h,
                 "entry_bps": screen.entry_bps if screen else None,
+                "close_bps": screen.close_bps if screen else None,
+                "spread_cost_bps": screen.spread_cost_bps if screen else None,
                 "net_edge_bps": screen.net_edge_bps if screen else None,
                 "entry_bps_avg": screen.entry_bps_avg if screen else None,
                 "net_edge_bps_avg": screen.net_edge_bps_avg if screen else None,
