@@ -1445,12 +1445,24 @@ class Executor:
             )
         await self._accrue_funding(pos)
         pnl = self._positions.finalize_pnl(position_id)
+        pos = self._positions.get(position_id)  # refresh funding after accrual
         self._positions.set_state(position_id, pm.CLOSED)
+        # Executed entry basis (locked at the fills, stored at OPEN) vs executed
+        # exit basis, so the P&L is legible: a name whose /screen quote looked
+        # rich but whose real entry basis was thin shows the true capture here.
         xb = self._executed_basis_bps(pos.perp_exit_avg, pos.spot_exit_avg)
-        xb_txt = f" @ {float(xb):+.1f}bps" if xb is not None else ""
-        journal(self._conn, f"position {position_id}: CLOSED{xb_txt} pnl={pnl}")
+        eb = pos.entry_basis_bps
+        if eb is not None and xb is not None:
+            basis_txt = (f" basis {float(eb):+.1f}->{float(xb):+.1f}bps"
+                         f" (captured {float(eb) - float(xb):+.1f})")
+        elif xb is not None:
+            basis_txt = f" exit basis {float(xb):+.1f}bps"
+        else:
+            basis_txt = ""
+        journal(self._conn, f"position {position_id}: CLOSED{basis_txt} pnl={pnl}")
         await self._notifier.alert(
-            f"🏁 position {position_id} {pos.symbol} CLOSED{xb_txt}, realised PnL"
+            f"🏁 position {position_id} {pos.symbol} CLOSED,"
+            f"{basis_txt or ' '} realised PnL"
             f" ${float(pnl):.2f} ({'paper' if self._paper else 'LIVE'})"
         )
 
