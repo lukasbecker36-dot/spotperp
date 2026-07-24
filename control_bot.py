@@ -387,14 +387,15 @@ class ControlBot:
                 if p.opened_ms else "-"
             )
             kind_tag = " ⚓carry" if p.trade_kind == "carry" else ""
+            base = p.symbol[:-4] if p.symbol.endswith("USDT") else p.symbol
             head = (f"#{p.id} {p.symbol} [{p.state}]{kind_tag}  held {held}"
                     f"{' · exit ' + p.exit_mode if p.exit_mode else ''}"
                     f"{' (paper)' if p.paper else ''}")
             venue = [
-                f"  Aster perp  sell {self._fmt_px(p.perp_entry_avg)}"
-                f"  buy —(open)",
-                f"  MEXC spot   buy  {self._fmt_px(p.spot_entry_avg)}"
-                f"  sell —(open)",
+                f"  Aster perp  short {self._fmt_qty(p.perp_qty)} {base}"
+                f"  sell {self._fmt_px(p.perp_entry_avg)} / buy —(open)",
+                f"  MEXC spot   long  {self._fmt_qty(p.spot_qty)} {base}"
+                f"  buy {self._fmt_px(p.spot_entry_avg)} / sell —(open)",
             ]
             m = marks.get(str(p.id)) if marks_fresh else None
             if m and "upnl_usd" in m:
@@ -449,6 +450,17 @@ class ControlBot:
         if f >= 1:
             return f"{f:.4f}"
         return f"{f:.6g}"
+
+    @staticmethod
+    def _fmt_qty(qty: Decimal | None) -> str:
+        """Coin units without trailing-zero noise (e.g. 3377, 9.95, 0.0125)."""
+        if qty is None:
+            return "-"
+        q = qty.normalize()
+        # normalize() renders small integers in exponent form (3E+3); expand.
+        if q == q.to_integral_value():
+            return str(int(q))
+        return f"{q:f}"
 
     @staticmethod
     def _basis_bps(perp: Decimal | None, spot: Decimal | None) -> float | None:
