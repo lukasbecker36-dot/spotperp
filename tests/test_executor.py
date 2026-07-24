@@ -428,6 +428,34 @@ async def wait_for_perp_qty(positions, position_id, qty, timeout=10.0):
     )
 
 
+async def test_entry_emits_clip_alert_with_basis(env):
+    """Each spot hedge on entry pings Telegram with the fill and live basis."""
+    md, positions, executor, notifier, conn = env
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True)
+    executor.start_entry(pos)
+    await wait_for_state(positions, pos.id, pm.OPEN)
+
+    clips = [m for m in notifier.messages if "entry clip" in m]
+    assert clips, f"no entry clip alert in {notifier.messages}"
+    assert "spot" in clips[0] and "basis" in clips[0]
+    assert "bps" in clips[0]
+
+
+async def test_aggressive_exit_emits_clip_alert(env):
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+    notifier.messages.clear()
+    positions.set_exit_request(pos_id, "now", None, None)
+    await executor.start_exit(positions.get(pos_id))
+    await wait_for_state(positions, pos_id, pm.CLOSED)
+
+    clips = [m for m in notifier.messages if "exit clip" in m]
+    assert clips, f"no exit clip alert in {notifier.messages}"
+    assert "basis" in clips[0]
+
+
 async def test_partial_aggressive_exit_leaves_residual_open(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)

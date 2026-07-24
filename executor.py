@@ -603,6 +603,24 @@ class Executor:
         mult = self._pair(symbol).qty_multiplier
         return (aster.bid / mult - mexc.bid) / mexc.bid * BPS
 
+    async def _notify_clip(
+        self, position_id: int, symbol: str, phase: str, side: str,
+        base_qty: Decimal, price: Decimal,
+    ) -> None:
+        """Telegram ping for one filled clip of a partial entry/exit, tagged
+        with the live executable basis at fill time (entry ask/ask basis on the
+        way in, close bid/bid basis on the way out). Fire-and-forget."""
+        basis = (self._entry_basis_bps(symbol) if phase == "entry"
+                 else self._close_basis_bps(symbol))
+        b = f"{float(basis):+.1f}bps" if basis is not None else "n/a"
+        notional = float(base_qty * price)
+        arrow = "+" if side == "BUY" else "-"
+        px = f"{float(price):,.6g}"
+        await self._notifier.alert(
+            f"▫️ #{position_id} {symbol} {phase} clip: {arrow}{base_qty} spot"
+            f" @ {px} (~${notional:,.0f}) · basis {b}"
+        )
+
     @staticmethod
     def _executed_basis_bps(
         perp_avg: Decimal | None, spot_avg: Decimal | None
@@ -698,6 +716,11 @@ class Executor:
                     fill.avg_price,
                     self._fee_usd("mexc", False, fill.qty, fill.avg_price),
                 )
+                if phase in ("entry", "exit"):
+                    await self._notify_clip(
+                        position.id, position.symbol, phase, side,
+                        fill.qty, fill.avg_price,
+                    )
                 remaining = info.round_qty(remaining - fill.qty)
                 last_error = None  # progress made; not an outright rejection
             if remaining <= 0:
@@ -1160,6 +1183,12 @@ class Executor:
                         result.avg_price,
                         self._fee_usd(venue, False, result.qty, result.avg_price),
                     )
+                    # One clip ping per iteration, on the spot (hedge) leg.
+                    if venue == "mexc":
+                        await self._notify_clip(
+                            position.id, symbol, "exit", side,
+                            result.qty, result.avg_price,
+                        )
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
 
         await self._complete_exit(position.id, floor_perp)
