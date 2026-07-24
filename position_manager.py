@@ -337,6 +337,17 @@ class PositionManager:
         ).fetchall()
         return sum((Decimal(r["qty"]) for r in rows), Decimal(0))
 
+    def leg_qtys(self, position_id: int) -> dict[str, Decimal]:
+        """Entry and exit fill quantities per leg, for display/diagnosis. A
+        healthy hedge has perp_entry == spot_entry and perp_exit == spot_exit
+        (in matching units); a gap means the position carried naked delta."""
+        return {
+            "perp_entry": self._phase_qty(position_id, "aster", "entry"),
+            "spot_entry": self._phase_qty(position_id, "mexc", "entry"),
+            "perp_exit": self._exited_qty(position_id, "aster"),
+            "spot_exit": self._exited_qty(position_id, "mexc"),
+        }
+
     def pnl_summary(self) -> dict[str, Decimal]:
         out: dict[str, Decimal] = {}
         day_start_ms = (_now_ms() // 86_400_000) * 86_400_000

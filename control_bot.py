@@ -492,17 +492,33 @@ class ControlBot:
             cb = f"{close_basis:+.1f}" if close_basis is not None else "-"
             drift = (f"{open_basis - close_basis:+.1f}"
                      if open_basis is not None and close_basis is not None else "-")
+            # Hedge-balance check: captured basis is a PRICE relationship that
+            # only turns into the shown P&L if both legs are the same size. If
+            # the fraction of the perp closed differs from the fraction of the
+            # spot closed, the position carried naked delta and the coin's raw
+            # move (not the basis) drove P&L — flag it so a "converged but lost"
+            # trade is legible.
+            q = self._positions.leg_qtys(p.id)
+            imbalance = ""
+            fp = (q["perp_exit"] / q["perp_entry"]) if q["perp_entry"] else None
+            fs = (q["spot_exit"] / q["spot_entry"]) if q["spot_entry"] else None
+            if fp is not None and fs is not None and abs(float(fp - fs)) > 0.02:
+                imbalance = (f"  ⚠️ hedge imbalance: closed {float(fp) * 100:.0f}%"
+                             f" of perp vs {float(fs) * 100:.0f}% of spot"
+                             f" — residual delta drove P&L, not basis")
             blocks.append("\n".join([
                 f"#{p.id} {p.symbol} {p.state}"
                 f"{' (paper)' if p.paper else ''}  {when} · held {held}",
                 f"  Aster perp  sell {self._fmt_px(p.perp_entry_avg)}"
-                f"  buy {self._fmt_px(p.perp_exit_avg)}",
+                f"  buy {self._fmt_px(p.perp_exit_avg)}"
+                f"  ({self._fmt_qty(q['perp_entry'])}/{self._fmt_qty(q['perp_exit'])})",
                 f"  MEXC spot   buy  {self._fmt_px(p.spot_entry_avg)}"
-                f"  sell {self._fmt_px(p.spot_exit_avg)}",
+                f"  sell {self._fmt_px(p.spot_exit_avg)}"
+                f"  ({self._fmt_qty(q['spot_entry'])}/{self._fmt_qty(q['spot_exit'])})",
                 f"  basis  open {ob}  close {cb}  captured {drift} bps",
                 f"  funding ${float(p.funding_usd):+.2f}"
                 f"  commission ${float(p.fees_usd):.2f}"
-                f"  →  P&L {pnl}",
+                f"  →  P&L {pnl}{imbalance}",
             ]))
         return "last trades:\n\n" + "\n\n".join(blocks)
 
