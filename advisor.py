@@ -49,7 +49,12 @@ real numbers from the data. Lead with anything urgent (liquidation proximity, \
 funding that has flipped negative, basis gone adverse past the stop). If nothing \
 needs doing, say so plainly rather than inventing action. Do not fabricate \
 numbers; reason only from what you are given. Keep the whole reply under ~250 \
-words, plain text for Telegram (no markdown tables)."""
+words, plain text for Telegram (no markdown tables).
+
+Ignore holding time and any max-hold limit entirely. A position being old is NOT \
+a reason to exit — never suggest closing or reducing just because it has been \
+held a long time. Judge every position purely on its basis, funding carry, and \
+liquidation risk; a profitable carry should run as long as those stay healthy."""
 
 
 def _f(x, default=None):
@@ -121,7 +126,6 @@ def build_context(conn) -> dict:
         "thresholds": {
             "exit_basis_bps": _f(config.EXIT_BASIS_BPS),
             "adverse_widen_stop_bps": _f(config.ADVERSE_WIDEN_STOP_BPS),
-            "max_hold_hours": _f(config.MAX_HOLD_HOURS),
             "liq_alert_pct": _f(config.LIQ_ALERT_PCT),
         },
         "open_positions": open_positions,
