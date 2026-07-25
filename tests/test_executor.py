@@ -530,6 +530,39 @@ async def test_passive_exit_alerts_when_target_below_min_notional(env):
     assert p.perp_qty == Decimal("9.95")    # nothing closed
 
 
+async def test_add_reverts_cleanly_when_hedge_basis_collapses(env, monkeypatch):
+    """Sizing up an OPEN position: the add's maker fills, but the hedge-time
+    basis collapses below the salvage floor and the add is unwound. The
+    position must keep its TRUE prior basis (not a phantom negative blended
+    basis from the reversed fills), report 'reverted', and stay balanced."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(0))
+    pos_id = await open_position(md, positions, executor)   # +50bps, hedged
+    before = positions.get(pos_id)
+    prior_qty = before.perp_qty
+    prior_basis = before.entry_basis_bps
+    notifier.messages.clear()
+
+    calls = {"n": 0}
+
+    async def flip_depth(symbol, side, limit=20):
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return [(Decimal("100.0"), Decimal(100))]     # placement: fine
+        return [(Decimal("100.6"), Decimal(100))]         # hedge: basis ~ -10bps
+    executor._trader.spot_depth = flip_depth
+
+    executor.start_add(positions.get(pos_id), Decimal(500))
+    await wait_for_message(notifier, "add NOT taken")
+    await wait_for_state(positions, pos_id, pm.OPEN)
+
+    final = positions.get(pos_id)
+    assert final.perp_qty == prior_qty                    # unchanged
+    assert final.spot_qty == final.perp_qty               # still hedged, no naked leg
+    assert final.entry_basis_bps == prior_basis           # true basis preserved
+    assert not any("added" in m for m in notifier.messages)   # not a phantom add
+
+
 async def test_entry_unwinds_when_hedge_basis_below_salvage_floor(env, monkeypatch):
     """Adverse-selection guard: the resting maker passes the floor at
     placement, but by hedge time the spot has rallied and the executable basis

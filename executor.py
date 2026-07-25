@@ -846,6 +846,14 @@ class Executor:
         order_seen_executed = Decimal(0)
         last_reprice = 0.0
         aborted = False                # hedge-time basis collapse -> stop entry
+        abort_basis: Decimal | None = None  # the collapsed hedge basis, for msgs
+        # Snapshot pre-run perp state. An add that fully unwinds books an
+        # exit-style buy-back that leaves perp_entry_avg polluted by the
+        # reversed add fills — a phantom deeply-negative "blended basis". If the
+        # add nets out, we restore this so the position keeps its true basis.
+        _pre = self._positions.get(position.id)
+        pre_perp_qty = _pre.perp_qty
+        pre_perp_entry_avg = _pre.perp_entry_avg
 
         async def absorb_fills(result: OrderResult) -> None:
             nonlocal remaining, unhedged, order_seen_executed, run_filled
@@ -863,7 +871,7 @@ class Executor:
             unhedged += delta
 
         async def hedge_unhedged(force: bool = False) -> None:
-            nonlocal unhedged, aborted
+            nonlocal unhedged, aborted, abort_basis
             if unhedged <= 0:
                 return
             book = self._md.mexc_books.get(pair.mexc_symbol)
@@ -891,6 +899,7 @@ class Executor:
                 naked = unhedged
                 unhedged = Decimal(0)
                 aborted = True
+                abort_basis = live_basis
                 await self._notifier.alert(
                     f"🛑 position {position.id} {symbol}: entry basis collapsed to"
                     f" {live_basis:.1f}bps (below hedge-min"
@@ -1036,6 +1045,49 @@ class Executor:
             raise
 
         final = self._positions.get(position.id)
+
+        # An add whose hedge basis collapsed and was unwound must not be
+        # reported as a successful add: the buy-back is booked as an exit, so
+        # perp_entry_avg stays polluted by the reversed add fills (a phantom
+        # negative blended basis) and run_filled still counts the reverted
+        # units. Handle it explicitly.
+        if is_add and aborted:
+            mexc_info = self._md.mexc_info[pair.mexc_symbol]
+            hedge_gap = final.perp_qty * pair.qty_multiplier - final.spot_qty
+            net_perp = final.perp_qty - pre_perp_qty
+            cb = f"{float(abort_basis):.1f}bps" if abort_basis is not None else "n/a"
+            if hedge_gap > mexc_info.step_size:
+                # Buy-back didn't fully complete: a naked short remains.
+                self._positions.set_state(position.id, pm.OPEN, "add unwind incomplete")
+                journal(self._conn, f"position {position.id}: ADD unwind INCOMPLETE"
+                        f" — naked perp {hedge_gap} (basis {cb})", "ERROR")
+                await self._notifier.alert(
+                    f"🚨 position {position.id} {symbol}: add unwind INCOMPLETE —"
+                    f" ~{hedge_gap} coin of perp short is NAKED (spot not bought)."
+                    f" Reconcile now: /exit {position.id} now or rebalance manually."
+                )
+                return
+            if net_perp <= aster_info.step_size:
+                # Fully reverted: restore perp_entry_avg so the position keeps
+                # its true prior basis instead of the polluted phantom.
+                if pre_perp_entry_avg is not None:
+                    self._conn.execute(
+                        "UPDATE positions SET perp_entry_avg=? WHERE id=?",
+                        (str(pre_perp_entry_avg), position.id),
+                    )
+                    self._conn.commit()
+                self._positions.set_state(position.id, pm.OPEN, "add reverted")
+                journal(self._conn, f"position {position.id}: ADD reverted"
+                        f" (basis collapsed to {cb}), position unchanged")
+                await self._notifier.alert(
+                    f"↩️ position {position.id} {symbol}: add NOT taken — entry basis"
+                    f" collapsed to {cb} by hedge time and the {run_filled} perp"
+                    f" units were unwound. Position unchanged."
+                )
+                return
+            # else: some clips hedged fine before a later one collapsed — a real
+            # partial add; fall through and report the net that stuck.
+
         if final.spot_qty > 0 or final.perp_qty > 0:
             entry_basis = None
             if final.perp_entry_avg and final.spot_entry_avg:
@@ -1060,12 +1112,13 @@ class Executor:
             basis_str = (
                 "n/a" if entry_basis is None else f"{round(float(entry_basis), 2)}bps"
             )
-            if is_add and run_filled > 0:
-                journal(self._conn, f"position {position.id}: ADD +{run_filled} ->"
+            net_added = final.perp_qty - pre_perp_qty   # excludes any unwound
+            if is_add and net_added > 0:
+                journal(self._conn, f"position {position.id}: ADD +{net_added} ->"
                         f" perp={final.perp_qty} spot={final.spot_qty}"
                         f" blended_basis={entry_basis}")
                 await self._notifier.alert(
-                    f"➕ position {position.id} {symbol}: added {run_filled} perp"
+                    f"➕ position {position.id} {symbol}: added {net_added} perp"
                     f" units (total qty={final.perp_qty}), blended entry"
                     f" basis={basis_str} ({'paper' if self._paper else 'LIVE'})"
                 )
