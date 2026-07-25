@@ -530,13 +530,13 @@ async def test_passive_exit_alerts_when_target_below_min_notional(env):
     assert p.perp_qty == Decimal("9.95")    # nothing closed
 
 
-async def test_entry_aborts_when_hedge_basis_collapses(env):
+async def test_entry_unwinds_when_hedge_basis_below_salvage_floor(env, monkeypatch):
     """Adverse-selection guard: the resting maker passes the floor at
-    placement, but by hedge time the spot has rallied and the executable
-    basis has collapsed below floor - abort band. The engine must unwind the
-    perp fill instead of locking a bad entry."""
+    placement, but by hedge time the spot has rallied and the executable basis
+    has collapsed BELOW the salvage floor (ENTRY_HEDGE_MIN_BPS). Holding would
+    lock a loss, so the engine unwinds the perp fill instead."""
     md, positions, executor, notifier, conn = env
-    config.ENTRY_HEDGE_ABORT_BPS = Decimal(20)
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(10))  # unwind if < 10bps
     # Gate sees +50bps (perp ask 100.5 vs spot ask 100.0) -> places at floor 30.
     set_books(md, "100.4", "100.5", "99.9", "100.0")
 
@@ -544,7 +544,7 @@ async def test_entry_aborts_when_hedge_basis_collapses(env):
 
     async def flip_depth(symbol, side, limit=20):
         # First call (placement-time hedgeable cap) sees good depth; by the
-        # hedge-time re-check the ask has rallied to ~100.49 (basis ~1bps).
+        # hedge-time re-check the ask has rallied to ~100.49 (basis ~1bps < 10).
         calls["n"] += 1
         if calls["n"] <= 1:
             return [(Decimal("100.0"), Decimal(100))]
@@ -562,6 +562,34 @@ async def test_entry_aborts_when_hedge_basis_collapses(env):
     # (previously left NULL, so /pnl silently overstated results).
     assert final.realized_pnl_usd is not None
     assert final.realized_pnl_usd <= 0
+
+
+async def test_entry_salvages_when_basis_below_floor_but_above_min(env, monkeypatch):
+    """Salvage: basis collapses below the entry floor (30) but stays above the
+    salvage floor (0) — the engine hedges and KEEPS the position rather than
+    paying to unwind a still-positive entry."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(0))
+    # rest the full size in one clip so the test completes to OPEN promptly
+    monkeypatch.setattr(config, "ENTRY_MAX_CLIP_NOTIONAL_USD", Decimal("100000"))
+    # Gate sees +50bps -> rests at floor 30. Hedge-time basis ~1bps (>= 0).
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    calls = {"n": 0}
+
+    async def flip_depth(symbol, side, limit=20):
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return [(Decimal("100.0"), Decimal(100))]
+        return [(Decimal("100.49"), Decimal(100))]   # ~1bps, above salvage floor
+    executor._trader.spot_depth = flip_depth
+
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True, min_entry_bps=Decimal(30))
+    executor.start_entry(pos)
+    await wait_for_state(positions, pos.id, pm.OPEN)   # kept, not unwound
+    final = positions.get(pos.id)
+    assert final.perp_qty > 0
+    assert final.spot_qty == final.perp_qty            # fully hedged and held
 
 
 async def test_aggressive_exit_closes_immediately(env):

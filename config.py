@@ -162,14 +162,20 @@ UNWIND_TIMEOUT_SECONDS = 60              # hard limit to flatten a naked leg
 HEDGE_RETRY_ATTEMPTS = 3
 # A resting maker perp leg is adverse-selected: it fills preferentially when
 # the spot has rallied and the basis has compressed, then the reactive taker
-# hedge locks that worse spot. So the realized entry basis can land well below
-# the resting floor. Before hedging each perp fill we re-price the basis the
-# hedge would ACTUALLY pay against fresh spot depth, and:
-#   - abort (unwind the perp increment, don't enter) if it is below
-#     floor - ENTRY_HEDGE_ABORT_BPS, so a severe collapse never enters;
-#   - alert (but still enter) if the final realized basis lands more than
+# hedge locks that worse spot. So the realized entry basis can land below the
+# resting floor. Once the perp has FILLED, the entry-floor decision is sunk —
+# the only choice left is hedge-and-hold vs unwind (a guaranteed taker-spread
+# loss for zero position). So before hedging each perp fill we re-price the
+# basis the hedge would ACTUALLY pay against fresh spot depth, and:
+#   - SALVAGE (hedge and keep the position) as long as that basis is >=
+#     ENTRY_HEDGE_MIN_BPS — holding a thin-but-positive entry beats paying to
+#     unwind. You may end up entered below the floor you wanted.
+#   - UNWIND (don't enter) only when it is below ENTRY_HEDGE_MIN_BPS, i.e. so
+#     low that holding would lock a loss. Set higher to be pickier (more
+#     unwinds), lower/negative to salvage even more.
+#   - ALERT (but still enter) if the final realized basis lands more than
 #     ENTRY_REALIZED_ALERT_BPS below the floor, so it is never a silent miss.
-ENTRY_HEDGE_ABORT_BPS = Decimal(os.environ.get("ENTRY_HEDGE_ABORT_BPS", "20"))
+ENTRY_HEDGE_MIN_BPS = Decimal(os.environ.get("ENTRY_HEDGE_MIN_BPS", "0"))
 ENTRY_REALIZED_ALERT_BPS = Decimal(os.environ.get("ENTRY_REALIZED_ALERT_BPS", "10"))
 # Buffer added past the live depth level that completes the hedge fill (the
 # IOC is priced to cross real resting depth up to the needed size, then this
@@ -190,10 +196,14 @@ ENTRY_DEPTH_LEVELS = int(os.environ.get("ENTRY_DEPTH_LEVELS", "50"))
 # all of it as a taker at a loss (ASTEROID: one 902k clip swept -> -40.7bps ->
 # -3.70 unwind). Capping the clip limits that blast radius — a sweep catches at
 # most one clip, then edge_ok goes false and the remainder never rests. None
-# (default) keeps the old single-order behaviour; set e.g. 100 to chunk entries.
+# Cap each resting maker clip so a single taker sweep catches at most this
+# notional before the next tick re-checks the (possibly collapsed) basis and
+# stops resting — bounding the adverse-selection blast radius. Default $100
+# chunks entries into small clips; set to a large value / env-empty behaviour
+# to rest the full size at once. Lower = safer on thin names, more clips.
 ENTRY_MAX_CLIP_NOTIONAL_USD: Decimal | None = (
     Decimal(os.environ["ENTRY_MAX_CLIP_NOTIONAL_USD"])
-    if os.environ.get("ENTRY_MAX_CLIP_NOTIONAL_USD") else None
+    if os.environ.get("ENTRY_MAX_CLIP_NOTIONAL_USD") else Decimal("100")
 )
 
 # ── Funding ──

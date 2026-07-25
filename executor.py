@@ -884,18 +884,28 @@ class Executor:
             )
             if (
                 live_basis is not None
-                and live_basis < entry_floor - config.ENTRY_HEDGE_ABORT_BPS
+                and live_basis < config.ENTRY_HEDGE_MIN_BPS
             ):
+                # Below the salvage floor: holding would lock a loss, so unwind
+                # rather than hedge into it.
                 naked = unhedged
                 unhedged = Decimal(0)
                 aborted = True
                 await self._notifier.alert(
                     f"🛑 position {position.id} {symbol}: entry basis collapsed to"
-                    f" {live_basis:.1f}bps (floor {entry_floor}bps) by hedge time"
-                    f" — unwinding {naked} perp units instead of entering"
+                    f" {live_basis:.1f}bps (below hedge-min"
+                    f" {float(config.ENTRY_HEDGE_MIN_BPS):.0f}bps) by hedge time"
+                    f" — unwinding {naked} perp units instead of locking a loss"
                 )
                 await self._unwind_perp(position, naked)
                 return
+            if live_basis is not None and live_basis < entry_floor:
+                # Salvage: collapsed below the floor you wanted but still worth
+                # holding — hedge and keep it rather than pay to unwind.
+                log.info(
+                    "position %s: salvaging hedge at %.1fbps (below floor %sbps)",
+                    position.id, float(live_basis), entry_floor,
+                )
 
             try:
                 shortfall, err = await self._hedge_spot(
