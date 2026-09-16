@@ -1396,6 +1396,17 @@ class Executor:
                                 aster_info.round_qty(closeable / pair.qty_multiplier),
                             )
 
+                # Cap each resting buy-back to a small clip: the size above is
+                # what spot can take RIGHT NOW, but the maker fills later — a
+                # smaller resting clip means a single sweep closes less perp
+                # before the next tick re-reads spot depth, bounding leg desync.
+                if config.EXIT_MAX_CLIP_NOTIONAL_USD is not None and price > 0:
+                    clip = aster_info.round_qty(
+                        config.EXIT_MAX_CLIP_NOTIONAL_USD / price
+                    )
+                    if clip >= aster_info.step_size:
+                        place_qty = min(place_qty, clip)
+
                 if order_id is None:
                     placeable = (
                         book is not None and not gated

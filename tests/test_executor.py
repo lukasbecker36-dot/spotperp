@@ -651,3 +651,31 @@ def test_executed_basis_bps_applies_multiplier():
     assert -9.0 < float(b1) < -8.5
     # missing avg -> None
     assert Executor._executed_basis_bps(None, Decimal("1")) is None
+
+
+async def test_exit_clip_cap_bounds_each_passive_buyback(env, monkeypatch):
+    """With EXIT_MAX_CLIP_NOTIONAL_USD set, no single resting perp buy-back on a
+    passive exit exceeds the cap — so one sweep can only close a small clip
+    before the next tick re-reads spot depth (bounding leg desync)."""
+    monkeypatch.setattr(config, "EXIT_MAX_CLIP_NOTIONAL_USD", Decimal(100))
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+
+    placed: list[Decimal] = []
+    orig = executor._trader.place_perp_maker
+
+    async def spy(symbol, side, qty, price, client_id):
+        placed.append(qty)
+        return await orig(symbol, side, qty, price, client_id)
+    executor._trader.place_perp_maker = spy
+
+    positions.set_exit_request(pos_id, "passive", Decimal(15))
+    await executor.start_exit(positions.get(pos_id))
+    await wait_for_state(positions, pos_id, pm.CLOSED)
+
+    final = positions.get(pos_id)
+    assert final.perp_qty == 0 and final.spot_qty == 0   # fully closed via clips
+    assert len(placed) > 1                               # chunked, not one order
+    clip_qty = Decimal("1.0")                            # round_qty(100 / 100.0 bid) = 1.000
+    assert all(q <= clip_qty for q in placed)            # no buy-back over the cap

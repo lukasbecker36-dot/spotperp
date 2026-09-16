@@ -205,6 +205,15 @@ ENTRY_MAX_CLIP_NOTIONAL_USD: Decimal | None = (
     Decimal(os.environ["ENTRY_MAX_CLIP_NOTIONAL_USD"])
     if os.environ.get("ENTRY_MAX_CLIP_NOTIONAL_USD") else Decimal("100")
 )
+# Same idea for a PASSIVE exit: cap each resting perp buy-back clip. A resting
+# maker is sized to the spot bid depth AT PLACEMENT, but it fills later — by
+# which time that bid may be gone, so a big resting clip can be swept while the
+# reactive spot sell walks a thinned book (leg desync). Small clips bound how
+# much perp a single sweep can close before the next tick re-reads spot depth.
+EXIT_MAX_CLIP_NOTIONAL_USD: Decimal | None = (
+    Decimal(os.environ["EXIT_MAX_CLIP_NOTIONAL_USD"])
+    if os.environ.get("EXIT_MAX_CLIP_NOTIONAL_USD") else Decimal("100")
+)
 
 # ── Funding ──
 FUNDING_INTERVAL_HOURS = 8
