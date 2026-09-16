@@ -1523,16 +1523,44 @@ class Executor:
         else:
             await self._finalize_close(position_id)
 
+    @staticmethod
+    def _is_dust(info, qty: Decimal, price: Decimal) -> bool:
+        """True when a residual leg can NEVER be traded away.
+
+        Lot size alone is not enough: a residual can be several whole lots and
+        still be worth less than the venue's MINIMUM ORDER NOTIONAL, so no order
+        can sell it (STONK #169 finished with 4 coins ~ $0.75 against a ~$1
+        minimum). Treating that as "exit incomplete" wedges the position in
+        EXITING forever and re-alerts on every restart.
+        """
+        if qty <= 0:
+            return True
+        if info is None:
+            return False
+        if info.round_qty(qty) <= 0:
+            return True          # below one lot
+        # Unknown price -> can't judge notional; treat as tradeable (safe).
+        return price > 0 and qty * price < info.min_notional
+
     async def _finalize_close(self, position_id: int) -> None:
         pos = self._positions.get(position_id)
-        # "Flat" means both legs are below one exchange step — sub-step dust can
-        # never be traded away, so testing raw qty > 0 wedges the position in
-        # EXITING forever (and re-alerts on every restart). Write the dust off.
+        # "Flat" means each leg is untradeable — below one lot OR worth less
+        # than the venue minimum. Such dust can never be sold, so write it off
+        # rather than wedging the position in EXITING forever.
         pair = self._md.pair_maps.get(pos.symbol)
         aster_info = self._md.aster_info.get(pair.aster_symbol) if pair else None
         mexc_info = self._md.mexc_info.get(pair.mexc_symbol) if pair else None
-        perp_left = aster_info.round_qty(pos.perp_qty) if aster_info else pos.perp_qty
-        spot_left = mexc_info.round_qty(pos.spot_qty) if mexc_info else pos.spot_qty
+        aster_book, mexc_book = self._books(pos.symbol)
+        perp_px = (
+            aster_book.bid if aster_book and aster_book.bid > 0
+            else (pos.perp_entry_avg or Decimal(0))
+        )
+        spot_px = (
+            mexc_book.bid if mexc_book and mexc_book.bid > 0
+            else (pos.spot_entry_avg or Decimal(0))
+        )
+        perp_left = Decimal(0) if self._is_dust(aster_info, pos.perp_qty, perp_px) else pos.perp_qty
+        spot_left = Decimal(0) if self._is_dust(mexc_info, pos.spot_qty, spot_px) else pos.spot_qty
         if perp_left > 0 or spot_left > 0:
             journal(
                 self._conn,
@@ -1548,7 +1576,7 @@ class Executor:
         if pos.perp_qty > 0 or pos.spot_qty > 0:
             journal(
                 self._conn,
-                f"position {position_id}: closing with sub-step dust written off"
+                f"position {position_id}: closing with untradeable dust written off"
                 f" (perp={pos.perp_qty}, spot={pos.spot_qty})",
                 "WARN",
             )

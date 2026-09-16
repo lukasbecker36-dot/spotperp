@@ -727,3 +727,60 @@ async def test_exit_basis_falls_back_to_live_without_clips(env):
     reported = executor._exit_basis_for_msg(positions.get(pos_id))
     live = executor._close_basis_bps("BTCUSDT")
     assert float(reported) == pytest.approx(float(live))
+
+
+async def test_exit_completes_with_sub_minimum_notional_dust(env):
+    """STONK #169: perp fully closed, 4 coins of spot (~$0.75) left against a
+    $5 minimum. Several whole lots, so the old lot-size-only dust test called
+    it 'exit incomplete' and wedged the position in EXITING forever."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+    # Close the perp entirely and all but a sliver of the spot.
+    pos = positions.get(pos_id)
+    positions.record_fill(pos_id, "aster", "exit", "BUY",
+                          pos.perp_qty, Decimal("100.0"), Decimal(0))
+    positions.record_fill(pos_id, "mexc", "exit", "SELL",
+                          pos.spot_qty - Decimal("0.02"), Decimal("99.9"), Decimal(0))
+    left = positions.get(pos_id)
+    assert left.perp_qty == 0
+    assert left.spot_qty == Decimal("0.02")          # 0.02 * ~100 = $2 < $5 min
+
+    await executor._finalize_close(pos_id)
+
+    assert positions.get(pos_id).state == pm.CLOSED
+    assert not any("exit incomplete" in m for m in notifier.messages)
+    assert positions.get(pos_id).realized_pnl_usd is not None   # P&L booked
+
+
+async def test_exit_still_incomplete_for_a_tradeable_residual(env):
+    """A residual that CAN be sold must still block the close — this guard only
+    writes off what no order could ever trade."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+    pos = positions.get(pos_id)
+    positions.record_fill(pos_id, "aster", "exit", "BUY",
+                          pos.perp_qty, Decimal("100.0"), Decimal(0))
+    # Leave 1.0 coin ~ $100: well above the $5 minimum, genuinely sellable.
+    positions.record_fill(pos_id, "mexc", "exit", "SELL",
+                          pos.spot_qty - Decimal("1.0"), Decimal("99.9"), Decimal(0))
+
+    await executor._finalize_close(pos_id)
+
+    assert positions.get(pos_id).state != pm.CLOSED
+    assert any("exit incomplete" in m for m in notifier.messages)
+
+
+def test_is_dust_uses_min_notional_not_just_lot_size():
+    from exchange_client import SymbolInfo
+    inf = SymbolInfo(symbol="X", base_asset="X", quote_asset="USDT",
+                     tick_size=Decimal("0.0001"), step_size=Decimal("1"),
+                     min_notional=Decimal("5"))
+    # 4 whole lots, but only $0.75 -> untradeable (the STONK case)
+    assert Executor._is_dust(inf, Decimal(4), Decimal("0.1867")) is True
+    # same 4 lots at a price that clears the minimum -> genuinely sellable
+    assert Executor._is_dust(inf, Decimal(4), Decimal("10")) is False
+    assert Executor._is_dust(inf, Decimal(0), Decimal("10")) is True
+    # unknown price: don't write off what we can't value
+    assert Executor._is_dust(inf, Decimal(4), Decimal(0)) is False
