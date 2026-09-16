@@ -79,6 +79,7 @@ def engine(tmp_path, monkeypatch):
     eng._position_risk = {}
     eng._liq_alerted = {}
     eng._stops_qty = {}
+    eng._auto_stops_attempt = {}
     eng._stops_orders = {}
     eng._stop_grace = {}
     eng._hedge_break = {}
@@ -766,7 +767,7 @@ async def test_stops_auto_refresh_on_size_up(engine):
     engine.positions.record_fill(pid, "aster", "entry", "SELL", Decimal(5), Decimal(100), Decimal(0))
     engine.positions.record_fill(pid, "mexc", "entry", "BUY", Decimal(5), Decimal(100), Decimal(0))
 
-    await engine._check_stops_resize(engine.positions.get(pid))
+    await engine._ensure_stops(engine.positions.get(pid))
     assert engine._stops_qty[pid] == Decimal("14.95")           # tracks new size
     assert len(engine.aster.placed) > before                    # re-placed
     assert engine.aster.placed[-1]["quantity"] == Decimal("14.95")
@@ -782,7 +783,7 @@ async def test_stops_resize_noop_when_size_unchanged(engine):
         "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "150"}
     }
     engine._stops_qty[pid] = Decimal("9.95")                     # matches current
-    await engine._check_stops_resize(engine.positions.get(pid))
+    await engine._ensure_stops(engine.positions.get(pid))
     assert engine.aster.placed == []                            # nothing re-placed
 
 
@@ -1090,3 +1091,89 @@ async def test_exit_dollar_below_one_lot_rejected(engine):
         {"position_id": str(pos_id), "mode": "now", "qty": "$0.01"}
     )
     assert "below one lot" in result
+
+
+def _live_stops_engine(engine):
+    """Engine wired for real stop placement (live mode + stub venue clients)."""
+    engine.paper = False
+    engine.aster = _StopClient()
+    engine.mexc = _StopClient()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "150"}
+    }
+
+
+async def test_stops_auto_placed_when_position_has_none(engine):
+    """A brand-new OPEN position gets stops without the operator running
+    /stops — the 'in case I forget' case."""
+    pid = await _make_live_open(engine)
+    _live_stops_engine(engine)
+    assert pid not in engine._stops_qty              # nothing placed yet
+
+    await engine._ensure_stops(engine.positions.get(pid))
+
+    assert engine._stops_qty[pid] == Decimal("9.95")
+    assert engine.aster.placed and engine.mexc.placed
+    assert any("auto-placed" in m for m in engine.notifier.messages)
+
+
+async def test_stops_rearmed_after_partial_exit_cancelled_them(engine):
+    """/exit cancels stops (the spot LIMIT locks balance the exit needs). Once
+    the part-reduce finishes and the position is OPEN again at a smaller size,
+    stops must be re-armed automatically."""
+    pid = await _make_live_open(engine)
+    _live_stops_engine(engine)
+    await engine._place_stops(engine.positions.get(pid))
+    assert engine._stops_qty[pid] == Decimal("9.95")
+
+    # Partial exit: stops cancelled + untracked, then the position shrinks and
+    # returns to OPEN (what _complete_exit leaves behind).
+    await engine._cancel_stops_for(engine.positions.get(pid))
+    assert pid not in engine._stops_qty
+    engine.positions.record_fill(pid, "aster", "exit", "BUY", Decimal(4), Decimal(100), Decimal(0))
+    engine.positions.record_fill(pid, "mexc", "exit", "SELL", Decimal(4), Decimal(100), Decimal(0))
+    engine._auto_stops_attempt.clear()
+
+    await engine._ensure_stops(engine.positions.get(pid))
+
+    assert engine._stops_qty[pid] == Decimal("5.95")          # re-armed at new size
+    assert engine.aster.placed[-1]["quantity"] == Decimal("5.95")
+    assert any("auto-placed" in m for m in engine.notifier.messages)
+
+
+async def test_auto_stops_can_be_disabled(engine, monkeypatch):
+    monkeypatch.setattr(config, "AUTO_STOPS", False)
+    pid = await _make_live_open(engine)
+    _live_stops_engine(engine)
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert pid not in engine._stops_qty
+    assert engine.aster.placed == []
+
+
+async def test_auto_stops_skipped_while_task_working(engine):
+    """An entry/add/exit in flight means the size is still changing — don't
+    place stops against a moving target."""
+    pid = await _make_live_open(engine)
+    _live_stops_engine(engine)
+    engine.executor.has_task = lambda _pid: True
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert pid not in engine._stops_qty
+    assert engine.aster.placed == []
+
+
+async def test_auto_stops_retry_is_throttled(engine):
+    """A failing placement (no liq price) must not retry — or alert — every
+    sweep."""
+    pid = await _make_live_open(engine)
+    _live_stops_engine(engine)
+    engine._position_risk = {}                       # no liq price -> fails
+
+    async def _no_risk():
+        return []
+    engine.aster.position_risk = _no_risk
+
+    await engine._ensure_stops(engine.positions.get(pid))
+    first = len(engine.notifier.messages)
+    await engine._ensure_stops(engine.positions.get(pid))   # immediate retry
+    assert len(engine.notifier.messages) == first           # throttled
+    assert pid not in engine._stops_qty

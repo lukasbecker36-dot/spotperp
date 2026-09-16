@@ -93,6 +93,17 @@ LIQ_ALERT_THROTTLE_SECONDS = float(os.environ.get("LIQ_ALERT_THROTTLE_SECONDS", 
 # reduce-only buy STOP_MARKET on Aster (triggers on the mark, closing the short
 # before liquidation) and a resting sell LIMIT on MEXC at the same level.
 STOP_LIQ_BUFFER_PCT = Decimal(os.environ.get("STOP_LIQ_BUFFER_PCT", "1"))
+# Automatically keep /stops in place on a live OPEN position: place them when
+# it has none (a brand-new position, or one whose stops were cancelled to run a
+# partial exit and never re-armed) and re-place them whenever its size changes
+# (a /enter size-up or a completed part-reduce). Without this, protection
+# depends on remembering to run /stops by hand. Set AUTO_STOPS=0 to disable.
+AUTO_STOPS = os.environ.get("AUTO_STOPS", "1").strip().lower() not in (
+    "0", "false", "no", "off", ""
+)
+# Don't retry a failed auto-placement more often than this (a fresh position
+# may have no liquidation price yet; retrying every sweep would spam alerts).
+AUTO_STOPS_RETRY_SECONDS = float(os.environ.get("AUTO_STOPS_RETRY_SECONDS", "300"))
 
 # ── Hedge-integrity guard (ADL protection) ──
 # The venue can close/reduce the perp leg WITHOUT any order of ours: auto-

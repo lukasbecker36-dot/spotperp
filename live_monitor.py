@@ -100,6 +100,8 @@ class Engine:
         # loop can auto-refresh them after a resize. In-memory: lost on restart
         # (stops themselves survive; re-run /stops to re-arm auto-refresh).
         self._stops_qty: dict[int, Decimal] = {}
+        # Last auto-stop placement attempt per position (throttles retries).
+        self._auto_stops_attempt: dict[int, float] = {}
         # Venue order ids of each position's /stops legs, so the hedge guard can
         # recognise its OWN stop firing (query the real fill) vs an ADL.
         self._stops_orders: dict[int, dict] = {}
@@ -832,24 +834,53 @@ class Engine:
             self.positions.get(pos.id), floor
         )
 
-    async def _check_stops_resize(self, pos: pm.Position) -> None:
-        """Re-place a position's /stops if its size changed since they were set
-        (e.g. a /enter size-up), so the added portion isn't left unprotected."""
-        if self.paper or pos.id not in self._stops_qty:
+    async def _ensure_stops(self, pos: pm.Position) -> None:
+        """Keep liquidation-protection orders in place for a live OPEN position.
+
+        Idempotent, runs every safety sweep, and covers three cases:
+          - no stops at all (a brand-new position, or one whose stops were
+            cancelled to free the spot balance for a partial exit and never
+            re-armed) -> place them;
+          - size changed (a /enter size-up, or a completed part-reduce)
+            -> re-place at the current size;
+          - already correct -> no-op.
+
+        Skipped while an entry/exit task is working (size still in flux) and
+        while the stop-fire / ADL handlers own the position, so it never places
+        a spot sell LIMIT that would lock balance those paths need."""
+        if self.paper or not config.AUTO_STOPS:
+            return
+        if pos.state != pm.OPEN or pos.perp_qty <= 0 or pos.spot_qty <= 0:
+            return
+        if self.executor.has_task(pos.id):
+            return
+        if pos.id in self._stop_grace or pos.id in self._hedge_break:
             return
         pair = self.md.pair_maps.get(pos.symbol)
         info = self.md.aster_info.get(pair.aster_symbol) if pair else None
         if info is None:
             return
         current = info.round_qty(pos.perp_qty)
-        if current == self._stops_qty[pos.id]:
+        prior = self._stops_qty.get(pos.id)
+        if prior == current:
             return
-        prior = self._stops_qty[pos.id]
-        await self._place_stops(pos)   # updates self._stops_qty to `current`
-        await self.notifier.alert(
-            f"🔁 position {pos.id} {pos.symbol}: size changed {prior} -> {current}"
-            f" — /stops auto-refreshed to cover the new size"
-        )
+        # _place_stops can fail without recording (no liquidation price yet on a
+        # just-opened position, venue error). Throttle so a persistent failure
+        # doesn't retry — and alert — every sweep.
+        now = time.monotonic()
+        if now - self._auto_stops_attempt.get(pos.id, 0.0) < config.AUTO_STOPS_RETRY_SECONDS:
+            return
+        self._auto_stops_attempt[pos.id] = now
+        result = await self._place_stops(pos)   # updates self._stops_qty
+        if prior is None:
+            await self.notifier.alert(
+                f"🛡 position {pos.id} {pos.symbol}: stops auto-placed\n{result}"
+            )
+        else:
+            await self.notifier.alert(
+                f"🔁 position {pos.id} {pos.symbol}: size changed {prior} -> {current}"
+                f" — /stops auto-refreshed to cover the new size\n{result}"
+            )
 
     async def _check_liquidation(self, pos: pm.Position) -> None:
         """Alert (throttled) when a live perp short's mark is within
@@ -1665,7 +1696,7 @@ class Engine:
                             if await self._check_hedge_integrity(pos):
                                 continue   # guard took over; skip basis checks
                             await self._check_safety(pos)
-                            await self._check_stops_resize(pos)
+                            await self._ensure_stops(pos)
                         elif pos.state == pm.EXITING and pos.id in self._auto_passive:
                             await self._check_auto_passive(pos)
                     except Exception:
@@ -1674,6 +1705,8 @@ class Engine:
                 # cancelled). Intersecting with active_ids — NOT a "seen this sweep"
                 # set — keeps ids that _check_safety just added this same sweep.
                 self._auto_passive &= active_ids
+                for gone in set(self._auto_stops_attempt) - active_ids:
+                    self._auto_stops_attempt.pop(gone, None)
             except Exception:
                 log.exception("safety loop error")
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS * 5)
