@@ -257,3 +257,63 @@ def test_write_snapshot_carries_diff_rows(tmp_path, monkeypatch):
     assert [r["symbol"] for r in snap["rows"]] == ["AAA"]
     assert [r["symbol"] for r in snap["diff_rows"]] == ["BBB"]
     assert snap["diff_rows"][0]["entry_bps_avg_24h"] == -50.0
+
+
+def _swing_row(symbol, entry, lo, hi, fund=1.0, hours=24.0, depth=1000.0):
+    r = _row(symbol, entry, (lo + hi) / 2, hours=hours, depth=depth)
+    r.basis_p10_24h = lo
+    r.basis_p90_24h = hi
+    r.funding_8h_bps = fund
+    return r
+
+
+def test_swing_ranks_by_round_trip_from_here(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_SWING_EXIT_BPS", 5.0)
+    monkeypatch.setattr(config, "SCREEN_SWING_MIN_FUNDING_BPS", 0.0)
+    rows = [
+        _swing_row("SMALL", 40.0, 0.0, 45.0),      # capt +40
+        _swing_row("STONK", 150.0, -50.0, 160.0),  # capt +200
+    ]
+    assert [r.symbol for r in screener.rank_rows_by_swing(rows)] == ["STONK", "SMALL"]
+
+
+def test_swing_excludes_permanently_rich_pairs(monkeypatch):
+    """A pair pinned at +80..+120 has a range but never becomes closeable —
+    that's carry, not a round trip."""
+    monkeypatch.setattr(config, "SCREEN_SWING_EXIT_BPS", 5.0)
+    monkeypatch.setattr(config, "SCREEN_SWING_MIN_FUNDING_BPS", 0.0)
+    rows = [
+        _swing_row("PINNEDRICH", 120.0, 80.0, 125.0),   # low never reaches 5
+        _swing_row("ROUNDTRIP", 60.0, 1.0, 65.0),
+    ]
+    assert [r.symbol for r in screener.rank_rows_by_swing(rows)] == ["ROUNDTRIP"]
+
+
+def test_swing_excludes_negative_funding(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_SWING_EXIT_BPS", 5.0)
+    monkeypatch.setattr(config, "SCREEN_SWING_MIN_FUNDING_BPS", 0.0)
+    rows = [
+        _swing_row("PAYSYOU", 60.0, 1.0, 65.0, fund=2.0),
+        _swing_row("COSTSYOU", 90.0, 1.0, 95.0, fund=-3.0),   # bigger capt, but pays
+    ]
+    assert [r.symbol for r in screener.rank_rows_by_swing(rows)] == ["PAYSYOU"]
+
+
+def test_hourly_means_average_out_intra_hour_flicker():
+    """The BULLA failure mode: a quote swinging +-160bps WITHIN each hour must
+    not look like a swing, because each hourly mean lands near the centre."""
+    import time as _time
+    now = int(_time.time() * 1000)
+    flicker = screener.DailyBasis()
+    swinger = screener.DailyBasis()
+    for h in range(24):
+        ts = now - h * 3_600_000
+        # flicker: violent within the hour, but centred on 0 every hour
+        for k, v in enumerate((-160.0, 160.0, -160.0, 160.0)):
+            flicker.add("FLICKER", ts + k * 60_000, v)
+        # swinger: calm within the hour, but the LEVEL walks across the day
+        swinger.add("SWING", ts, float(h) * 10.0)
+    f_lo, f_hi = flicker.percentiles("FLICKER")
+    s_lo, s_hi = swinger.percentiles("SWING")
+    assert abs(f_hi - f_lo) < 5.0       # noise averages out -> tiny range
+    assert (s_hi - s_lo) > 100.0        # real day-scale swing -> wide range

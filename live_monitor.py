@@ -421,7 +421,9 @@ class Engine:
                 self._basis_24h.annotate(row)
                 rows.append(row)
         screener.write_snapshot(
-            screener.rank_rows(rows), screener.rank_rows_by_dislocation(rows)
+            screener.rank_rows(rows),
+            screener.rank_rows_by_dislocation(rows),
+            screener.rank_rows_by_swing(rows),
         )
         self._log_basis_rows(rows)
 

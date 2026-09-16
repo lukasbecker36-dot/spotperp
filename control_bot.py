@@ -37,6 +37,7 @@ COMMAND_WAIT_SECONDS = 10
 HELP = """Commands:
 /screen [n] — top basis opportunities
 /screen diff [n] — pairs furthest ABOVE their own 24h avg basis (reversion candidates)
+/screen swing [n] — pairs that go wide then return to closeable (round-trip candidates)
 /funding [n] — top funding carry (24h avg, 8h-equiv)
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
@@ -69,7 +70,7 @@ HELP = """Commands:
 # mode/service. Telegram limits: name 1-32 chars [a-z0-9_], description 1-256.
 BOT_COMMANDS = [
     # monitoring
-    {"command": "screen", "description": "Top basis opportunities; 'diff' = vs 24h avg"},
+    {"command": "screen", "description": "Basis opportunities; 'diff' vs 24h avg, 'swing' round-trip"},
     {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
     {"command": "positions", "description": "Open positions, P&L + liq proximity"},
     {"command": "recon", "description": "Live venue P&L, funding rate + liq"},
@@ -283,6 +284,8 @@ class ControlBot:
     def _cmd_screen(self, args: list[str]) -> str:
         if args and args[0].lower() in ("diff", "d"):
             return self._cmd_screen_diff(args[1:])
+        if args and args[0].lower() in ("swing", "s"):
+            return self._cmd_screen_swing(args[1:])
         n = int(args[0]) if args else 10
         snap = screener.read_snapshot()
         age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
@@ -383,6 +386,55 @@ class ControlBot:
             " long spot profits if it reverts. Reversion is a HYPOTHESIS — the"
             " divergence backtest found this hard to capture net of spreads, so"
             " check /book depth and the exit basis before entering."
+        )
+        return "\n".join(lines)
+
+
+    def _cmd_screen_swing(self, args: list[str]) -> str:
+        """Pairs that go WIDE and then come back — the round-trip profile.
+
+        /screen ranks by absolute edge and /screen diff by distance from the
+        mean; neither asks whether a pair ever becomes closeable. This ranks by
+        (entry now - the pair's own 24h low), and only lists pairs whose low
+        actually reaches an exitable level with funding paying you to wait.
+        """
+        n = int(args[0]) if args else 10
+        snap = screener.read_snapshot()
+        age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
+        rows = (snap.get("swing_rows") or [])[:n]
+        if not rows:
+            return (
+                "no swing candidates — needs"
+                f" {config.SCREEN_DIFF_MIN_HOURS:.0f}h of basis history, a 24h low"
+                f" reaching {config.SCREEN_SWING_EXIT_BPS:.0f}bps or below, and"
+                " non-negative funding. If you just deployed, give it a slow scan."
+            )
+        hdr = (f"{'symbol':<13}{'entry':>7}{'lo24':>7}{'hi24':>7}{'capt':>7}"
+               f"{'fund':>6}{'dep$':>7}")
+        sep = "-" * len(hdr)
+        lines = [f"swing screen ({age_s:.0f}s old)", hdr, sep]
+        for r in rows:
+            entry_avg = r.get("entry_bps_avg", r["entry_bps"])
+            lo = r.get("basis_p10_24h", entry_avg)
+            hi = r.get("basis_p90_24h", entry_avg)
+            lines.append(
+                f"{r['symbol'][:12]:<13}{entry_avg:>7.1f}{lo:>7.1f}{hi:>7.1f}"
+                f"{entry_avg - lo:>+7.1f}{r['funding_8h_bps']:>6.2f}"
+                f"{r['max_notional_usd']:>7,.0f}"
+            )
+        lines.append(sep)
+        lines.append(
+            "lo24/hi24 = p10/p90 of HOURLY MEAN basis (intra-hour flicker averages"
+            " out, so this is a real swing not a noisy quote)."
+        )
+        lines.append(
+            f"capt = entry now - lo24: the round trip if it returns to its own low."
+            f" Listed only if lo24 <= {config.SCREEN_SWING_EXIT_BPS:.0f}bps (it"
+            " actually becomes closeable) and funding >= 0 (paid to wait)."
+        )
+        lines.append(
+            "Past oscillation is not a promise it repeats — check /book depth and"
+            " the exit basis before entering."
         )
         return "\n".join(lines)
 

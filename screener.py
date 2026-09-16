@@ -85,6 +85,11 @@ class ScreenerRow:
     # always trades rich (entry_bps ~ this -> no convergence to capture).
     entry_bps_avg_24h: float = 0.0
     hours_24h: float = 0.0    # hours of history behind that mean
+    # Robust 24h range of the HOURLY MEAN basis (p10/p90). A pair that swings
+    # wide and then reaches flat/negative is round-trippable; one whose quote
+    # only flickers has a tight range because the noise averages out per hour.
+    basis_p10_24h: float = 0.0
+    basis_p90_24h: float = 0.0
 
 
 class RollingBasis:
@@ -214,14 +219,45 @@ def rank_rows_by_dislocation(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     return eligible[: config.SCREENER_TOP_N]
 
 
+def rank_rows_by_swing(rows: list[ScreenerRow]) -> list[ScreenerRow]:
+    """Rank by the round trip available from here: entry basis now minus the
+    pair's own 24h LOW (p10 of hourly means).
+
+    This is the STONK profile — a basis that goes wide, pays funding while you
+    hold, then returns to flat/negative so the position can actually be closed
+    at a profit. Two filters make it a round trip rather than wishful thinking:
+
+      - the 24h low must actually REACH SCREEN_SWING_EXIT_BPS. A pair pinned at
+        +80..+120 has a 40bps range but never becomes closeable, so it is carry,
+        not a swing.
+      - funding must be >= SCREEN_SWING_MIN_FUNDING_BPS, so waiting is paid for.
+
+    Because the range is built from hourly MEANS, a pair whose quote merely
+    flickers intra-hour scores near zero — the noise averages out.
+    """
+    eligible = [
+        r
+        for r in rows
+        if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
+        and r.hours_24h >= config.SCREEN_DIFF_MIN_HOURS
+        and r.basis_p10_24h <= config.SCREEN_SWING_EXIT_BPS
+        and r.funding_8h_bps >= config.SCREEN_SWING_MIN_FUNDING_BPS
+    ]
+    eligible.sort(key=lambda r: r.entry_bps_avg - r.basis_p10_24h, reverse=True)
+    return eligible[: config.SCREENER_TOP_N]
+
+
 def write_snapshot(
-    rows: list[ScreenerRow], diff_rows: list[ScreenerRow] | None = None
+    rows: list[ScreenerRow],
+    diff_rows: list[ScreenerRow] | None = None,
+    swing_rows: list[ScreenerRow] | None = None,
 ) -> None:
     config.SCREENER_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "ts_ms": int(time.time() * 1000),
         "rows": [asdict(r) for r in rows],
         "diff_rows": [asdict(r) for r in (diff_rows or [])],
+        "swing_rows": [asdict(r) for r in (swing_rows or [])],
     }
     tmp = config.SCREENER_SNAPSHOT_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=1))
@@ -233,6 +269,19 @@ def read_snapshot() -> dict:
         return json.loads(config.SCREENER_SNAPSHOT_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {"ts_ms": 0, "rows": []}
+
+
+def _percentile(values: list[float], p: float) -> float:
+    """Linear-interpolated percentile of a small unsorted list."""
+    s = sorted(values)
+    if not s:
+        return 0.0
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * (p / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
 class DailyBasis:
@@ -276,12 +325,36 @@ class DailyBasis:
             return None, 0.0
         return sum(v[0] for v in b.values()) / n, float(len(b))
 
+    def hourly_means(self, symbol: str) -> list[float]:
+        """Mean entry basis for each hour held. Averaging within the hour is
+        what makes the range usable: a pair whose quote merely FLICKERS (BULLA
+        printed +-160bps inside a minute) collapses to near-identical hourly
+        means, while a pair that genuinely swings over a day keeps a wide
+        spread. So a range built from these is a real oscillation, not noise."""
+        b = self._buckets.get(symbol)
+        if not b:
+            return []
+        return [v[0] / v[1] for v in b.values() if v[1] > 0]
+
+    def percentiles(
+        self, symbol: str, lo: float = 10.0, hi: float = 90.0
+    ) -> tuple[float | None, float | None]:
+        """(lo, hi) percentile of the hourly means — a robust 24h range. Uses
+        percentiles rather than min/max so one odd hour can't define it."""
+        means = self.hourly_means(symbol)
+        if not means:
+            return None, None
+        return _percentile(means, lo), _percentile(means, hi)
+
     def annotate(self, row: "ScreenerRow | None") -> "ScreenerRow | None":
         if row is None:
             return None
         mean, hours = self.stats(row.symbol)
         row.entry_bps_avg_24h = row.entry_bps if mean is None else mean
         row.hours_24h = hours
+        lo, hi = self.percentiles(row.symbol)
+        row.basis_p10_24h = row.entry_bps if lo is None else lo
+        row.basis_p90_24h = row.entry_bps if hi is None else hi
         return row
 
 

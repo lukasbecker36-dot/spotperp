@@ -50,6 +50,16 @@ SCREEN_AVG_WINDOW_SECONDS = float(os.environ.get("SCREEN_AVG_WINDOW_SECONDS", "3
 # pair sits ABOVE its own recent norm. Require at least this many hours of 24h
 # history before a pair qualifies, or a thin window makes the gap meaningless.
 SCREEN_DIFF_MIN_HOURS = float(os.environ.get("SCREEN_DIFF_MIN_HOURS", "6"))
+# /screen swing looks for the STONK profile: a basis that goes WIDE, pays
+# funding while you wait, then comes back to flat/negative so the position can
+# actually be closed at a profit. A pair only qualifies if its 24h low (p10 of
+# hourly means) actually reaches this level — otherwise it is permanently rich
+# and there is no round trip, just carry. Funding must also be non-negative, so
+# holding is paid rather than paid for.
+SCREEN_SWING_EXIT_BPS = float(os.environ.get("SCREEN_SWING_EXIT_BPS", "5"))
+SCREEN_SWING_MIN_FUNDING_BPS = float(
+    os.environ.get("SCREEN_SWING_MIN_FUNDING_BPS", "0")
+)
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis
