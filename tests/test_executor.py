@@ -634,3 +634,20 @@ async def test_aggressive_exit_closes_immediately(env):
     await wait_for_state(positions, pos_id, pm.CLOSED)
     final = positions.get(pos_id)
     assert final.perp_qty == 0 and final.spot_qty == 0
+
+
+def test_executed_basis_bps_applies_multiplier():
+    """For a 1000PEPE-style contract the perp price is ~mult x the spot price,
+    so the basis must divide perp by qty_multiplier. Without it the number is
+    off by ~(mult-1)*1e4 bps (the source of nonsensical exit-basis readings)."""
+    from decimal import Decimal
+    from executor import Executor
+    # perp 10.05 per 1000-coin contract, spot 0.01 per coin, mult 1000
+    # true basis = (10.05/1000 - 0.01)/0.01 = +50 bps
+    b = Executor._executed_basis_bps(Decimal("10.05"), Decimal("0.01"), Decimal("1000"))
+    assert abs(float(b) - 50.0) < 0.01
+    # mult=1 unchanged
+    b1 = Executor._executed_basis_bps(Decimal("1.2440"), Decimal("1.2451"))
+    assert -9.0 < float(b1) < -8.5
+    # missing avg -> None
+    assert Executor._executed_basis_bps(None, Decimal("1")) is None

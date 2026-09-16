@@ -623,14 +623,30 @@ class Executor:
 
     @staticmethod
     def _executed_basis_bps(
-        perp_avg: Decimal | None, spot_avg: Decimal | None
+        perp_avg: Decimal | None, spot_avg: Decimal | None,
+        mult: Decimal = Decimal(1),
     ) -> Decimal | None:
         """Realised basis from the exit-fill VWAPs (perp buy-back vs spot sell):
-        (perp - spot) / spot in bps. Cumulative over the position's exit fills,
-        so on a first partial it is exactly this run's basis."""
+        (perp/mult - spot) / spot in bps. NOTE: this ratios two averages taken
+        at DIFFERENT times across the exit — on a moving price (or when thin
+        spot bids delay the spot leg) it can read far from the real per-clip
+        basis. Prefer _exit_basis_for_msg (live, same-instant) for user output;
+        this stays as a books-unavailable fallback."""
         if perp_avg is None or spot_avg is None or spot_avg == 0:
             return None
-        return (perp_avg - spot_avg) / spot_avg * BPS
+        return (perp_avg / mult - spot_avg) / spot_avg * BPS
+
+    def _exit_basis_for_msg(self, pos: pm.Position) -> Decimal | None:
+        """Basis to report for a completed exit. Prefer the live, same-instant
+        close basis (perp bid vs spot bid right now) — it matches the per-clip
+        pings and cannot be distorted by the perp and spot legs filling at
+        different times. Fall back to the (multiplier-correct) exit VWAP ratio
+        only when the book is unavailable."""
+        live = self._close_basis_bps(pos.symbol)
+        if live is not None:
+            return live
+        mult = self._pair(pos.symbol).qty_multiplier
+        return self._executed_basis_bps(pos.perp_exit_avg, pos.spot_exit_avg, mult)
 
     def _fee_usd(self, venue: str, maker: bool, qty: Decimal, price: Decimal) -> Decimal:
         if venue == "aster":
@@ -1463,7 +1479,7 @@ class Executor:
         if floor_perp > 0 and (pos.perp_qty > 0 or pos.spot_qty > 0):
             self._positions.set_exit_request(position_id, None, None, None)
             self._positions.set_state(position_id, pm.OPEN, "partial exit complete")
-            xb = self._executed_basis_bps(pos.perp_exit_avg, pos.spot_exit_avg)
+            xb = self._exit_basis_for_msg(pos)
             xb_txt = f" @ {float(xb):+.1f}bps" if xb is not None else ""
             journal(
                 self._conn,
@@ -1510,10 +1526,12 @@ class Executor:
         pnl = self._positions.finalize_pnl(position_id)
         pos = self._positions.get(position_id)  # refresh funding after accrual
         self._positions.set_state(position_id, pm.CLOSED)
-        # Executed entry basis (locked at the fills, stored at OPEN) vs executed
-        # exit basis, so the P&L is legible: a name whose /screen quote looked
-        # rich but whose real entry basis was thin shows the true capture here.
-        xb = self._executed_basis_bps(pos.perp_exit_avg, pos.spot_exit_avg)
+        # Executed entry basis (locked at the fills, stored at OPEN) vs the live
+        # close basis at close time, so the P&L is legible: a name whose /screen
+        # quote looked rich but whose real entry basis was thin shows the true
+        # capture. The live close basis is same-instant (unlike the exit VWAP
+        # ratio, which desyncs across a moving price).
+        xb = self._exit_basis_for_msg(pos)
         eb = pos.entry_basis_bps
         if eb is not None and xb is not None:
             basis_txt = (f" basis {float(eb):+.1f}->{float(xb):+.1f}bps"
