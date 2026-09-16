@@ -13,7 +13,10 @@ passive exit target, minus fees on every leg and a slippage haircut.
 """
 from __future__ import annotations
 
+import csv
+import gzip
 import json
+import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, asdict
@@ -21,6 +24,8 @@ from decimal import Decimal
 
 import config
 from exchange_client import BookTicker
+
+log = logging.getLogger(__name__)
 
 BPS = Decimal("10000")
 
@@ -75,6 +80,11 @@ class ScreenerRow:
     net_edge_bps_avg: float = 0.0
     samples: int = 0          # samples in the window
     window_s: float = 0.0     # span covered by those samples (seconds)
+    # 24h mean of the entry basis (filled by DailyBasis). Tells a DISLOCATION
+    # (entry_bps >> this -> likely to revert) apart from a pair that simply
+    # always trades rich (entry_bps ~ this -> no convergence to capture).
+    entry_bps_avg_24h: float = 0.0
+    hours_24h: float = 0.0    # hours of history behind that mean
 
 
 class RollingBasis:
@@ -194,3 +204,101 @@ def read_snapshot() -> dict:
         return json.loads(config.SCREENER_SNAPSHOT_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {"ts_ms": 0, "rows": []}
+
+
+class DailyBasis:
+    """24h rolling mean of the entry basis, kept in hourly buckets.
+
+    Storing every sample would be ~2M tuples across the universe (one per slow
+    scan per symbol); bucketing to (sum, count) per hour is 24 numbers per
+    symbol instead. Purpose: tell an ELEVATED basis apart from a pair's normal
+    level. A pair that always trades +50bps offers no convergence to capture —
+    only a basis well above its own 24h mean is a dislocation likely to revert.
+    """
+
+    def __init__(self, hours: int = 24):
+        self._hours = hours
+        # symbol -> {hour_epoch: [sum_bps, count]}
+        self._buckets: dict[str, dict[int, list]] = defaultdict(dict)
+
+    def add(self, symbol: str, ts_ms: int, entry_bps: float) -> None:
+        hour = int(ts_ms) // 3_600_000
+        b = self._buckets[symbol]
+        slot = b.get(hour)
+        if slot is None:
+            b[hour] = [float(entry_bps), 1]
+        else:
+            slot[0] += float(entry_bps)
+            slot[1] += 1
+        # Prune relative to the NEWEST hour held, not the one just added: the
+        # log seed replays historical rows, so an out-of-order add must never
+        # widen the window past `hours`.
+        cutoff = max(b) - self._hours + 1
+        for stale in [h for h in b if h < cutoff]:
+            del b[stale]
+
+    def stats(self, symbol: str) -> tuple[float | None, float]:
+        """(mean entry bps over the window, hours of history behind it)."""
+        b = self._buckets.get(symbol)
+        if not b:
+            return None, 0.0
+        n = sum(v[1] for v in b.values())
+        if n <= 0:
+            return None, 0.0
+        return sum(v[0] for v in b.values()) / n, float(len(b))
+
+    def annotate(self, row: "ScreenerRow | None") -> "ScreenerRow | None":
+        if row is None:
+            return None
+        mean, hours = self.stats(row.symbol)
+        row.entry_bps_avg_24h = row.entry_bps if mean is None else mean
+        row.hours_24h = hours
+        return row
+
+
+def seed_daily_from_logs(daily: DailyBasis, now_ms: int, hours: int = 24) -> int:
+    """Warm the 24h window from the engine's own basis logs.
+
+    The engine restarts on every /update; without this the '24h average' would
+    be a few minutes of data and useless exactly when it's consulted. Reads only
+    the day files that can overlap the window (gzipped ones included) and only
+    rows inside it. Returns the number of samples seeded.
+    """
+    cutoff = now_ms - hours * 3_600_000
+    paths = []
+    for day_offset in (1, 0):          # yesterday then today (chronological)
+        day = time.strftime(
+            "%Y%m%d", time.gmtime((now_ms - day_offset * 86_400_000) / 1000)
+        )
+        for suffix in (".csv", ".csv.gz"):
+            path = config.OUTPUT_DIR / f"basis_log_{day}{suffix}"
+            if path.exists():
+                paths.append(path)
+    seeded = 0
+    for path in paths:
+        try:
+            opener = gzip.open if path.name.endswith(".gz") else open
+            with opener(path, "rt", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if not header:
+                    continue
+                idx = {name: i for i, name in enumerate(header)}
+                try:
+                    ts_i, sym_i, entry_i = (
+                        idx["ts_ms"], idx["symbol"], idx["entry_bps"],
+                    )
+                except KeyError:
+                    continue
+                for row in reader:
+                    try:
+                        ts = int(row[ts_i])
+                        if ts < cutoff:
+                            continue
+                        daily.add(row[sym_i], ts, float(row[entry_i]))
+                        seeded += 1
+                    except (IndexError, ValueError):
+                        continue   # malformed / partially-written line
+        except OSError:
+            log.warning("could not seed 24h basis from %s", path, exc_info=True)
+    return seeded

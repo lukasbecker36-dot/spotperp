@@ -289,26 +289,39 @@ class ControlBot:
         win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
         # entry/net are the windowed averages; 'now' is the live net edge so a
         # persistent edge (now ~ net) is distinguishable from a one-tick spike.
-        hdr = f"{'symbol':<14}{'entry':>6}{'net':>6}{'now':>6}{'fund':>6}{'depth$':>8}"
+        hdr = (f"{'symbol':<14}{'entry':>6}{'24h':>7}{'net':>6}{'now':>6}"
+               f"{'fund':>6}{'depth$':>8}")
         sep = "-" * len(hdr)
         lines = [
             f"screener ({age_s:.0f}s old, {len(snap['rows'])} pairs, {win_m:.0f}m avg)",
             hdr, sep,
         ]
         max_n = 0
+        max_h = 0.0
         for r in rows:
             sym = r["symbol"][:13]
             entry_avg = r.get("entry_bps_avg", r["entry_bps"])
             net_avg = r.get("net_edge_bps_avg", r["net_edge_bps"])
+            # 24h mean entry basis: entry >> 24h = dislocated (room to revert);
+            # entry ~ 24h = this pair's normal level, so nothing to converge.
+            d24 = r.get("entry_bps_avg_24h")
+            d24_s = f"{d24:>7.1f}" if d24 is not None else f"{'-':>7}"
             max_n = max(max_n, r.get("samples", 0))
+            max_h = max(max_h, r.get("hours_24h", 0.0) or 0.0)
             lines.append(
-                f"{sym:<14}{entry_avg:>6.1f}{net_avg:>6.1f}{r['net_edge_bps']:>6.1f}"
+                f"{sym:<14}{entry_avg:>6.1f}{d24_s}{net_avg:>6.1f}"
+                f"{r['net_edge_bps']:>6.1f}"
                 f"{r['funding_8h_bps']:>6.2f}{r['max_notional_usd']:>8,.0f}"
             )
         lines.append(sep)
         lines.append(
             f"bps: entry/net = {win_m:.0f}m avg (<={max_n} samples), ranked by net;"
             " now = live net edge, fund = 8h rate"
+        )
+        lines.append(
+            f"24h = 24h avg entry basis (<={max_h:.0f}h history)."
+            " entry >> 24h = elevated, likely to revert;"
+            " entry ~ 24h = this pair's normal level, won't converge"
         )
         return "\n".join(lines)
 

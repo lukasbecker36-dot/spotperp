@@ -129,3 +129,72 @@ def test_rolling_basis_window_mean_and_pruning():
     r = rb.annotate(pair_row(10.0, 5.0))
     assert r.samples == 1             # only the newest remains
     assert r.net_edge_bps_avg == pytest.approx(5.0)
+
+
+def _daily_now_ms():
+    import time
+    return int(time.time() * 1000)
+
+
+def test_daily_basis_means_over_window():
+    d = screener.DailyBasis()
+    now = _daily_now_ms()
+    for h in range(24):
+        d.add("AAAUSDT", now - h * 3_600_000, 10.0)
+    mean, hours = d.stats("AAAUSDT")
+    assert mean == pytest.approx(10.0)
+    assert hours == 24
+
+
+def test_daily_basis_prunes_beyond_window_out_of_order():
+    """The log seed replays historical rows, so an out-of-order (older) add
+    must not widen the window past 24h."""
+    d = screener.DailyBasis()
+    now = _daily_now_ms()
+    d.add("BBBUSDT", now - 30 * 3_600_000, 999.0)   # ancient, added first
+    for h in range(24):
+        d.add("BBBUSDT", now - h * 3_600_000, 5.0)
+    mean, hours = d.stats("BBBUSDT")
+    assert hours <= 24
+    assert mean == pytest.approx(5.0)               # 999 dropped
+
+
+def test_daily_basis_unknown_symbol_is_none():
+    d = screener.DailyBasis()
+    assert d.stats("NOPEUSDT") == (None, 0.0)
+
+
+def test_daily_basis_annotate_falls_back_to_live():
+    d = screener.DailyBasis()
+    row = screener.ScreenerRow(
+        symbol="ZZZUSDT", entry_bps=42.0, close_bps=0.0, spread_cost_bps=0.0,
+        fees_bps=0.0, funding_8h_bps=0.0, net_edge_bps=0.0,
+        max_notional_usd=0.0, aster_ask="1", mexc_ask="1", ts_ms=0,
+    )
+    d.annotate(row)
+    assert row.entry_bps_avg_24h == 42.0    # no history -> live value
+    assert row.hours_24h == 0.0
+
+
+def test_seed_daily_from_logs_reads_recent_rows(tmp_path, monkeypatch):
+    """Seeding warms the window from the engine's own basis logs so a restart
+    doesn't reset it; rows older than the window are skipped."""
+    import csv as _csv
+    import time as _time
+    monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path)
+    now = _daily_now_ms()
+    day = _time.strftime("%Y%m%d", _time.gmtime(now / 1000))
+    path = tmp_path / f"basis_log_{day}.csv"
+    with open(path, "w", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["ts_ms", "symbol", "entry_bps", "close_bps",
+                    "funding_8h_bps", "max_notional_usd"])
+        w.writerow([now - 2 * 3_600_000, "SEEDUSDT", "20.0", "1", "0", "100"])
+        w.writerow([now - 1 * 3_600_000, "SEEDUSDT", "30.0", "1", "0", "100"])
+        w.writerow([now - 48 * 3_600_000, "SEEDUSDT", "999.0", "1", "0", "100"])  # too old
+
+    d = screener.DailyBasis()
+    seeded = screener.seed_daily_from_logs(d, now)
+    assert seeded == 2                      # the 48h-old row is skipped
+    mean, hours = d.stats("SEEDUSDT")
+    assert mean == pytest.approx(25.0)      # (20 + 30) / 2

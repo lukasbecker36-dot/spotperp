@@ -90,6 +90,9 @@ class Engine:
         self._auto_passive: set[int] = set()
         # Rolling per-symbol basis history for the /screen 5-minute averages.
         self._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+        # 24h mean entry basis per symbol, so /screen can show whether the
+        # current level is elevated or just this pair's normal richness.
+        self._basis_24h = screener.DailyBasis()
         # Aster positionRisk cached by symbol (mark + liquidation price) for the
         # /positions liq readout. Refreshed each slow scan in live mode.
         self._position_risk: dict[str, dict] = {}
@@ -128,6 +131,16 @@ class Engine:
         if not self.paper:
             await self.mexc.sync_time()   # align the signing clock before trading
         await self._load_symbol_maps(initial=True)
+        # Warm the 24h basis window from our own logs: the engine restarts on
+        # every /update, and a reset window would make the figure useless.
+        try:
+            seeded = await asyncio.to_thread(
+                screener.seed_daily_from_logs, self._basis_24h,
+                int(time.time() * 1000),
+            )
+            log.info("seeded 24h basis window with %d samples", seeded)
+        except Exception:
+            log.exception("24h basis seed failed (continuing without history)")
         await recovery.reconcile(
             self.conn, self.positions, self.aster, self.mexc, self.notifier,
             paper=self.paper,
@@ -401,6 +414,8 @@ class Engine:
             if row is not None:
                 self._basis_avg.add(sym, now, row.entry_bps, row.net_edge_bps)
                 self._basis_avg.annotate(row)
+                self._basis_24h.add(sym, now, row.entry_bps)
+                self._basis_24h.annotate(row)
                 rows.append(row)
         screener.write_snapshot(screener.rank_rows(rows))
         self._log_basis_rows(rows)
@@ -459,6 +474,7 @@ class Engine:
                 # sample, so annotate is read-only here for the 5m means.
                 if screen is not None:
                     self._basis_avg.annotate(screen)
+                    self._basis_24h.annotate(screen)
             # Recompute the current rate from the 15s-fresh premiumIndex rather
             # than the 15-min stats sweep, so a new funding settlement shows up
             # promptly. (lastFundingRate only changes at each settlement, so
