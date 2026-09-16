@@ -51,6 +51,7 @@ def set_books(md: MarketData, aster_bid: str, aster_ask: str,
 def engine(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "POLL_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(config, "REPRICE_MIN_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(config, "EXIT_REPRICE_MIN_INTERVAL_SECONDS", 0.0)
     monkeypatch.setattr(config, "MIN_HEDGE_NOTIONAL_USD", Decimal("1"))
     # Convergence tests open a position and check the auto-close in the same
     # instant; default the min-hold off so they behave as before (its own test
@@ -1060,3 +1061,32 @@ async def test_refresh_position_funding_skips_paper_positions(engine):
     await engine._refresh_position_funding()
     assert engine.positions.get(pos.id).funding_usd == Decimal(0)
     assert engine.aster.calls == []
+
+
+async def test_exit_qty_accepts_dollar_notional(engine):
+    """'$500' sizes the partial close from USD notional at the live perp mid
+    (bid 100.4 / ask 100.5 -> mid 100.45), so $500 ~ 4.977 contracts."""
+    pos_id = await open_position(engine)
+    result = await engine._cmd_exit(
+        {"position_id": str(pos_id), "mode": "now", "qty": "$500"}
+    )
+    assert "exit started" in result
+    assert "~$500" in result       # echoed back as notional
+    assert "4.977" in result       # round_qty(500 / 100.45)
+
+
+async def test_exit_qty_bare_number_is_still_coins(engine):
+    """A bare number keeps the old meaning: coins, as shown in /positions."""
+    pos_id = await open_position(engine)
+    result = await engine._cmd_exit(
+        {"position_id": str(pos_id), "mode": "now", "qty": "4"}
+    )
+    assert "size 4 of 9.95" in result
+
+
+async def test_exit_dollar_below_one_lot_rejected(engine):
+    pos_id = await open_position(engine)
+    result = await engine._cmd_exit(
+        {"position_id": str(pos_id), "mode": "now", "qty": "$0.01"}
+    )
+    assert "below one lot" in result

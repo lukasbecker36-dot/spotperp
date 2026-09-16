@@ -147,6 +147,12 @@ COMMAND_POLL_SECONDS = 1.0
 COMMAND_TTL_SECONDS = float(os.environ.get("COMMAND_TTL_SECONDS", "60"))
 ORDER_STATUS_POLL_SECONDS = 2.0
 REPRICE_MIN_INTERVAL_SECONDS = 3.0       # don't cancel/replace faster than this
+# Exits reprice faster than entries: a resting buy-back sized to spot bid
+# depth must be pulled quickly when that depth vanishes, or it can be hit
+# with no spot to hedge against (leg desync). Lower = tighter, more
+# cancel/replace traffic.
+EXIT_REPRICE_MIN_INTERVAL_SECONDS = float(os.environ.get(
+    "EXIT_REPRICE_MIN_INTERVAL_SECONDS", "1.0"))
 PASSIVE_UNREACHABLE_ALERT_SECONDS = 600  # throttle "passive target unreachable" alerts
 # Default basis floor while an entry works: stop resting/repricing when the
 # executable basis decays below cost breakeven (fees + slippage buffer), so a

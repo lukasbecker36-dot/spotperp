@@ -47,8 +47,8 @@ HELP = """Commands:
 /refresh — rebuild the cross-listed coin universe (pick up new listings)
 /enter SYMBOL NOTIONAL [min_bps] [carry] — start maker entry, or size up an already-OPEN position by NOTIONAL (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close)
 /cancel ID|SYMBOL — stop a working entry OR exit, back to OPEN
-/exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins, omit=full
-/exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins, omit=full
+/exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins or $500, omit=full
+/exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins or $500, omit=full
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
 /stops SYMBOL — place liq-protection stop (perp) + sell limit (spot) ~1% below liq price (auto-refreshes on size-up)
 /remove ID|SYMBOL YES — stop tracking a position closed manually on the exchange (DB only)
@@ -577,7 +577,8 @@ class ControlBot:
         if len(args) < 2 or args[1] not in ("now", "passive", "cancel"):
             return ("usage: /exit ID|SYMBOL now [qty] |"
                     " passive [target_bps] [qty] | cancel\n"
-                    "qty = coins to close (as in /positions); omit = full")
+                    "qty = coins to close (as in /positions), or $NOTIONAL"
+                    " e.g. $500; omit = full")
         payload: dict = {"position_id": args[0], "mode": args[1]}
         if args[1] == "now" and len(args) > 2:
             payload["qty"] = args[2]

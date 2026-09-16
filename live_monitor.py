@@ -1086,15 +1086,38 @@ class Engine:
         size_desc = "full"
         qty_arg = args.get("qty")
         if qty_arg is not None:
+            raw = str(qty_arg).strip()
+            # "$500" = USD notional, converted to perp contracts at the live
+            # perp mid. A bare number stays coins/contracts (as in /positions).
+            usd_mode = raw.startswith("$")
             try:
-                q = Decimal(str(qty_arg))
+                q = Decimal(raw[1:].replace(",", "") if usd_mode else raw)
             except (InvalidOperation, ValueError):
                 return f"bad qty: {qty_arg}"
             if q <= 0:
                 return "qty must be > 0"
+            usd = q
+            if usd_mode:
+                pair = self.md.pair_maps.get(pos.symbol)
+                info = self.md.aster_info.get(pair.aster_symbol) if pair else None
+                abook = self.md.aster_books.get(pair.aster_symbol) if pair else None
+                px = (
+                    (abook.bid + abook.ask) / 2
+                    if abook and abook.bid > 0 and abook.ask > 0 else Decimal(0)
+                )
+                if info is None or px <= 0:
+                    return (f"{pos.symbol}: no live perp quote to size ${usd}"
+                            f" — pass a coin quantity instead")
+                q = info.round_qty(usd / px)
+                if q <= 0:
+                    return (f"${usd} is below one lot of {pos.symbol}"
+                            f" (step {info.step_size} @ ~{px}) — increase the size")
             if q < pos.perp_qty:
                 target_qty = pos.perp_qty - q
-                size_desc = f"{q} of {pos.perp_qty}"
+                size_desc = (
+                    f"~${usd:,.0f} ({q}) of {pos.perp_qty}" if usd_mode
+                    else f"{q} of {pos.perp_qty}"
+                )
         self.positions.set_exit_request(pos.id, mode, target_dec, target_qty)
         await self.executor.start_exit(self.positions.get(pos.id))
         desc = "aggressive (taker both legs)" if mode == "now" else (

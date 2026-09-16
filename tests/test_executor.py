@@ -50,6 +50,7 @@ def set_books(md: MarketData, aster_bid: str, aster_ask: str,
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "POLL_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(config, "REPRICE_MIN_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(config, "EXIT_REPRICE_MIN_INTERVAL_SECONDS", 0.0)
     monkeypatch.setattr(config, "MIN_HEDGE_NOTIONAL_USD", Decimal("1"))
     monkeypatch.setattr(config, "ENTRY_TIMEOUT_MINUTES", 1)
     monkeypatch.setattr(config, "EXIT_TIMEOUT_MINUTES", 1)
@@ -679,3 +680,14 @@ async def test_exit_clip_cap_bounds_each_passive_buyback(env, monkeypatch):
     assert len(placed) > 1                               # chunked, not one order
     clip_qty = Decimal("1.0")                            # round_qty(100 / 100.0 bid) = 1.000
     assert all(q <= clip_qty for q in placed)            # no buy-back over the cap
+
+
+def test_passive_exit_uses_faster_reprice_interval():
+    """A resting buy-back is sized to spot bid depth that can vanish, so the
+    exit must be able to pull it faster than an entry reprices."""
+    import inspect
+    import executor as ex
+    src = inspect.getsource(ex.Executor._run_passive_exit)
+    assert "EXIT_REPRICE_MIN_INTERVAL_SECONDS" in src
+    assert (config.EXIT_REPRICE_MIN_INTERVAL_SECONDS
+            <= config.REPRICE_MIN_INTERVAL_SECONDS)

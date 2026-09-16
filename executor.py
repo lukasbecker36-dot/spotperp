@@ -1453,7 +1453,7 @@ class Executor:
                         size_drift = abs(place_qty - open_qty) >= aster_info.step_size
                         can_reprice = (
                             time.monotonic() - last_reprice
-                            >= config.REPRICE_MIN_INTERVAL_SECONDS
+                            >= config.EXIT_REPRICE_MIN_INTERVAL_SECONDS
                         )
                         if (gated or price != order_price or size_drift) and can_reprice:
                             result = await self._trader.cancel_perp_order(
