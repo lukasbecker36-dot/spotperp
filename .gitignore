@@ -11,3 +11,6 @@ data/mode.env
 data/screener_snapshot.json
 data/heartbeat.json
 output/
+
+# Python build artifacts (regenerated on install)
+*.egg-info/
