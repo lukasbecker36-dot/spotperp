@@ -105,6 +105,9 @@ class Engine:
         self._stops_qty: dict[int, Decimal] = {}
         # Last auto-stop placement attempt per position (throttles retries).
         self._auto_stops_attempt: dict[int, float] = {}
+        # Consecutive sweeps the taker-close-is-profitable condition held,
+        # per position: a single flickering quote must not cross both legs.
+        self._tp_confirm: dict[int, int] = {}
         # Venue order ids of each position's /stops legs, so the hedge guard can
         # recognise its OWN stop firing (query the real fill) vs an ADL.
         self._stops_orders: dict[int, dict] = {}
@@ -1729,6 +1732,8 @@ class Engine:
                 self._auto_passive &= active_ids
                 for gone in set(self._auto_stops_attempt) - active_ids:
                     self._auto_stops_attempt.pop(gone, None)
+                for gone in set(self._tp_confirm) - active_ids:
+                    self._tp_confirm.pop(gone, None)
             except Exception:
                 log.exception("safety loop error")
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS * 5)
@@ -1780,7 +1785,19 @@ class Engine:
         if close is not None and close <= config.CONVERGED_PASSIVE_BPS:
             pnl = self._aggressive_close_pnl(pos)
             if pnl is not None and pnl > 0:
-                # Taker-taker close is profitable now — cross and lock it.
+                # Taker-taker close is profitable now — but only cross once the
+                # condition has held for several sweeps, so a flickering quote
+                # can't open a real trade at a fictional price.
+                if not self._tp_confirmed(pos.id):
+                    journal(
+                        self.conn,
+                        f"position {pos.id}: CONVERGED TP confirming"
+                        f" {self._tp_confirm[pos.id]}/"
+                        f"{config.CONVERGED_TP_CONFIRM_TICKS}"
+                        f" basis={close:.1f}bps est_pnl={pnl:.2f}",
+                    )
+                    return
+                self._tp_confirm.pop(pos.id, None)
                 journal(
                     self.conn,
                     f"position {pos.id}: CONVERGED TP basis={close:.1f}bps"
@@ -1796,6 +1813,7 @@ class Engine:
                 return
             # Converged but a taker close isn't worth it yet: work it passively
             # at the convergence target (maker perp buy-back, 0 perp fee).
+            self._tp_confirm.pop(pos.id, None)
             journal(
                 self.conn,
                 f"position {pos.id}: CONVERGED basis={close:.1f}bps -> passive"
@@ -1814,6 +1832,7 @@ class Engine:
             )
             await self.executor.start_exit(self.positions.get(pos.id))
             return
+        self._tp_confirm.pop(pos.id, None)   # still in premium: streak broken
         if pos.opened_ms is not None:
             hold_hours = (time.time() * 1000 - pos.opened_ms) / 3_600_000
             if hold_hours > config.MAX_HOLD_HOURS:
@@ -1837,6 +1856,7 @@ class Engine:
         # OPEN so it keeps collecting funding and max-hold is re-armed.
         if close > config.CONVERGED_PASSIVE_BPS + config.CONVERGED_PASSIVE_RESET_BPS:
             self._auto_passive.discard(pos.id)
+            self._tp_confirm.pop(pos.id, None)
             await self._cancel_exit(pos)
             journal(
                 self.conn,
@@ -1850,6 +1870,9 @@ class Engine:
             return
         pnl = self._aggressive_close_pnl(pos)
         if pnl is not None and pnl > 0:
+            if not self._tp_confirmed(pos.id):
+                return          # same anti-flicker gate as the converged TP
+            self._tp_confirm.pop(pos.id, None)
             self._auto_passive.discard(pos.id)
             journal(
                 self.conn,
@@ -1863,6 +1886,17 @@ class Engine:
             await self._cancel_stops_for(pos)
             self.positions.set_exit_request(pos.id, "now", None)
             await self.executor.start_exit(self.positions.get(pos.id))
+
+    def _tp_confirmed(self, pos_id: int) -> bool:
+        """Count consecutive sweeps where a taker close looked profitable.
+
+        A thin book can print a basis hundreds of bps from where a taker order
+        actually fills, so one tick must never cross both legs for real. Returns
+        True only once the condition has held CONVERGED_TP_CONFIRM_TICKS times.
+        """
+        n = self._tp_confirm.get(pos_id, 0) + 1
+        self._tp_confirm[pos_id] = n
+        return n >= config.CONVERGED_TP_CONFIRM_TICKS
 
     def _aggressive_close_pnl(self, pos: pm.Position) -> Decimal | None:
         """Estimated net PnL of closing taker on both legs right now:

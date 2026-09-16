@@ -79,6 +79,15 @@ CONVERGED_PASSIVE_BPS = Decimal(os.environ.get("CONVERGED_PASSIVE_BPS", "0.0"))
 CONVERGED_PASSIVE_RESET_BPS = Decimal(
     os.environ.get("CONVERGED_PASSIVE_RESET_BPS", "5.0")
 )
+# Consecutive safety sweeps the "taker close is profitable" condition must
+# hold before the engine actually crosses both legs. A thin book can print a
+# basis hundreds of bps away from where a taker order really fills, and a
+# single bad tick would otherwise open a real trade at a fictional price
+# (BULLA #170 fired on a -160bps quote and filled at +27bps, for -$2.07 on an
+# estimated +$0.38). Entries already require confirmation; this matches them.
+CONVERGED_TP_CONFIRM_TICKS = int(
+    os.environ.get("CONVERGED_TP_CONFIRM_TICKS", "3")
+)
 # Don't let the convergence auto-close fire until a position has been held this
 # long. Right after entry the closeable (bid/bid) basis is dominated by the
 # bid-ask SPREAD, not real convergence — on a wide microcap it's already <= 0

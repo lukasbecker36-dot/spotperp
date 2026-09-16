@@ -691,3 +691,39 @@ def test_passive_exit_uses_faster_reprice_interval():
     assert "EXIT_REPRICE_MIN_INTERVAL_SECONDS" in src
     assert (config.EXIT_REPRICE_MIN_INTERVAL_SECONDS
             <= config.REPRICE_MIN_INTERVAL_SECONDS)
+
+
+async def test_exit_basis_prefers_executed_clip_bases(env):
+    """The reported exit basis must come from the bases the clips ACTUALLY
+    filled at — not the completion-instant quote, which lies when the book
+    flickers (BULLA #170 reported -20.5 while the clip filled at +26.8)."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+    live = executor._close_basis_bps("BTCUSDT")
+    assert live is not None
+
+    # Clips actually filled at +26.8bps on $100 of notional.
+    executor._exit_clip_basis[pos_id] = [26.8 * 100.0, 100.0]
+    reported = executor._exit_basis_for_msg(positions.get(pos_id))
+
+    assert float(reported) == pytest.approx(26.8)
+    assert abs(float(reported) - float(live)) > 1.0   # not the live quote
+
+
+async def test_exit_basis_weights_clips_by_notional(env):
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    # $300 at +10bps and $100 at +50bps -> notional-weighted mean = +20bps
+    executor._exit_clip_basis[pos_id] = [10.0 * 300 + 50.0 * 100, 400.0]
+    reported = executor._exit_basis_for_msg(positions.get(pos_id))
+    assert float(reported) == pytest.approx(20.0)
+
+
+async def test_exit_basis_falls_back_to_live_without_clips(env):
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+    reported = executor._exit_basis_for_msg(positions.get(pos_id))
+    live = executor._close_basis_bps("BTCUSDT")
+    assert float(reported) == pytest.approx(float(live))

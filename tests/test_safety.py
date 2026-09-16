@@ -80,6 +80,7 @@ def engine(tmp_path, monkeypatch):
     eng._liq_alerted = {}
     eng._stops_qty = {}
     eng._auto_stops_attempt = {}
+    eng._tp_confirm = {}
     eng._stops_orders = {}
     eng._stop_grace = {}
     eng._hedge_break = {}
@@ -140,10 +141,28 @@ async def test_converged_tp_fires_when_profitable(engine):
     # Taker close: buy perp at 99.1 (entry 100.5), sell spot 99.9 (entry
     # 100.0) -> clearly net positive.
     set_books(engine.md, "99.0", "99.1", "99.9", "100.0")
+    # Needs CONVERGED_TP_CONFIRM_TICKS consecutive sweeps: one flickering quote
+    # must not cross both legs (BULLA #170).
+    for _ in range(config.CONVERGED_TP_CONFIRM_TICKS - 1):
+        await engine._check_safety(engine.positions.get(pos_id))
+        assert engine.positions.get(pos_id).exit_mode is None   # still confirming
     await engine._check_safety(engine.positions.get(pos_id))
     pos = engine.positions.get(pos_id)
     assert pos.exit_mode == "now"
     assert any("taking profit" in m for m in engine.notifier.messages)
+
+
+async def test_converged_tp_not_fired_by_a_single_flicker(engine):
+    """A one-tick inverted quote surrounded by normal ones must NOT cross: the
+    BULLA case fired on a -160bps print and filled at +27bps for a real loss."""
+    pos_id = await open_position(engine)
+    for _ in range(5):
+        set_books(engine.md, "99.0", "99.1", "99.9", "100.0")   # flicker
+        await engine._check_safety(engine.positions.get(pos_id))
+        set_books(engine.md, "100.4", "100.5", "99.9", "100.0")  # back to premium
+        await engine._check_safety(engine.positions.get(pos_id))
+    assert engine.positions.get(pos_id).exit_mode is None
+    assert not any("taking profit" in m for m in engine.notifier.messages)
 
 
 async def test_converged_tp_waits_for_min_hold(engine, monkeypatch):
@@ -162,7 +181,8 @@ async def test_converged_tp_waits_for_min_hold(engine, monkeypatch):
         (int(_time.time() * 1000) - 20 * 60_000, pos_id),
     )
     engine.conn.commit()
-    await engine._check_safety(engine.positions.get(pos_id))
+    for _ in range(config.CONVERGED_TP_CONFIRM_TICKS):
+        await engine._check_safety(engine.positions.get(pos_id))
     assert engine.positions.get(pos_id).exit_mode == "now"
 
 
@@ -227,7 +247,8 @@ async def test_auto_passive_escalates_when_taker_turns_profitable(engine):
     engine._auto_passive.add(pos_id)
     # Tight book, deeply inverted: taker buy-back at 99.1 (entry 100.5) wins.
     set_books(engine.md, "99.0", "99.1", "99.9", "100.0")
-    await engine._check_auto_passive(engine.positions.get(pos_id))
+    for _ in range(config.CONVERGED_TP_CONFIRM_TICKS):
+        await engine._check_auto_passive(engine.positions.get(pos_id))
     pos = engine.positions.get(pos_id)
     assert pos.exit_mode == "now"
     assert pos_id not in engine._auto_passive

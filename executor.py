@@ -414,6 +414,9 @@ class Executor:
         self._conn = conn
         self._paper = paper
         self._tasks: dict[int, asyncio.Task] = {}
+        # position id -> [sum(basis * notional), sum(notional)] for the
+        # exit clips of the CURRENT run; cleared when the run completes.
+        self._exit_clip_basis: dict[int, list[float]] = {}
         self._cancel_requested: set[int] = set()
         self._margin_configured: set[str] = set()  # Aster symbols set to 1x isolated
 
@@ -614,6 +617,15 @@ class Executor:
                  else self._close_basis_bps(symbol))
         b = f"{float(basis):+.1f}bps" if basis is not None else "n/a"
         notional = float(base_qty * price)
+        if phase == "exit" and basis is not None and notional > 0:
+            # Notional-weighted accumulator of the bases the exit ACTUALLY
+            # filled at. The completion message reports this: the exit-VWAP
+            # ratio desyncs when the legs fill at different times, and the
+            # completion-instant quote lies when the book flickers — only the
+            # per-clip bases are what really happened.
+            acc = self._exit_clip_basis.setdefault(position_id, [0.0, 0.0])
+            acc[0] += float(basis) * notional
+            acc[1] += notional
         arrow = "+" if side == "BUY" else "-"
         px = f"{float(price):,.6g}"
         await self._notifier.alert(
@@ -637,11 +649,16 @@ class Executor:
         return (perp_avg / mult - spot_avg) / spot_avg * BPS
 
     def _exit_basis_for_msg(self, pos: pm.Position) -> Decimal | None:
-        """Basis to report for a completed exit. Prefer the live, same-instant
-        close basis (perp bid vs spot bid right now) — it matches the per-clip
-        pings and cannot be distorted by the perp and spot legs filling at
-        different times. Fall back to the (multiplier-correct) exit VWAP ratio
-        only when the book is unavailable."""
+        """Basis to report for a completed exit.
+
+        Prefer the notional-weighted mean of the bases the clips actually
+        filled at — the only measure that survives both failure modes: the
+        exit-VWAP ratio breaks when the legs fill at different times across a
+        moving price, and the completion-instant quote lies when the book
+        flickers. Fall back to the live close basis, then the VWAP ratio."""
+        acc = self._exit_clip_basis.get(pos.id)
+        if acc and acc[1] > 0:
+            return Decimal(str(acc[0] / acc[1]))
         live = self._close_basis_bps(pos.symbol)
         if live is not None:
             return live
@@ -1501,6 +1518,8 @@ class Executor:
                 f"✂️ position {position_id} {pos.symbol}: partial exit done{xb_txt} —"
                 f" {pos.perp_qty} perp / {pos.spot_qty} spot remain (OPEN)"
             )
+            # Next exit run measures its own clips, not this one's.
+            self._exit_clip_basis.pop(position_id, None)
         else:
             await self._finalize_close(position_id)
 
@@ -1557,6 +1576,7 @@ class Executor:
             f"{basis_txt or ' '} realised PnL"
             f" ${float(pnl):.2f} ({'paper' if self._paper else 'LIVE'})"
         )
+        self._exit_clip_basis.pop(position_id, None)
 
     async def _accrue_funding(self, pos: pm.Position) -> None:
         """Funding collected by the short perp leg over the holding period.
