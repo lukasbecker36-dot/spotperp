@@ -307,8 +307,18 @@ class ControlBot:
             net_avg = r.get("net_edge_bps_avg", r["net_edge_bps"])
             # 24h mean entry basis: entry >> 24h = dislocated (room to revert);
             # entry ~ 24h = this pair's normal level, so nothing to converge.
+            # A '?' marks too little history to be a real norm — DailyBasis
+            # falls back to the live basis there, which would otherwise look
+            # like a genuine 24h average (and is why such a pair is absent
+            # from /screen diff).
             d24 = r.get("entry_bps_avg_24h")
-            d24_s = f"{d24:>7.1f}" if d24 is not None else f"{'-':>7}"
+            hrs = r.get("hours_24h", 0.0) or 0.0
+            if d24 is None:
+                d24_s = f"{'-':>7}"
+            elif hrs < config.SCREEN_DIFF_MIN_HOURS:
+                d24_s = f"{f'{d24:.1f}?':>7}"
+            else:
+                d24_s = f"{d24:>7.1f}"
             max_n = max(max_n, r.get("samples", 0))
             max_h = max(max_h, r.get("hours_24h", 0.0) or 0.0)
             lines.append(
@@ -325,6 +335,10 @@ class ControlBot:
             f"24h = 24h avg entry basis (<={max_h:.0f}h history)."
             " entry >> 24h = elevated, likely to revert;"
             " entry ~ 24h = this pair's normal level, won't converge"
+        )
+        lines.append(
+            f"? = under {config.SCREEN_DIFF_MIN_HOURS:.0f}h of history, so that"
+            " figure is the live basis, not a norm — excluded from /screen diff"
         )
         return "\n".join(lines)
 

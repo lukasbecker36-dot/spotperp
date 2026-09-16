@@ -114,3 +114,40 @@ async def test_update_restarts_engine_then_control_detached(shell):
     joined = " ".join(popen_cmd)
     assert "sleep" in joined and control_bot.CONTROL_SERVICE in joined
     assert "restarting" in reply
+
+
+def _screen_snapshot(tmp_path, monkeypatch, rows):
+    import json as _json
+    import time as _time
+    import config as _config
+    p = tmp_path / "snap.json"
+    p.write_text(_json.dumps({"ts_ms": int(_time.time() * 1000),
+                              "rows": rows, "diff_rows": []}))
+    monkeypatch.setattr(_config, "SCREENER_SNAPSHOT_FILE", p)
+
+
+def _srow(symbol, entry, avg24, hours, depth=500.0):
+    return {"symbol": symbol, "entry_bps": entry, "entry_bps_avg": entry,
+            "entry_bps_avg_24h": avg24, "hours_24h": hours,
+            "net_edge_bps": 10.0, "net_edge_bps_avg": 10.0,
+            "funding_8h_bps": 1.0, "max_notional_usd": depth, "samples": 19}
+
+
+def test_screen_marks_thin_24h_history(tmp_path, monkeypatch):
+    """With too little history DailyBasis falls back to the LIVE basis, which
+    would otherwise read as a genuine 24h norm — and silently explains why the
+    pair is absent from /screen diff. It must be marked."""
+    _screen_snapshot(tmp_path, monkeypatch, [
+        _srow("THINUSDT", 62.2, 56.5, hours=2.0),
+        _srow("SEASONEDUSDT", 30.4, 25.4, hours=24.0),
+    ])
+    out = control_bot.ControlBot._cmd_screen(_bot(), [])
+    assert "56.5?" in out            # thin history flagged
+    assert "25.4?" not in out        # real norm unflagged
+    assert "excluded from /screen diff" in out
+
+
+def test_screen_diff_reports_when_no_dislocation_rows(tmp_path, monkeypatch):
+    _screen_snapshot(tmp_path, monkeypatch, [_srow("AAAUSDT", 10.0, 5.0, 24.0)])
+    out = control_bot.ControlBot._cmd_screen(_bot(), ["diff"])
+    assert "no dislocation data yet" in out
