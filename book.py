@@ -46,7 +46,7 @@ def _block(title: str, asks, bids, div: Decimal) -> list[str]:
 
 def format_book(
     symbol: str, mult: Decimal, aster_depth: dict, mexc_depth: dict,
-    levels: int = 5,
+    levels: int = 5, funding: dict | None = None,
 ) -> str:
     a_asks = _levels(aster_depth.get("asks"), levels)
     a_bids = _levels(aster_depth.get("bids"), levels)
@@ -70,11 +70,33 @@ def format_book(
     if a_asks and a_bids and m_asks and m_bids:
         a_ask, a_bid = a_asks[0][0] / mult, a_bids[0][0] / mult
         m_ask, m_bid = m_asks[0][0], m_bids[0][0]
-        entry = (a_ask - m_ask) / m_ask * BPS
-        close = (a_bid - m_bid) / m_bid * BPS
+        # Premium trade: short perp + long spot; exit = buy back perp + sell spot.
+        entry = (a_ask - m_ask) / m_ask * BPS          # short perp ask / buy spot ask
+        exit_passive = (a_bid - m_bid) / m_bid * BPS   # perp maker bid / sell spot bid
+        exit_taker = (a_ask - m_bid) / m_bid * BPS     # perp taker ask / sell spot bid
         lines.append("")
-        lines.append(
-            f"entry basis {float(entry):+.1f}bps  close {float(close):+.1f}bps"
-        )
-        lines.append("entry=short perp ask vs buy spot ask")
+        lines.append(f"entry basis  {float(entry):+7.1f}bps  (short perp ask / buy spot ask)")
+        lines.append(f"exit passive {float(exit_passive):+7.1f}bps  (perp maker bid / sell spot bid)")
+        lines.append(f"exit taker   {float(exit_taker):+7.1f}bps  (perp taker ask / sell spot bid)")
+        lines.append(f"  taker exit crosses the perp spread: {float(exit_taker - exit_passive):.1f}bps worse")
+
+    if funding:
+        cur = funding.get("current_8h_bps")
+        avg = funding.get("avg_24h_8h_bps")
+        nxt = funding.get("next_funding_h")
+        iv = funding.get("interval_hours")
+        lines.append("")
+        parts = []
+        if cur is not None:
+            parts.append(f"now {float(cur):+.1f}")
+        if avg is not None:
+            parts.append(f"24h avg {float(avg):+.1f}")
+        lines.append(f"funding (8h-equiv, bps): {'  '.join(parts) if parts else 'n/a'}")
+        tail = []
+        if iv:
+            tail.append(f"settles every {iv}h")
+        if nxt is not None and nxt >= 0:
+            tail.append(f"next in {float(nxt):.1f}h")
+        tail.append("+ = short receives")
+        lines.append("  " + " · ".join(tail))
     return "\n".join(lines)

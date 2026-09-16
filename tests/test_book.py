@@ -23,9 +23,32 @@ def test_format_book_shows_both_venues_and_basis():
     assert "ASTER perp" in out and "MEXC spot" in out
     assert "BTCUSDT order book — top 5" in out
     # best Aster ask 100.5 vs best MEXC ask 100.0 -> +50 bps entry
-    assert "entry basis +50.0bps" in out
-    # best Aster bid 100.4 vs best MEXC bid 99.9 -> +50.05 -> +50.1 bps close
-    assert "close +50.1bps" in out
+    assert "entry basis" in out and "+50.0bps" in out
+    # passive exit: Aster bid 100.4 vs MEXC bid 99.9 -> +50.05 -> +50.1 bps
+    assert "exit passive" in out and "+50.1bps" in out
+    # taker exit: Aster ask 100.5 vs MEXC bid 99.9 -> +60.06 -> +60.1 bps
+    assert "exit taker" in out and "+60.1bps" in out
+
+
+def test_format_book_taker_exit_worse_than_passive():
+    out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC, levels=5)
+    # taker exit crosses the perp spread -> strictly worse (higher) close basis
+    assert "taker exit crosses the perp spread" in out
+
+
+def test_format_book_shows_funding_when_provided():
+    funding = {"current_8h_bps": 12.3, "avg_24h_8h_bps": 8.5,
+               "interval_hours": 8, "next_funding_h": 2.4}
+    out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC, funding=funding)
+    assert "funding" in out
+    assert "now +12.3" in out and "24h avg +8.5" in out
+    assert "next in 2.4h" in out
+    assert "short receives" in out
+
+
+def test_format_book_omits_funding_when_absent():
+    out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC)
+    assert "funding" not in out
 
 
 def test_format_book_limits_levels():
@@ -43,7 +66,7 @@ def test_format_book_normalizes_multiplier():
     assert "÷1000" in out
     assert "0.0001" in out  # 0.10 / 1000 normalized
     # both touch at 0.0001 / 0.000099 -> ~0 bps basis
-    assert "entry basis +0.0bps" in out
+    assert "entry basis" in out and "+0.0bps" in out
 
 
 def test_format_book_handles_empty_side():

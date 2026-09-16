@@ -1356,7 +1356,32 @@ class Engine:
             )
         except ExchangeError as exc:
             return f"{symbol}: book fetch failed ({exc})"
-        return book.format_book(symbol, pair.qty_multiplier, aster_depth, mexc_depth)
+
+        # Funding: current (live rate projected to 8h) + realised 24h average.
+        stat = self.md.funding_stats.get(pair.aster_symbol)
+        fund_row = self.md.funding.get(pair.aster_symbol) or {}
+        live_rate = fund_row.get("funding_rate")
+        funding = None
+        if stat is not None:
+            current_8h = stat.current_8h_bps
+            if live_rate is not None and stat.interval_hours:
+                current_8h = float(
+                    live_rate * Decimal(10000) * Decimal(8) / Decimal(stat.interval_hours)
+                )
+            next_ms = fund_row.get("next_funding_time")
+            next_h = (
+                float((next_ms - int(time.time() * 1000)) / 3_600_000)
+                if next_ms and next_ms > 0 else None
+            )
+            funding = {
+                "current_8h_bps": current_8h,
+                "avg_24h_8h_bps": stat.avg_24h_8h_bps,
+                "interval_hours": stat.interval_hours,
+                "next_funding_h": next_h,
+            }
+        return book.format_book(
+            symbol, pair.qty_multiplier, aster_depth, mexc_depth, funding=funding
+        )
 
     async def _cmd_adopt(self, args: dict) -> str:
         """Import an existing on-venue short-perp / long-spot carry trade into
