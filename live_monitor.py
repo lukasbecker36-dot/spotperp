@@ -417,7 +417,9 @@ class Engine:
                 self._basis_24h.add(sym, now, row.entry_bps)
                 self._basis_24h.annotate(row)
                 rows.append(row)
-        screener.write_snapshot(screener.rank_rows(rows))
+        screener.write_snapshot(
+            screener.rank_rows(rows), screener.rank_rows_by_dislocation(rows)
+        )
         self._log_basis_rows(rows)
 
     def _log_basis_rows(self, rows: list[screener.ScreenerRow]) -> None:
@@ -884,7 +886,11 @@ class Engine:
         # just-opened position, venue error). Throttle so a persistent failure
         # doesn't retry — and alert — every sweep.
         now = time.monotonic()
-        if now - self._auto_stops_attempt.get(pos.id, 0.0) < config.AUTO_STOPS_RETRY_SECONDS:
+        last = self._auto_stops_attempt.get(pos.id)
+        # `is not None`, not a 0.0 default: monotonic() is small early in the
+        # process's life, so a 0.0 default throttles the very FIRST attempt —
+        # exactly when a position needs stops after an /update restart.
+        if last is not None and now - last < config.AUTO_STOPS_RETRY_SECONDS:
             return
         self._auto_stops_attempt[pos.id] = now
         result = await self._place_stops(pos)   # updates self._stops_qty

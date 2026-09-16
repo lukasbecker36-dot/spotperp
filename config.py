@@ -46,6 +46,10 @@ BASIS_LOG_SECONDS = 60.0                 # touch-basis CSV sampling cadence
 # slow scan) so a persistent edge is distinguishable from a one-tick blip, and
 # rows are ranked by the AVERAGE net edge rather than the instantaneous touch.
 SCREEN_AVG_WINDOW_SECONDS = float(os.environ.get("SCREEN_AVG_WINDOW_SECONDS", "300"))
+# /screen diff ranks by (5m avg entry basis - 24h avg entry basis): how far a
+# pair sits ABOVE its own recent norm. Require at least this many hours of 24h
+# history before a pair qualifies, or a thin window makes the gap meaningless.
+SCREEN_DIFF_MIN_HOURS = float(os.environ.get("SCREEN_DIFF_MIN_HOURS", "6"))
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

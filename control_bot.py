@@ -36,6 +36,7 @@ COMMAND_WAIT_SECONDS = 10
 
 HELP = """Commands:
 /screen [n] — top basis opportunities
+/screen diff [n] — pairs furthest ABOVE their own 24h avg basis (reversion candidates)
 /funding [n] — top funding carry (24h avg, 8h-equiv)
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
@@ -68,7 +69,7 @@ HELP = """Commands:
 # mode/service. Telegram limits: name 1-32 chars [a-z0-9_], description 1-256.
 BOT_COMMANDS = [
     # monitoring
-    {"command": "screen", "description": "Top basis opportunities (5m avg)"},
+    {"command": "screen", "description": "Top basis opportunities; 'diff' = vs 24h avg"},
     {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
     {"command": "positions", "description": "Open positions, P&L + liq proximity"},
     {"command": "recon", "description": "Live venue P&L, funding rate + liq"},
@@ -280,6 +281,8 @@ class ControlBot:
     # ── read commands ──
 
     def _cmd_screen(self, args: list[str]) -> str:
+        if args and args[0].lower() in ("diff", "d"):
+            return self._cmd_screen_diff(args[1:])
         n = int(args[0]) if args else 10
         snap = screener.read_snapshot()
         age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
@@ -324,6 +327,51 @@ class ControlBot:
             " entry ~ 24h = this pair's normal level, won't converge"
         )
         return "\n".join(lines)
+
+    def _cmd_screen_diff(self, args: list[str]) -> str:
+        """Pairs whose 5m entry basis sits furthest ABOVE their own 24h mean.
+
+        /screen ranks by absolute net edge, which hides a pair that is wildly
+        dislocated but not especially rich. This is the reversion view: a +5
+        basis on a pair that normally sits at -50 is a 55bps gap to capture IF
+        it reverts.
+        """
+        n = int(args[0]) if args else 10
+        snap = screener.read_snapshot()
+        age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
+        rows = (snap.get("diff_rows") or [])[:n]
+        if not rows:
+            return (
+                "no dislocation data yet — needs"
+                f" {config.SCREEN_DIFF_MIN_HOURS:.0f}h of 24h basis history"
+                " (the engine seeds it from the basis logs at startup)."
+                " If you just deployed, give it a slow scan."
+            )
+        win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
+        hdr = (f"{'symbol':<14}{'entry':>6}{'24h':>7}{'diff':>7}{'net':>6}"
+               f"{'depth$':>8}{'hrs':>5}")
+        sep = "-" * len(hdr)
+        lines = [f"dislocation screen ({age_s:.0f}s old)", hdr, sep]
+        for r in rows:
+            entry_avg = r.get("entry_bps_avg", r["entry_bps"])
+            d24 = r.get("entry_bps_avg_24h", entry_avg)
+            lines.append(
+                f"{r['symbol'][:13]:<14}{entry_avg:>6.1f}{d24:>7.1f}"
+                f"{entry_avg - d24:>+7.1f}{r['net_edge_bps_avg']:>6.1f}"
+                f"{r['max_notional_usd']:>8,.0f}{r.get('hours_24h', 0):>5.0f}"
+            )
+        lines.append(sep)
+        lines.append(
+            f"diff = {win_m:.0f}m avg entry basis - 24h avg, ranked biggest first."
+        )
+        lines.append(
+            "A positive diff means the basis is ABOVE its own norm: short perp /"
+            " long spot profits if it reverts. Reversion is a HYPOTHESIS — the"
+            " divergence backtest found this hard to capture net of spreads, so"
+            " check /book depth and the exit basis before entering."
+        )
+        return "\n".join(lines)
+
 
     def _cmd_funding(self, args: list[str]) -> str:
         n = int(args[0]) if args else 10

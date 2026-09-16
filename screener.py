@@ -191,9 +191,38 @@ def rank_rows(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     return eligible[: config.SCREENER_TOP_N]
 
 
-def write_snapshot(rows: list[ScreenerRow]) -> None:
+def rank_rows_by_dislocation(rows: list[ScreenerRow]) -> list[ScreenerRow]:
+    """Rank by how far the 5m entry basis sits ABOVE the pair's own 24h mean.
+
+    rank_rows ranks by net edge, so a pair whose basis is wildly dislocated but
+    whose absolute edge is mediocre never reaches the snapshot. This is the
+    reversion view: a +5 basis on a pair that normally sits at -50 is a 55bps
+    gap, which a premium trade captures IF it reverts to its norm.
+
+    Pairs without enough 24h history are excluded — a gap measured against a
+    few minutes of data is noise, not a dislocation.
+    """
+    eligible = [
+        r
+        for r in rows
+        if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
+        and r.hours_24h >= config.SCREEN_DIFF_MIN_HOURS
+    ]
+    eligible.sort(
+        key=lambda r: r.entry_bps_avg - r.entry_bps_avg_24h, reverse=True
+    )
+    return eligible[: config.SCREENER_TOP_N]
+
+
+def write_snapshot(
+    rows: list[ScreenerRow], diff_rows: list[ScreenerRow] | None = None
+) -> None:
     config.SCREENER_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"ts_ms": int(time.time() * 1000), "rows": [asdict(r) for r in rows]}
+    payload = {
+        "ts_ms": int(time.time() * 1000),
+        "rows": [asdict(r) for r in rows],
+        "diff_rows": [asdict(r) for r in (diff_rows or [])],
+    }
     tmp = config.SCREENER_SNAPSHOT_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=1))
     tmp.replace(config.SCREENER_SNAPSHOT_FILE)

@@ -1177,3 +1177,18 @@ async def test_auto_stops_retry_is_throttled(engine):
     await engine._ensure_stops(engine.positions.get(pid))   # immediate retry
     assert len(engine.notifier.messages) == first           # throttled
     assert pid not in engine._stops_qty
+
+
+async def test_auto_stops_first_attempt_never_throttled(engine, monkeypatch):
+    """monotonic() is small early in a process's life, so defaulting the 'last
+    attempt' to 0.0 would throttle the FIRST placement — precisely when a
+    position needs stops after an /update restart. A huge retry window must
+    still let the first attempt through."""
+    monkeypatch.setattr(config, "AUTO_STOPS_RETRY_SECONDS", 1e9)
+    pid = await _make_live_open(engine)
+    _live_stops_engine(engine)
+
+    await engine._ensure_stops(engine.positions.get(pid))
+
+    assert engine._stops_qty[pid] == Decimal("9.95")
+    assert engine.aster.placed                       # really placed

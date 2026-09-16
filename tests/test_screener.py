@@ -198,3 +198,62 @@ def test_seed_daily_from_logs_reads_recent_rows(tmp_path, monkeypatch):
     assert seeded == 2                      # the 48h-old row is skipped
     mean, hours = d.stats("SEEDUSDT")
     assert mean == pytest.approx(25.0)      # (20 + 30) / 2
+
+
+def _row(symbol, entry_avg, avg24, hours=24.0, depth=1000.0, net_avg=10.0):
+    r = screener.ScreenerRow(
+        symbol=symbol, entry_bps=entry_avg, close_bps=0.0, spread_cost_bps=0.0,
+        fees_bps=0.0, funding_8h_bps=0.0, net_edge_bps=net_avg,
+        max_notional_usd=depth, aster_ask="1", mexc_ask="1", ts_ms=0,
+    )
+    r.entry_bps_avg = entry_avg
+    r.net_edge_bps_avg = net_avg
+    r.entry_bps_avg_24h = avg24
+    r.hours_24h = hours
+    return r
+
+
+def test_dislocation_ranks_by_gap_not_absolute_basis(monkeypatch):
+    """A +5 basis on a pair that normally sits at -50 outranks a +51 basis on a
+    pair that always sits at +50 — the gap is the opportunity, not the level."""
+    monkeypatch.setattr(config, "SCREEN_DIFF_MIN_HOURS", 6.0)
+    rows = [
+        _row("ALWAYSRICH", 51.0, 50.4),      # gap +0.6
+        _row("REVERT", 5.0, -50.0),          # gap +55
+        _row("MILD", 40.0, 10.0),            # gap +30
+    ]
+    ranked = screener.rank_rows_by_dislocation(rows)
+    assert [r.symbol for r in ranked] == ["REVERT", "MILD", "ALWAYSRICH"]
+
+
+def test_dislocation_excludes_thin_24h_history(monkeypatch):
+    """A gap measured against a few minutes of history is noise."""
+    monkeypatch.setattr(config, "SCREEN_DIFF_MIN_HOURS", 6.0)
+    rows = [
+        _row("FRESH", 5.0, -50.0, hours=1.0),    # huge gap, but no history
+        _row("SEASONED", 10.0, 5.0, hours=12.0),
+    ]
+    ranked = screener.rank_rows_by_dislocation(rows)
+    assert [r.symbol for r in ranked] == ["SEASONED"]
+
+
+def test_dislocation_excludes_thin_depth(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_DIFF_MIN_HOURS", 6.0)
+    monkeypatch.setattr(config, "MIN_DEPTH_NOTIONAL_USD", Decimal("200"))
+    rows = [
+        _row("THIN", 5.0, -50.0, depth=10.0),
+        _row("DEEP", 10.0, 5.0, depth=1000.0),
+    ]
+    ranked = screener.rank_rows_by_dislocation(rows)
+    assert [r.symbol for r in ranked] == ["DEEP"]
+
+
+def test_write_snapshot_carries_diff_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SCREENER_SNAPSHOT_FILE", tmp_path / "snap.json")
+    main = [_row("AAA", 10.0, 1.0)]
+    diff = [_row("BBB", 5.0, -50.0)]
+    screener.write_snapshot(main, diff)
+    snap = screener.read_snapshot()
+    assert [r["symbol"] for r in snap["rows"]] == ["AAA"]
+    assert [r["symbol"] for r in snap["diff_rows"]] == ["BBB"]
+    assert snap["diff_rows"][0]["entry_bps_avg_24h"] == -50.0
