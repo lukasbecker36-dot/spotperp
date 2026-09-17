@@ -608,13 +608,25 @@ class Executor:
 
     async def _notify_clip(
         self, position_id: int, symbol: str, phase: str, side: str,
-        base_qty: Decimal, price: Decimal,
+        base_qty: Decimal, price: Decimal, perp_px: Decimal | None = None,
     ) -> None:
-        """Telegram ping for one filled clip of a partial entry/exit, tagged
-        with the live executable basis at fill time (entry ask/ask basis on the
-        way in, close bid/bid basis on the way out). Fire-and-forget."""
-        basis = (self._entry_basis_bps(symbol) if phase == "entry"
-                 else self._close_basis_bps(symbol))
+        """Telegram ping for one filled clip, tagged with the basis that clip
+        ACTUALLY locked: the perp leg's fill price against the spot leg's fill
+        price.
+
+        Falling back to the live market basis (as this used to do) overstates a
+        rising market: your maker perp sold at the price it was RESTING at, but
+        the live ask has moved up since, so quoting the current ask against the
+        spot you just bought reports a basis you never got. STONK #186 pinged
+        clips averaging +121bps and locked +58.8.
+        """
+        basis = None
+        if perp_px is not None and perp_px > 0 and price > 0:
+            mult = self._pair(symbol).qty_multiplier
+            basis = (perp_px / mult - price) / price * BPS
+        if basis is None:
+            basis = (self._entry_basis_bps(symbol) if phase == "entry"
+                     else self._close_basis_bps(symbol))
         b = f"{float(basis):+.1f}bps" if basis is not None else "n/a"
         notional = float(base_qty * price)
         if phase == "exit" and basis is not None and notional > 0:
@@ -704,7 +716,8 @@ class Executor:
         return info.round_price(ref * (1 - buf), up=False)
 
     async def _hedge_spot(
-        self, position: pm.Position, side: str, base_qty: Decimal, phase: str
+        self, position: pm.Position, side: str, base_qty: Decimal, phase: str,
+        perp_px: Decimal | None = None,
     ) -> tuple[Decimal, str | None]:
         """Buy (entry) or sell (exit) spot for a perp fill increment.
 
@@ -752,7 +765,7 @@ class Executor:
                 if phase in ("entry", "exit"):
                     await self._notify_clip(
                         position.id, position.symbol, phase, side,
-                        fill.qty, fill.avg_price,
+                        fill.qty, fill.avg_price, perp_px,
                     )
                 remaining = info.round_qty(remaining - fill.qty)
                 last_error = None  # progress made; not an outright rejection
@@ -951,7 +964,8 @@ class Executor:
 
             try:
                 shortfall, err = await self._hedge_spot(
-                    position, "BUY", unhedged * pair.qty_multiplier, "entry"
+                    position, "BUY", unhedged * pair.qty_multiplier, "entry",
+                    perp_ref,
                 )
             except AmbiguousOrderError as exc:
                 # Spot buy may or may not have filled. Do NOT unwind (could leave
@@ -1281,9 +1295,15 @@ class Executor:
                     )
                     # One clip ping per iteration, on the spot (hedge) leg.
                     if venue == "mexc":
+                        perp_fill = next(
+                            (r.avg_price for (v, _), r in zip(jobs, results)
+                             if v == "aster" and not isinstance(r, BaseException)
+                             and r.qty > 0),
+                            None,
+                        )
                         await self._notify_clip(
                             position.id, symbol, "exit", side,
-                            result.qty, result.avg_price,
+                            result.qty, result.avg_price, perp_fill,
                         )
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
 
@@ -1310,9 +1330,11 @@ class Executor:
         # < threshold right after a reboot/restart).
         last_unreachable_alert = float("-inf")  # throttle "target unreachable" notices
         to_sell = Decimal(0)   # spot base units pending sale after perp buy-backs
+        pend_perp_qty = Decimal(0)    # perp contracts behind `to_sell`
+        pend_perp_cost = Decimal(0)   # ...and their cost, for the VWAP
 
         async def absorb_fills(result: OrderResult) -> None:
-            nonlocal to_sell, order_seen_executed
+            nonlocal to_sell, order_seen_executed, pend_perp_qty, pend_perp_cost
             delta = result.executed_qty - order_seen_executed
             if delta <= 0:
                 return
@@ -1323,9 +1345,14 @@ class Executor:
                 self._fee_usd("aster", True, delta, price), result.order_id,
             )
             to_sell += delta * pair.qty_multiplier
+            # VWAP of the perp buy-backs this pending spot sale hedges, so the
+            # clip ping can report the basis actually locked rather than the
+            # live quote (which drifts away from the resting fill price).
+            pend_perp_qty += delta
+            pend_perp_cost += delta * price
 
         async def sell_pending(force: bool = False) -> None:
-            nonlocal to_sell
+            nonlocal to_sell, pend_perp_qty, pend_perp_cost
             if to_sell <= 0:
                 return
             book = self._md.mexc_books.get(pair.mexc_symbol)
@@ -1334,7 +1361,12 @@ class Executor:
                 return
             qty = min(to_sell, self._positions.get(position.id).spot_qty)
             try:
-                shortfall, err = await self._hedge_spot(position, "SELL", qty, "exit")
+                perp_vwap = (
+                    pend_perp_cost / pend_perp_qty if pend_perp_qty > 0 else None
+                )
+                shortfall, err = await self._hedge_spot(
+                    position, "SELL", qty, "exit", perp_vwap
+                )
             except AmbiguousOrderError as exc:
                 # Spot sell may have filled; don't retry (could oversell). Stop
                 # this increment and alert for manual reconciliation.
@@ -1346,6 +1378,8 @@ class Executor:
                 )
                 return
             to_sell = shortfall
+            if to_sell <= 0:                 # pending batch cleared
+                pend_perp_qty = pend_perp_cost = Decimal(0)
             if shortfall > 0:
                 reason = f" — MEXC: {err}" if err else " (no fill / thin book)"
                 await self._notifier.alert(

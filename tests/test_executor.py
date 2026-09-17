@@ -784,3 +784,43 @@ def test_is_dust_uses_min_notional_not_just_lot_size():
     assert Executor._is_dust(inf, Decimal(0), Decimal("10")) is True
     # unknown price: don't write off what we can't value
     assert Executor._is_dust(inf, Decimal(4), Decimal(0)) is False
+
+
+async def test_entry_clip_reports_fill_to_fill_basis_not_live_quote(env):
+    """STONK #186: clips pinged +69/+125.6/+178.5/+54.1 (avg +121bps) but the
+    position locked +58.76. The ping quoted the LIVE perp ask, which had risen
+    above the price the resting maker actually filled at. It must report the
+    basis between the two legs' real fill prices."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    # Live perp ask has run up to 102 ; the maker actually filled at 100.5.
+    set_books(md, "101.9", "102.0", "99.9", "100.0")
+    live = executor._entry_basis_bps("BTCUSDT")
+    notifier.messages.clear()
+
+    await executor._notify_clip(
+        pos_id, "BTCUSDT", "entry", "BUY",
+        Decimal("10"), Decimal("100.0"), Decimal("100.5"),   # spot 100.0 / perp 100.5
+    )
+
+    msg = next(m for m in notifier.messages if "entry clip" in m)
+    # (100.5 - 100.0)/100.0 = +50bps locked, NOT the ~200bps the live ask implies
+    assert "+50.0bps" in msg
+    assert float(live) > 150            # the misleading number it used to print
+
+
+async def test_clip_falls_back_to_live_basis_without_a_perp_price(env):
+    """The tranche sell-down has already reconciled the perp, so there is no
+    fill price to pair with — the live basis stays the fallback."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+    notifier.messages.clear()
+
+    await executor._notify_clip(
+        pos_id, "BTCUSDT", "exit", "SELL", Decimal("10"), Decimal("99.9"),
+    )
+
+    msg = next(m for m in notifier.messages if "exit clip" in m)
+    live = executor._close_basis_bps("BTCUSDT")
+    assert f"{float(live):+.1f}bps" in msg
