@@ -108,6 +108,9 @@ class Engine:
         # Consecutive sweeps the taker-close-is-profitable condition held,
         # per position: a single flickering quote must not cross both legs.
         self._tp_confirm: dict[int, int] = {}
+        # Positions whose working order was stood down for liquidation
+        # proximity. Latched so a manual /exit afterwards is honoured.
+        self._liq_protect: set[int] = set()
         # Venue order ids of each position's /stops legs, so the hedge guard can
         # recognise its OWN stop firing (query the real fill) vs an ADL.
         self._stops_orders: dict[int, dict] = {}
@@ -909,6 +912,52 @@ class Engine:
                 f" — /stops auto-refreshed to cover the new size\n{result}"
             )
 
+    async def _stand_down_for_liq(self, pos: pm.Position, dist: float) -> None:
+        """Near liquidation, a WAITING order is a liability.
+
+        A passive exit has NO deadline, and while one runs the position's stops
+        are cancelled (their spot sell LIMIT would lock the balance the exit
+        needs to sell). A move overnight could liquidate the perp with nothing
+        armed. So stand the waiting order down and let the auto-stops reconciler
+        arm protection in its place.
+
+        Deliberate choices:
+          - an AGGRESSIVE exit is left running: it is actively closing the
+            position, which removes the risk faster than stops would;
+          - latched per excursion, so a manual /exit afterwards is honoured
+            rather than cancelled again on the next sweep;
+          - skipped when AUTO_STOPS is off, since cancelling the exit would
+            then leave NO protection at all — strictly worse than waiting.
+        """
+        if self.paper or not config.AUTO_STOPS:
+            return
+        if pos.id in self._liq_protect:
+            return                      # already stood down this excursion
+        if not self.executor.has_task(pos.id):
+            return                      # nothing waiting
+        if pos.state == pm.EXITING and pos.exit_mode == "now":
+            return                      # taker close in flight; let it finish
+        self._liq_protect.add(pos.id)
+        # Don't let the convergence TP immediately restart a passive close.
+        self._auto_passive.discard(pos.id)
+        what = "exit" if pos.state == pm.EXITING else "entry"
+        if pos.state == pm.EXITING:
+            await self._cancel_exit(pos)      # awaits task cleanup
+        else:
+            self.executor.request_cancel(pos.id)
+        journal(
+            self.conn,
+            f"position {pos.id}: {dist:.1f}% from liq — working {what} stood"
+            f" down, arming stops",
+            "ERROR",
+        )
+        await self.notifier.alert(
+            f"🛑 position {pos.id} {pos.symbol}: {dist:.1f}% from LIQUIDATION —"
+            f" working {what} cancelled and stops armed. Add margin, or send"
+            f" /exit {pos.id} now to close (a manual exit WILL be honoured)."
+        )
+        await self._ensure_stops(self.positions.get(pos.id))
+
     async def _check_liquidation(self, pos: pm.Position) -> None:
         """Alert (throttled) when a live perp short's mark is within
         LIQ_ALERT_PCT of its liquidation price. Re-arms once it recovers."""
@@ -920,7 +969,11 @@ class Engine:
         _liq, dist = stats
         if dist >= float(config.LIQ_ALERT_PCT):
             self._liq_alerted.pop(pos.id, None)  # recovered -> re-arm
+            self._liq_protect.discard(pos.id)    # ...and the stand-down latch
             return
+        # Protection must not wait on the ALERT throttle window, so stand any
+        # waiting order down first.
+        await self._stand_down_for_liq(pos, dist)
         now = time.monotonic()
         last = self._liq_alerted.get(pos.id)
         if last is not None and now - last < config.LIQ_ALERT_THROTTLE_SECONDS:
@@ -1736,6 +1789,7 @@ class Engine:
                     self._auto_stops_attempt.pop(gone, None)
                 for gone in set(self._tp_confirm) - active_ids:
                     self._tp_confirm.pop(gone, None)
+                self._liq_protect &= active_ids
             except Exception:
                 log.exception("safety loop error")
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS * 5)
@@ -1784,7 +1838,8 @@ class Engine:
         # Two-tier convergence auto-close (see config.CONVERGED_PASSIVE_BPS).
         # While still in premium (close above the passive trigger) just hold and
         # collect funding; max-hold below still bounds the carry.
-        if close is not None and close <= config.CONVERGED_PASSIVE_BPS:
+        if (close is not None and close <= config.CONVERGED_PASSIVE_BPS
+                and pos.id not in self._liq_protect):
             pnl = self._aggressive_close_pnl(pos)
             if pnl is not None and pnl > 0:
                 # Taker-taker close is profitable now — but only cross once the

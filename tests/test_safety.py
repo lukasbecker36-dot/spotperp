@@ -81,6 +81,7 @@ def engine(tmp_path, monkeypatch):
     eng._stops_qty = {}
     eng._auto_stops_attempt = {}
     eng._tp_confirm = {}
+    eng._liq_protect = set()
     eng._stops_orders = {}
     eng._stop_grace = {}
     eng._hedge_break = {}
@@ -1213,3 +1214,89 @@ async def test_auto_stops_first_attempt_never_throttled(engine, monkeypatch):
 
     assert engine._stops_qty[pid] == Decimal("9.95")
     assert engine.aster.placed                       # really placed
+
+
+async def _near_liq(engine, pid, dist_pct="108"):
+    """Put the position within the liq-alert threshold (mark 100, liq 108)."""
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100",
+                    "liquidationPrice": dist_pct}
+    }
+
+
+async def test_passive_exit_stood_down_near_liquidation(engine):
+    """A passive exit waits with NO deadline and with stops cancelled. Near
+    liquidation that is an unprotected overnight position — stand it down and
+    arm stops instead."""
+    pid = await _make_live_open(engine)
+    _live_stops_engine(engine)
+    await _near_liq(engine, pid)
+    engine.positions.set_exit_request(pid, "passive", Decimal(0))
+    engine.positions.set_state(pid, pm.EXITING)
+    await engine.executor.start_exit(engine.positions.get(pid))
+
+    await engine._check_liquidation(engine.positions.get(pid))
+
+    pos = engine.positions.get(pid)
+    assert pos.state == pm.OPEN               # exit stood down
+    assert pos.exit_mode is None
+    assert pid in engine._liq_protect
+    assert engine._stops_qty.get(pid) is not None    # stops armed
+    assert any("stops armed" in m for m in engine.notifier.messages)
+
+
+async def test_aggressive_exit_is_left_running_near_liquidation(engine):
+    """A taker close is actively removing the risk — cancelling it would be
+    counterproductive."""
+    pid = await _make_live_open(engine)
+    _live_stops_engine(engine)
+    await _near_liq(engine, pid)
+    engine.positions.set_exit_request(pid, "now", None)
+    engine.positions.set_state(pid, pm.EXITING)
+    engine.executor.has_task = lambda _p: True     # pretend it's still working
+
+    await engine._check_liquidation(engine.positions.get(pid))
+
+    assert pid not in engine._liq_protect
+    assert engine.positions.get(pid).exit_mode == "now"   # untouched
+
+
+async def test_manual_exit_after_stand_down_is_honoured(engine):
+    """The latch means a /exit issued AFTER the stand-down is not cancelled
+    again on the next sweep."""
+    pid = await _make_live_open(engine)
+    _live_stops_engine(engine)
+    await _near_liq(engine, pid)
+    engine._liq_protect.add(pid)                  # already stood down
+    engine.positions.set_exit_request(pid, "passive", Decimal(0))
+    engine.positions.set_state(pid, pm.EXITING)
+    engine.executor.has_task = lambda _p: True
+
+    await engine._check_liquidation(engine.positions.get(pid))
+
+    pos = engine.positions.get(pid)
+    assert pos.state == pm.EXITING                # left alone
+    assert pos.exit_mode == "passive"
+
+
+async def test_converged_tp_does_not_restart_exit_while_stood_down(engine):
+    """Without this the convergence auto-close would re-open a passive exit on
+    the next sweep, cancelling the stops again and undoing the protection."""
+    pid = await _make_live_open(engine)
+    engine._liq_protect.add(pid)
+    set_books(engine.md, "99.0", "99.1", "99.9", "100.0")   # converged
+
+    await engine._check_safety(engine.positions.get(pid))
+
+    assert engine.positions.get(pid).exit_mode is None
+
+
+async def test_stand_down_latch_rearms_after_recovery(engine):
+    pid = await _make_live_open(engine)
+    engine._liq_protect.add(pid)
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100",
+                    "liquidationPrice": "300"}          # far away again
+    }
+    await engine._check_liquidation(engine.positions.get(pid))
+    assert pid not in engine._liq_protect
