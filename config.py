@@ -180,7 +180,15 @@ COMMAND_POLL_SECONDS = 1.0
 # a crash mid-command from replaying it on restart.
 COMMAND_TTL_SECONDS = float(os.environ.get("COMMAND_TTL_SECONDS", "60"))
 ORDER_STATUS_POLL_SECONDS = 2.0
-REPRICE_MIN_INTERVAL_SECONDS = 3.0       # don't cancel/replace faster than this
+# Cancel/replace throttle for a RESTING MAKER order. This is not the hedge
+# lag (that is POLL_INTERVAL_SECONDS): it bounds how long an order may sit at a
+# price the market has moved away from. A stale resting perp SELL in a rising
+# market is picked off below the live ask — STONK #186 locked +58.8bps while
+# the market showed +121 — and a resting order sized to spot depth that has
+# since vanished can be hit with nothing to hedge against. Both shrink as this
+# falls; the cost is more cancel/replace traffic to the venue.
+REPRICE_MIN_INTERVAL_SECONDS = float(os.environ.get(
+    "REPRICE_MIN_INTERVAL_SECONDS", "1.0"))
 # Exits reprice faster than entries: a resting buy-back sized to spot bid
 # depth must be pulled quickly when that depth vanishes, or it can be hit
 # with no spot to hedge against (leg desync). Lower = tighter, more
