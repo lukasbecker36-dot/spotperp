@@ -1334,6 +1334,8 @@ class Executor:
         # the first PASSIVE_UNREACHABLE_ALERT_SECONDS of machine uptime (now-0
         # < threshold right after a reboot/restart).
         last_unreachable_alert = float("-inf")  # throttle "target unreachable" notices
+        last_sale_alert = float("-inf")         # ...and failed-sale notices
+        sale_blocked = False                    # venue says we hold less than the DB
         to_sell = Decimal(0)   # spot base units pending sale after perp buy-backs
         pend_perp_qty = Decimal(0)    # perp contracts behind `to_sell`
         pend_perp_cost = Decimal(0)   # ...and their cost, for the VWAP
@@ -1358,6 +1360,7 @@ class Executor:
 
         async def sell_pending(force: bool = False) -> None:
             nonlocal to_sell, pend_perp_qty, pend_perp_cost
+            nonlocal last_sale_alert, sale_blocked
             if to_sell <= 0:
                 return
             book = self._md.mexc_books.get(pair.mexc_symbol)
@@ -1386,10 +1389,26 @@ class Executor:
             if to_sell <= 0:                 # pending batch cleared
                 pend_perp_qty = pend_perp_cost = Decimal(0)
             if shortfall > 0:
+                # "Oversold" means the venue holds LESS than the DB thinks, so
+                # retrying can never succeed — the spot-integrity check has to
+                # reconcile the DB first. Back off and stop shouting rather than
+                # hammering the venue every poll.
+                sale_blocked = bool(err) and (
+                    "oversold" in err.lower() or "insufficient" in err.lower()
+                )
+                now_m = time.monotonic()
+                if now_m - last_sale_alert < config.PASSIVE_UNREACHABLE_ALERT_SECONDS:
+                    return
+                last_sale_alert = now_m
                 reason = f" — MEXC: {err}" if err else " (no fill / thin book)"
+                extra = (
+                    " — the venue holds less than this position's DB quantity;"
+                    " the spot-integrity check will reconcile it shortly"
+                    if sale_blocked else ""
+                )
                 await self._notifier.alert(
                     f"⚠️ position {position.id} {symbol}: spot exit sale incomplete,"
-                    f" {shortfall} base units pending{reason}"
+                    f" {shortfall} base units pending{reason}{extra}"
                 )
 
         done = False
@@ -1423,7 +1442,10 @@ class Executor:
                     if to_sell <= 0:  # closed-portion spot fully sold
                         done = True
                         break
-                    await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+                    await asyncio.sleep(
+                        config.SPOT_CHECK_INTERVAL_SECONDS if sale_blocked
+                        else config.POLL_INTERVAL_SECONDS
+                    )
                     continue
 
                 book = self._md.aster_books.get(pair.aster_symbol)

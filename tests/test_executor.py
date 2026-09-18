@@ -852,3 +852,33 @@ async def test_passive_exit_sells_spot_left_unhedged_by_an_earlier_run(env):
     assert final.spot_qty == 0                                   # actually sold
     assert not any("exit incomplete" in m for m in notifier.messages)
     assert final.realized_pnl_usd is not None                    # P&L booked
+
+
+async def test_oversold_sale_is_throttled_and_backs_off(env, monkeypatch):
+    """STONK #189: the DB held 366 spot against 4 on the venue, so every sell
+    came back 'Oversold'. Retrying can never succeed until the spot-integrity
+    check reconciles, so it must not hammer the venue or the operator."""
+    from exchange_client import ExchangeError
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "PASSIVE_UNREACHABLE_ALERT_SECONDS", 600)
+    monkeypatch.setattr(config, "HEDGE_RETRY_ATTEMPTS", 1)   # keep the test quick
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+
+    # Perp flat, spot still on the books -> the exit will try to sell it.
+    pos = positions.get(pos_id)
+    positions.record_fill(pos_id, "aster", "exit", "BUY",
+                          pos.perp_qty, Decimal("100.0"), Decimal(0))
+
+    async def oversold(symbol, side, qty, cap):
+        raise ExchangeError("mexc", "Oversold", 30005)
+    executor._trader.spot_taker = oversold
+
+    positions.set_exit_request(pos_id, "passive", Decimal(15))
+    await executor.start_exit(positions.get(pos_id))
+    await asyncio.sleep(3.0)            # several sell attempts
+    await executor._cancel_task(pos_id)
+
+    sale_alerts = [m for m in notifier.messages if "sale incomplete" in m]
+    assert len(sale_alerts) == 1                      # throttled, not per-poll
+    assert "reconcile it shortly" in sale_alerts[0]   # explains the cause
