@@ -319,25 +319,35 @@ def test_hourly_means_average_out_intra_hour_flicker():
     assert (s_hi - s_lo) > 100.0        # real day-scale swing -> wide range
 
 
-def _fill_row(symbol, entry, hours_tradeable, volume, depth=1000.0):
+def _fill_row(symbol, entry, hours_tradeable, volume, depth=1000.0, trades=24_000):
     r = _row(symbol, entry, entry, hours=24.0, depth=depth)
     r.hours_tradeable_24h = hours_tradeable
     r.perp_volume_24h = volume
+    r.perp_trades_24h = trades
     return r
 
 
-def test_fillability_ranks_by_dwell_not_basis_size(monkeypatch):
-    """The fattest basis is often the least fillable. A name workable for 21h
-    on real volume beats one showing 160bps for an hour on a dead book."""
-    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 250_000.0)
+def test_fillability_ranks_by_expected_taker_events(monkeypatch):
+    """Dwell alone misleads. A name workable 23h at ~7 trades/h gives a resting
+    order far fewer chances than one workable 19h at ~613 trades/h, even though
+    dwell ranks the first higher. Rank by the product."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
     monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
     rows = [
-        _fill_row("FATBUTDEAD", 160.0, 5, 310_000),
-        _fill_row("STONK", 78.0, 21, 4_200_000),
-        _fill_row("BUSY", 45.0, 14, 1_150_000),
+        _fill_row("LONGBUTQUIET", 23.2, 23, 50_000, trades=176),      # ~169
+        _fill_row("SHORTBUTBUSY", 69.6, 19, 1_900_000, trades=14_700),  # ~11638
+        _fill_row("MIDDLING", 15.2, 21, 95_000, trades=238),          # ~208
     ]
     ranked = screener.rank_rows_by_fillability(rows)
-    assert [r.symbol for r in ranked] == ["STONK", "BUSY", "FATBUTDEAD"]
+    assert [r.symbol for r in ranked] == [
+        "SHORTBUTBUSY", "MIDDLING", "LONGBUTQUIET",
+    ]
+
+
+def test_fill_chances_is_dwell_times_trades_per_hour():
+    r = _fill_row("X", 50.0, 19, 1_900_000, trades=14_700)
+    assert screener._fill_chances(r) == pytest.approx(19 * 14_700 / 24)
 
 
 def test_fillability_excludes_dead_books(monkeypatch):

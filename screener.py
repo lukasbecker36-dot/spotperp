@@ -275,10 +275,19 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         # row you cannot act on today is a watchlist entry, not a candidate.
         and r.entry_bps_avg >= float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
     ]
-    eligible.sort(
-        key=lambda r: (r.hours_tradeable_24h, r.perp_volume_24h), reverse=True
-    )
+    # Rank by EXPECTED TAKER EVENTS while the basis is workable:
+    #   dwell hours x trades/hour
+    # Dwell alone is misleading — a name workable for 23h on 176 trades/day
+    # (~7/hour) gives a resting order far fewer chances than one workable for
+    # 19h on 14,700 trades/day (~613/hour), even though dwell ranks the first
+    # higher. This is the product that matters.
+    eligible.sort(key=_fill_chances, reverse=True)
     return eligible[: config.SCREENER_TOP_N]
+
+
+def _fill_chances(row: ScreenerRow) -> float:
+    """Expected number of taker events while the basis is workable."""
+    return row.hours_tradeable_24h * (row.perp_trades_24h / 24.0)
 
 
 def write_snapshot(

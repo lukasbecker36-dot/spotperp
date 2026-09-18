@@ -483,32 +483,34 @@ class ControlBot:
                 return f"{v / 1e3:.0f}k"
             return f"{v:.0f}"
 
-        hdr = (f"{'symbol':<13}{'entry':>7}{'lo24':>7}{'hrs':>5}{'vol24':>8}"
-               f"{'trades':>8}{'dep$':>7}")
+        hdr = (f"{'symbol':<13}{'entry':>7}{'lo24':>7}{'swing':>7}{'hrs':>5}"
+               f"{'tr/h':>7}{'dep$':>7}")
         sep = "-" * len(hdr)
         lines = [f"fillability screen ({age_s:.0f}s old)", hdr, sep]
         for r in rows:
             entry_avg = r.get("entry_bps_avg", r["entry_bps"])
+            lo = r.get("basis_p10_24h", entry_avg)
             lines.append(
-                f"{r['symbol'][:12]:<13}{entry_avg:>7.1f}"
-                f"{r.get('basis_p10_24h', entry_avg):>7.1f}"
+                f"{r['symbol'][:12]:<13}{entry_avg:>7.1f}{lo:>7.1f}"
+                f"{entry_avg - lo:>7.1f}"
                 f"{r.get('hours_tradeable_24h', 0):>5.0f}"
-                f"{vol(r.get('perp_volume_24h', 0)):>8}"
-                f"{r.get('perp_trades_24h', 0):>8,.0f}"
+                f"{r.get('perp_trades_24h', 0) / 24.0:>7.1f}"
                 f"{r['max_notional_usd']:>7,.0f}"
             )
         lines.append(sep)
         lines.append(
-            "hrs = hours of the last 24 the basis sat at/above the entry floor —"
-            " your CHANCES to be lifted. Ranked by it."
+            "Ranked by hrs x tr/h = expected taker events while workable. Dwell"
+            " alone misleads: 23h at 7 trades/h is far fewer chances than 19h"
+            " at 613."
         )
         lines.append(
-            "vol24/trades = Aster perp 24h traded volume and trade count. Depth"
-            " is resting size; this is actual flow, which is what fills a maker."
+            "hrs = hours of the last 24 the basis cleared the entry floor."
+            " tr/h = Aster perp trades per hour (flow, not resting depth — this"
+            " is what lifts a maker). Full 24h volume is in /book."
         )
         lines.append(
-            "lo24 = p10 of hourly basis: how far it comes back, i.e. whether you"
-            " can get OUT. Check /book before entering."
+            "swing = entry - lo24, the round trip if it returns to its own low."
+            " lo24 below 0 means it reaches a NEGATIVE basis you can exit into."
         )
         return "\n".join(lines)
 
