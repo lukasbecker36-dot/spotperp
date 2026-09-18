@@ -1317,6 +1317,7 @@ class Executor:
         symbol = position.symbol
         pair = self._pair(symbol)
         aster_info = self._md.aster_info[pair.aster_symbol]
+        mexc_info = self._md.mexc_info[pair.mexc_symbol]
         self._positions.set_state(position.id, pm.EXITING)
         target = position.exit_target_bps
         floor_perp = position.exit_target_qty or Decimal(0)  # partial-exit floor
@@ -1407,6 +1408,17 @@ class Executor:
                     if order_id is not None:
                         await self._trader.cancel_perp_order(pair.aster_symbol, order_id)
                         order_id = None
+                    # Sell ALL spot the surviving perp no longer hedges, not just
+                    # the increments this run bought back. `to_sell` starts at 0
+                    # each run, so a position arriving here already carrying
+                    # unhedged spot — an earlier run, an ADL reconcile, a stop
+                    # firing — would otherwise be declared done with that spot
+                    # never sold, and _finalize_close then wedges it in EXITING
+                    # forever (STONK #189: perp 0, 366 spot ~ $85 left naked).
+                    fresh = self._positions.get(position.id)
+                    unhedged = fresh.spot_qty - floor_perp * pair.qty_multiplier
+                    if unhedged > to_sell:
+                        to_sell = mexc_info.round_qty(unhedged)
                     await sell_pending(force=True)
                     if to_sell <= 0:  # closed-portion spot fully sold
                         done = True

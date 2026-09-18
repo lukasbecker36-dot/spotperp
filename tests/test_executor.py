@@ -824,3 +824,31 @@ async def test_clip_falls_back_to_live_basis_without_a_perp_price(env):
     msg = next(m for m in notifier.messages if "exit clip" in m)
     live = executor._close_basis_bps("BTCUSDT")
     assert f"{float(live):+.1f}bps" in msg
+
+
+async def test_passive_exit_sells_spot_left_unhedged_by_an_earlier_run(env):
+    """STONK #189: perp already flat, 366 spot (~$85) stranded. `to_sell` only
+    accumulates from perp buy-backs made by THIS run, so a run starting with
+    the perp already closed concluded 'nothing to sell', finalised, and wedged
+    in EXITING with real unhedged exposure."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+
+    # Close the perp WITHOUT selling the spot — as a prior run / ADL reconcile
+    # would leave it.
+    pos = positions.get(pos_id)
+    positions.record_fill(pos_id, "aster", "exit", "BUY",
+                          pos.perp_qty, Decimal("100.0"), Decimal(0))
+    stranded = positions.get(pos_id)
+    assert stranded.perp_qty == 0
+    assert stranded.spot_qty > 0          # real exposure, not dust
+
+    positions.set_exit_request(pos_id, "passive", Decimal(15))
+    await executor.start_exit(positions.get(pos_id))
+    await wait_for_state(positions, pos_id, pm.CLOSED)
+
+    final = positions.get(pos_id)
+    assert final.spot_qty == 0                                   # actually sold
+    assert not any("exit incomplete" in m for m in notifier.messages)
+    assert final.realized_pnl_usd is not None                    # P&L booked
