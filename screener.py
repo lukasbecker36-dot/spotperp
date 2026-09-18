@@ -300,6 +300,13 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         # Enterable RIGHT NOW. Dwell says a name is reliably workable, but a
         # row you cannot act on today is a watchlist entry, not a candidate.
         and r.entry_bps_avg >= float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+        # Worth doing, not merely possible: the round trip down to the pair's
+        # own 24h low must clear the cost floor. Without this the screen ranks
+        # a name you can fill easily but whose basis never comes back far
+        # enough to close for a profit ABOVE one that does.
+        and (r.entry_bps_avg - r.basis_p10_24h)
+        - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+        >= config.SCREEN_FILL_MIN_NET_SWING_BPS
     ]
     # Rank by EXPECTED TAKER EVENTS while the basis is workable:
     #   dwell hours x trades/hour

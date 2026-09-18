@@ -337,7 +337,7 @@ def test_fillability_ranks_by_expected_taker_events(monkeypatch):
     rows = [
         _fill_row("LONGBUTQUIET", 23.2, 23, 50_000, trades=176),      # ~169
         _fill_row("SHORTBUTBUSY", 69.6, 19, 1_900_000, trades=14_700),  # ~11638
-        _fill_row("MIDDLING", 15.2, 21, 95_000, trades=238),          # ~208
+        _fill_row("MIDDLING", 25.2, 21, 95_000, trades=238),          # ~208
     ]
     ranked = screener.rank_rows_by_fillability(rows)
     assert [r.symbol for r in ranked] == [
@@ -455,3 +455,20 @@ def test_jitter_measures_successive_change_not_spread():
     assert jitter_of(drift) < 10
     # The flicker spans the same kind of range but reverses every sample.
     assert jitter_of(flicker) > 100
+
+
+def test_fillability_drops_a_round_trip_that_cannot_clear_costs(monkeypatch):
+    """ZEREBRO: 44.9 entry but a 24h low of +32.3 — easily fillable, ranked top
+    on flow, yet only 12.6bps gross and +0.6 after the round-trip cost. Being
+    fillable is not the same as being worth doing."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_NET_SWING_BPS", 5.0)
+    rows = [
+        _fill_row("ZEREBRO", 44.9, 24, 1_000_000, trades=6_266),
+        _fill_row("WORTHIT", 20.2, 7, 129_000, trades=408),
+    ]
+    rows[0].basis_p10_24h = 32.3     # net (44.9-32.3)-12 = +0.6 -> dropped
+    rows[1].basis_p10_24h = 2.8      # net (20.2-2.8)-12  = +5.4 -> kept
+    assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == ["WORTHIT"]

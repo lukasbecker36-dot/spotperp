@@ -483,7 +483,7 @@ class ControlBot:
                 return f"{v / 1e3:.0f}k"
             return f"{v:.0f}"
 
-        hdr = (f"{'symbol':<12}{'entry':>6}{'lo24':>6}{'swing':>6}{'hrs':>4}"
+        hdr = (f"{'symbol':<12}{'entry':>6}{'lo24':>6}{'net':>6}{'hrs':>4}"
                f"{'tr/h':>6}{'jit':>6}{'dep$':>6}")
         sep = "-" * len(hdr)
         lines = [f"fillability screen ({age_s:.0f}s old)", hdr, sep]
@@ -494,7 +494,7 @@ class ControlBot:
             jit_s = f"{jit:>6.1f}" if r.get("samples", 0) >= 3 else f"{'-':>6}"
             lines.append(
                 f"{r['symbol'][:11]:<12}{entry_avg:>6.1f}{lo:>6.1f}"
-                f"{entry_avg - lo:>6.1f}"
+                f"{entry_avg - lo - float(config.ENTRY_MIN_EDGE_FLOOR_BPS):>+6.1f}"
                 f"{r.get('hours_tradeable_24h', 0):>4.0f}"
                 f"{r.get('perp_trades_24h', 0) / 24.0:>6.1f}{jit_s}"
                 f"{r['max_notional_usd']:>6,.0f}"
@@ -511,8 +511,11 @@ class ControlBot:
             " is what lifts a maker). Full 24h volume is in /book."
         )
         lines.append(
-            "swing = entry - lo24, the round trip if it returns to its own low."
-            " lo24 below 0 means it reaches a NEGATIVE basis you can exit into."
+            f"net = (entry - lo24) - {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps"
+            " round-trip cost: what the trip is actually WORTH. lo24 is where"
+            " to set your exit target — a lo24 of +32 will never fill an /exit"
+            f" at 0. Rows under +{config.SCREEN_FILL_MIN_NET_SWING_BPS:.0f} are"
+            " dropped as not worth working."
         )
         lines.append(
             f"jit = mean bps the basis moves BETWEEN 5m samples. A smooth drift"

@@ -83,6 +83,14 @@ SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
 SCREEN_MAX_BASIS_JITTER_BPS = float(
     os.environ.get("SCREEN_MAX_BASIS_JITTER_BPS", "25")
 )
+# A fillable name is not automatically a trade worth doing. The round trip
+# (entry basis now - the pair's own 24h low) must clear the round-trip cost
+# floor by at least this much, or you are working an order for nothing — or
+# worse, entering something whose basis never comes back far enough to close
+# (ZEREBRO: 44.9 entry, 24h low +32.3, so 12.6 gross and +0.6 after costs).
+SCREEN_FILL_MIN_NET_SWING_BPS = float(
+    os.environ.get("SCREEN_FILL_MIN_NET_SWING_BPS", "5")
+)
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis
