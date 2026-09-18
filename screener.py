@@ -90,6 +90,10 @@ class ScreenerRow:
     # only flickers has a tight range because the noise averages out per hour.
     basis_p10_24h: float = 0.0
     basis_p90_24h: float = 0.0
+    # Can this actually be TRADED? Depth is resting size; these are flow.
+    perp_volume_24h: float = 0.0    # Aster perp 24h quote volume (USDT)
+    perp_trades_24h: float = 0.0    # ...and how many trades made it up
+    hours_tradeable_24h: float = 0.0  # hours the basis sat at/above the floor
 
 
 class RollingBasis:
@@ -247,10 +251,36 @@ def rank_rows_by_swing(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     return eligible[: config.SCREENER_TOP_N]
 
 
+def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
+    """Rank by how many CHANCES a name gives you to get filled.
+
+    /screen ranks by the size of the edge, and depth only proves the book is
+    not empty. But an entry rests as a maker: it fills when a taker lifts it.
+    A wide basis on a symbol nobody trades never fills however good it looks —
+    which is why the richest /screen rows can be the hardest to enter.
+
+    So gate on FLOW, not size: real 24h perp volume, and a basis that sat at a
+    workable level for hours rather than spiking for one tick. Ranked by dwell
+    time, because that is literally the number of chances to be lifted.
+    """
+    eligible = [
+        r
+        for r in rows
+        if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
+        and r.perp_volume_24h >= config.SCREEN_FILL_MIN_VOLUME_USD
+        and r.hours_tradeable_24h >= config.SCREEN_FILL_MIN_HOURS
+    ]
+    eligible.sort(
+        key=lambda r: (r.hours_tradeable_24h, r.perp_volume_24h), reverse=True
+    )
+    return eligible[: config.SCREENER_TOP_N]
+
+
 def write_snapshot(
     rows: list[ScreenerRow],
     diff_rows: list[ScreenerRow] | None = None,
     swing_rows: list[ScreenerRow] | None = None,
+    fill_rows: list[ScreenerRow] | None = None,
 ) -> None:
     config.SCREENER_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -258,6 +288,7 @@ def write_snapshot(
         "rows": [asdict(r) for r in rows],
         "diff_rows": [asdict(r) for r in (diff_rows or [])],
         "swing_rows": [asdict(r) for r in (swing_rows or [])],
+        "fill_rows": [asdict(r) for r in (fill_rows or [])],
     }
     tmp = config.SCREENER_SNAPSHOT_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=1))
@@ -335,6 +366,17 @@ class DailyBasis:
         if not b:
             return []
         return [v[0] / v[1] for v in b.values() if v[1] > 0]
+
+    def hours_above(self, symbol: str, threshold: float) -> float:
+        """How many of the last 24 hours had a mean basis at or above
+        `threshold` — the DWELL time at a workable level.
+
+        A resting maker entry needs TIME to be lifted. A basis that spikes for
+        one tick can't be worked; one sitting wide for 18 of 24 hours gives
+        repeated chances to be filled (the STONK pattern). This is the
+        difference between an opportunity and a screenshot.
+        """
+        return float(sum(1 for m in self.hourly_means(symbol) if m >= threshold))
 
     def percentiles(
         self, symbol: str, lo: float = 10.0, hi: float = 90.0

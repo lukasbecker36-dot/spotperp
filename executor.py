@@ -58,6 +58,10 @@ class MarketData:
     pair_maps: dict[str, PairMap] = field(default_factory=dict)
     aster_info: dict[str, SymbolInfo] = field(default_factory=dict)
     mexc_info: dict[str, SymbolInfo] = field(default_factory=dict)
+    # Aster perp 24h traded volume / trade count per symbol. Depth says the
+    # book isn't empty; this says someone is actually trading, which is what
+    # lifts a resting maker entry.
+    perp_volume: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass

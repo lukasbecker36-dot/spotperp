@@ -317,3 +317,59 @@ def test_hourly_means_average_out_intra_hour_flicker():
     s_lo, s_hi = swinger.percentiles("SWING")
     assert abs(f_hi - f_lo) < 5.0       # noise averages out -> tiny range
     assert (s_hi - s_lo) > 100.0        # real day-scale swing -> wide range
+
+
+def _fill_row(symbol, entry, hours_tradeable, volume, depth=1000.0):
+    r = _row(symbol, entry, entry, hours=24.0, depth=depth)
+    r.hours_tradeable_24h = hours_tradeable
+    r.perp_volume_24h = volume
+    return r
+
+
+def test_fillability_ranks_by_dwell_not_basis_size(monkeypatch):
+    """The fattest basis is often the least fillable. A name workable for 21h
+    on real volume beats one showing 160bps for an hour on a dead book."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 250_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    rows = [
+        _fill_row("FATBUTDEAD", 160.0, 5, 310_000),
+        _fill_row("STONK", 78.0, 21, 4_200_000),
+        _fill_row("BUSY", 45.0, 14, 1_150_000),
+    ]
+    ranked = screener.rank_rows_by_fillability(rows)
+    assert [r.symbol for r in ranked] == ["STONK", "BUSY", "FATBUTDEAD"]
+
+
+def test_fillability_excludes_dead_books(monkeypatch):
+    """A wide basis on a symbol nobody trades never fills, however good it
+    looks — depth alone can't tell you that."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 250_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    rows = [
+        _fill_row("NOFLOW", 200.0, 24, 1_000),      # deep book, no trading
+        _fill_row("TRADED", 30.0, 10, 900_000),
+    ]
+    assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == ["TRADED"]
+
+
+def test_fillability_excludes_one_tick_spikes(monkeypatch):
+    """A basis that was only workable for an hour can't be worked by a resting
+    maker order."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 250_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    rows = [
+        _fill_row("SPIKE", 300.0, 1, 5_000_000),
+        _fill_row("SUSTAINED", 25.0, 12, 500_000),
+    ]
+    assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == ["SUSTAINED"]
+
+
+def test_hours_above_counts_workable_hours():
+    import time as _time
+    now = int(_time.time() * 1000)
+    d = screener.DailyBasis()
+    for h in range(24):
+        # wide for 18 hours, flat for 6
+        d.add("XUSDT", now - h * 3_600_000, 80.0 if h < 18 else 1.0)
+    assert d.hours_above("XUSDT", 20.0) == 18
+    assert d.hours_above("XUSDT", 200.0) == 0

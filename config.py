@@ -60,6 +60,15 @@ SCREEN_SWING_EXIT_BPS = float(os.environ.get("SCREEN_SWING_EXIT_BPS", "5"))
 SCREEN_SWING_MIN_FUNDING_BPS = float(
     os.environ.get("SCREEN_SWING_MIN_FUNDING_BPS", "0")
 )
+# /screen fill answers "can I actually get filled here?". Depth is RESTING
+# size; a maker entry only fills when a taker lifts it, so these gate on FLOW:
+# 24h perp volume, and how many of the last 24h the basis sat at a workable
+# level (a basis that spikes for one tick cannot be worked; one wide for hours
+# gives repeated chances — the STONK pattern).
+SCREEN_FILL_MIN_VOLUME_USD = float(
+    os.environ.get("SCREEN_FILL_MIN_VOLUME_USD", "250000")
+)
+SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

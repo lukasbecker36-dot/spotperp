@@ -399,6 +399,13 @@ class Engine:
                 )
             await asyncio.sleep(0.25)
         log.info("funding stats refreshed for %d symbols", len(self.md.funding_stats))
+        # 24h perp volume in the same sweep: one call for the whole universe,
+        # and it moves slowly enough that the funding cadence is plenty.
+        try:
+            self.md.perp_volume = await self.aster.ticker_24hr()
+            log.info("perp 24h volume for %d symbols", len(self.md.perp_volume))
+        except Exception:
+            log.exception("perp 24h volume refresh failed (keeping previous)")
 
     def _write_screener_snapshot(self) -> None:
         now = int(time.time() * 1000)
@@ -422,11 +429,18 @@ class Engine:
                 self._basis_avg.annotate(row)
                 self._basis_24h.add(sym, now, row.entry_bps)
                 self._basis_24h.annotate(row)
+                vol = self.md.perp_volume.get(pair.aster_symbol) or {}
+                row.perp_volume_24h = float(vol.get("quote_volume", 0) or 0)
+                row.perp_trades_24h = float(vol.get("trades", 0) or 0)
+                row.hours_tradeable_24h = self._basis_24h.hours_above(
+                    sym, float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+                )
                 rows.append(row)
         screener.write_snapshot(
             screener.rank_rows(rows),
             screener.rank_rows_by_dislocation(rows),
             screener.rank_rows_by_swing(rows),
+            screener.rank_rows_by_fillability(rows),
         )
         self._log_basis_rows(rows)
 

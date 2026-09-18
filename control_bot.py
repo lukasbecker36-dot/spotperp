@@ -38,6 +38,7 @@ HELP = """Commands:
 /screen [n] — top basis opportunities
 /screen diff [n] — pairs furthest ABOVE their own 24h avg basis (reversion candidates)
 /screen swing [n] — pairs that go wide then return to closeable (round-trip candidates)
+/screen fill [n] — pairs with real perp volume + a persistently workable basis (you can actually get filled)
 /funding [n] — top funding carry (24h avg, 8h-equiv)
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
@@ -286,6 +287,8 @@ class ControlBot:
             return self._cmd_screen_diff(args[1:])
         if args and args[0].lower() in ("swing", "s"):
             return self._cmd_screen_swing(args[1:])
+        if args and args[0].lower() in ("fill", "f"):
+            return self._cmd_screen_fill(args[1:])
         n = int(args[0]) if args else 10
         snap = screener.read_snapshot()
         age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
@@ -435,6 +438,65 @@ class ControlBot:
         lines.append(
             "Past oscillation is not a promise it repeats — check /book depth and"
             " the exit basis before entering."
+        )
+        return "\n".join(lines)
+
+
+    def _cmd_screen_fill(self, args: list[str]) -> str:
+        """Names you can realistically get FILLED on.
+
+        /screen ranks by the size of the edge, and its depth filter only proves
+        the book isn't empty. But an entry rests as a maker — it fills when a
+        taker lifts it. A wide basis on a symbol nobody trades never fills,
+        which is why the richest rows are often the hardest to enter.
+        """
+        n = int(args[0]) if args else 10
+        snap = screener.read_snapshot()
+        age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
+        rows = (snap.get("fill_rows") or [])[:n]
+        if not rows:
+            return (
+                "no fillable candidates — needs 24h perp volume >= "
+                f"${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f} and the basis workable"
+                f" for >= {config.SCREEN_FILL_MIN_HOURS:.0f}h of the last 24."
+                " If you just deployed, give it a slow scan."
+            )
+
+        def vol(v: float) -> str:
+            if v >= 1e9:
+                return f"{v / 1e9:.1f}B"
+            if v >= 1e6:
+                return f"{v / 1e6:.1f}M"
+            if v >= 1e3:
+                return f"{v / 1e3:.0f}k"
+            return f"{v:.0f}"
+
+        hdr = (f"{'symbol':<13}{'entry':>7}{'lo24':>7}{'hrs':>5}{'vol24':>8}"
+               f"{'trades':>8}{'dep$':>7}")
+        sep = "-" * len(hdr)
+        lines = [f"fillability screen ({age_s:.0f}s old)", hdr, sep]
+        for r in rows:
+            entry_avg = r.get("entry_bps_avg", r["entry_bps"])
+            lines.append(
+                f"{r['symbol'][:12]:<13}{entry_avg:>7.1f}"
+                f"{r.get('basis_p10_24h', entry_avg):>7.1f}"
+                f"{r.get('hours_tradeable_24h', 0):>5.0f}"
+                f"{vol(r.get('perp_volume_24h', 0)):>8}"
+                f"{r.get('perp_trades_24h', 0):>8,.0f}"
+                f"{r['max_notional_usd']:>7,.0f}"
+            )
+        lines.append(sep)
+        lines.append(
+            "hrs = hours of the last 24 the basis sat at/above the entry floor —"
+            " your CHANCES to be lifted. Ranked by it."
+        )
+        lines.append(
+            "vol24/trades = Aster perp 24h traded volume and trade count. Depth"
+            " is resting size; this is actual flow, which is what fills a maker."
+        )
+        lines.append(
+            "lo24 = p10 of hourly basis: how far it comes back, i.e. whether you"
+            " can get OUT. Check /book before entering."
         )
         return "\n".join(lines)
 

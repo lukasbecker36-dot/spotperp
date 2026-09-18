@@ -229,6 +229,28 @@ class AsterClient(_BaseClient):
             )
         return out
 
+    async def ticker_24hr(self) -> dict[str, dict[str, Decimal]]:
+        """24h traded volume and trade count for every perp, in one call.
+
+        Depth says the book is not empty; VOLUME says someone is actually
+        trading. A resting maker entry only fills when a taker lifts it, so a
+        wide basis on a symbol nobody trades is untradeable however good the
+        number looks.
+        """
+        payload = await self._request(
+            "GET", "/fapi/v1/ticker/24hr", venue=self.VENUE
+        )
+        out: dict[str, dict[str, Decimal]] = {}
+        for row in payload if isinstance(payload, list) else [payload]:
+            sym = row.get("symbol")
+            if not sym:
+                continue
+            out[sym] = {
+                "quote_volume": _dec(row.get("quoteVolume")),
+                "trades": Decimal(int(row.get("count") or 0)),
+            }
+        return out
+
     async def premium_index(self) -> dict[str, dict[str, Decimal]]:
         """mark price, index price and current funding rate for all symbols."""
         payload = await self._request(
