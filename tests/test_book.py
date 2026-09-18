@@ -74,3 +74,16 @@ def test_format_book_handles_empty_side():
     assert "ASTER perp: no levels" in out
     assert "MEXC spot" in out
     assert "entry basis" not in out  # no basis without both books
+
+
+def test_format_book_shows_perp_volume():
+    out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC,
+                           volume={"quote_volume": Decimal("184000"),
+                                   "trades": Decimal(2140)})
+    assert "perp 24h volume $184k" in out
+    assert "2,140 trades" in out
+
+
+def test_format_book_omits_volume_when_absent():
+    out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC)
+    assert "24h volume" not in out

@@ -65,8 +65,13 @@ SCREEN_SWING_MIN_FUNDING_BPS = float(
 # 24h perp volume, and how many of the last 24h the basis sat at a workable
 # level (a basis that spikes for one tick cannot be worked; one wide for hours
 # gives repeated chances — the STONK pattern).
+# A floor for "someone is trading this at all", NOT a liquidity requirement:
+# the names that actually fill a $100 clip can be far thinner than they look
+# (STONK fills repeatedly on modest volume). Set too high this excludes exactly
+# the profile worth trading. Check a known-good symbol's vol24 in /book and
+# calibrate from that rather than trusting this default.
 SCREEN_FILL_MIN_VOLUME_USD = float(
-    os.environ.get("SCREEN_FILL_MIN_VOLUME_USD", "250000")
+    os.environ.get("SCREEN_FILL_MIN_VOLUME_USD", "50000")
 )
 SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
 

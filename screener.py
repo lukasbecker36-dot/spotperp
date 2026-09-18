@@ -260,8 +260,10 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     which is why the richest /screen rows can be the hardest to enter.
 
     So gate on FLOW, not size: real 24h perp volume, and a basis that sat at a
-    workable level for hours rather than spiking for one tick. Ranked by dwell
-    time, because that is literally the number of chances to be lifted.
+    workable level for hours rather than spiking for one tick. Also require the
+    basis to clear the entry floor RIGHT NOW, or the screen lists names that
+    fill well but cannot be entered today. Ranked by dwell time, because that is
+    literally the number of chances to be lifted.
     """
     eligible = [
         r
@@ -269,6 +271,9 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
         and r.perp_volume_24h >= config.SCREEN_FILL_MIN_VOLUME_USD
         and r.hours_tradeable_24h >= config.SCREEN_FILL_MIN_HOURS
+        # Enterable RIGHT NOW. Dwell says a name is reliably workable, but a
+        # row you cannot act on today is a watchlist entry, not a candidate.
+        and r.entry_bps_avg >= float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
     ]
     eligible.sort(
         key=lambda r: (r.hours_tradeable_24h, r.perp_volume_24h), reverse=True

@@ -1528,7 +1528,9 @@ class Engine:
                 "next_funding_h": next_h,
             }
         return book.format_book(
-            symbol, pair.qty_multiplier, aster_depth, mexc_depth, funding=funding
+            symbol, pair.qty_multiplier, aster_depth, mexc_depth,
+            funding=funding,
+            volume=self.md.perp_volume.get(pair.aster_symbol),
         )
 
     async def _cmd_adopt(self, args: dict) -> str:

@@ -373,3 +373,17 @@ def test_hours_above_counts_workable_hours():
         d.add("XUSDT", now - h * 3_600_000, 80.0 if h < 18 else 1.0)
     assert d.hours_above("XUSDT", 20.0) == 18
     assert d.hours_above("XUSDT", 200.0) == 0
+
+
+def test_fillability_requires_current_enterability(monkeypatch):
+    """A name that fills well but whose basis is BELOW the entry floor today is
+    a watchlist entry, not a candidate — it can't be acted on."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    rows = [
+        # huge flow, historically workable, but -2.4bps right now (the 龙虾 case)
+        _fill_row("NOTNOW", -2.4, 6, 12_000_000),
+        _fill_row("ENTERABLE", 40.0, 5, 200_000),
+    ]
+    assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == ["ENTERABLE"]

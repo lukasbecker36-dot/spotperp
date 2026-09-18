@@ -46,7 +46,7 @@ def _block(title: str, asks, bids, div: Decimal) -> list[str]:
 
 def format_book(
     symbol: str, mult: Decimal, aster_depth: dict, mexc_depth: dict,
-    levels: int = 5, funding: dict | None = None,
+    levels: int = 5, funding: dict | None = None, volume: dict | None = None,
 ) -> str:
     a_asks = _levels(aster_depth.get("asks"), levels)
     a_bids = _levels(aster_depth.get("bids"), levels)
@@ -99,4 +99,24 @@ def format_book(
             tail.append(f"next in {float(nxt):.1f}h")
         tail.append("+ = short receives")
         lines.append("  " + " · ".join(tail))
+
+    if volume:
+        qv = volume.get("quote_volume")
+        tr = volume.get("trades")
+        def _v(x):
+            x = float(x or 0)
+            if x >= 1e9:
+                return f"${x / 1e9:.1f}B"
+            if x >= 1e6:
+                return f"${x / 1e6:.1f}M"
+            if x >= 1e3:
+                return f"${x / 1e3:.0f}k"
+            return f"${x:.0f}"
+        lines.append("")
+        lines.append(
+            f"perp 24h volume {_v(qv)} over {float(tr or 0):,.0f} trades"
+        )
+        lines.append(
+            "  flow, not resting depth — this is what lifts a maker entry"
+        )
     return "\n".join(lines)
