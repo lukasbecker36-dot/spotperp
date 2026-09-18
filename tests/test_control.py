@@ -172,3 +172,22 @@ def test_screen_fill_reports_best_dwell_when_thresholds_unmet(tmp_path, monkeypa
     ])
     out = control_bot.ControlBot._cmd_screen(_bot(), ["fill"])
     assert "best right now: 2h" in out
+
+
+def test_pad_counts_display_columns_not_code_points():
+    """The CJK-named pairs top the fillability screen, and a CJK glyph takes
+    two monospace cells. Padding on len() would shunt the rest of the row right
+    and the board would stop lining up."""
+    assert control_bot._pad("哈基米USDT", 11) == "哈基米USDT "   # 10 cells + 1
+    assert control_bot._pad("GRVTUSDT", 11) == "GRVTUSDT   "
+    assert control_bot._pad("我踏马来了USDT", 11) == "我踏马来了U"   # 14 cells -> trimmed to exactly 11
+
+
+def _cells(text):
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def test_pad_never_exceeds_its_width():
+    for sym in ("哈基米USDT", "我踏马来了USDT", "A", "", "LONGASCIISYMBOLUSDT"):
+        assert _cells(control_bot._pad(sym, 11)) <= 11

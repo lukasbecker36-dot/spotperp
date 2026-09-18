@@ -16,6 +16,7 @@ import json
 import logging
 import subprocess
 import time
+import unicodedata
 from decimal import Decimal, InvalidOperation
 
 import aiohttp
@@ -101,6 +102,24 @@ BOT_COMMANDS = [
     {"command": "restart", "description": "Restart the engine service"},
     {"command": "update", "description": "Git pull + restart (deploy latest code)"},
 ]
+
+
+
+def _pad(text: str, width: int) -> str:
+    """Left-pad to WIDTH *display* columns, not code points.
+
+    Telegram renders <pre> in a monospace font where CJK glyphs occupy two
+    cells. "哈基米USDT" is 9 characters but 14 columns wide, so a plain
+    f"{sym:<11}" shunts the rest of that row right and the board stops lining
+    up — and the CJK-named pairs are exactly the ones topping this screen.
+    """
+    cells = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+    while cells > width and text:
+        text = text[:-1]
+        cells = sum(
+            2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text
+        )
+    return text + " " * (width - cells)
 
 
 class ControlBot:
@@ -483,7 +502,7 @@ class ControlBot:
                 return f"{v / 1e3:.0f}k"
             return f"{v:.0f}"
 
-        hdr = (f"{'symbol':<11}{'score':>6}{'entry':>6}{'lo24':>7}{'net':>6}"
+        hdr = (f"{'symbol':<11}{'score':>6}{'entry':>6}{'lo24':>7}{'net':>7}"
                f"{'hrs':>4}{'tr/h':>6}{'jit':>5}{'$clip':>6}")
         sep = "-" * len(hdr)
         lines = [f"fillability screen ({age_s:.0f}s old)", hdr, sep]
@@ -505,8 +524,8 @@ class ControlBot:
             lo_s = (f"{f'{lo:.1f}!':>7}"
                     if lo > config.SCREEN_FILL_FLAG_LO_BPS else f"{lo:>7.1f}")
             lines.append(
-                f"{r['symbol'][:10]:<11}{score:>+6.1f}{entry_avg:>6.1f}{lo_s}"
-                f"{net:>+6.1f}"
+                f"{_pad(r['symbol'], 11)}{score:>+6.1f}{entry_avg:>6.1f}{lo_s}"
+                f"{net:>+7.1f}"
                 f"{r.get('hours_tradeable_24h', 0):>4.0f}"
                 f"{r.get('perp_trades_24h', 0) / 24.0:>6.1f}{jit_s}"
                 f"{net * r['max_notional_usd'] / 10000.0:>6.1f}"
