@@ -111,6 +111,10 @@ class Engine:
         # Positions whose working order was stood down for liquidation
         # proximity. Latched so a manual /exit afterwards is honoured.
         self._liq_protect: set[int] = set()
+        # Last DB-vs-MEXC spot check per position (throttle), and the first
+        # time a deficit was seen (confirmation window).
+        self._spot_check_at: dict[int, float] = {}
+        self._spot_deficit_since: dict[int, float] = {}
         # Venue order ids of each position's /stops legs, so the hedge guard can
         # recognise its OWN stop firing (query the real fill) vs an ADL.
         self._stops_orders: dict[int, dict] = {}
@@ -925,6 +929,81 @@ class Engine:
                 f"🔁 position {pos.id} {pos.symbol}: size changed {prior} -> {current}"
                 f" — /stops auto-refreshed to cover the new size\n{result}"
             )
+
+    async def _check_spot_integrity(self, pos: pm.Position) -> None:
+        """Reconcile the DB's spot leg against the MEXC balance.
+
+        The perp leg is checked against Aster positionRisk, but nothing ever
+        checked the spot leg — so the DB could believe it holds coins that are
+        not there. The main way that happens: an AMBIGUOUS spot sale, where the
+        order may have filled but we deliberately do NOT record a fill (to avoid
+        double-counting a sale that might not have happened). The alert asks for
+        a manual reconcile; nothing did it. STONK #189 ended up with 366 in the
+        DB against 4 on MEXC, and the exit then wedged trying to sell coins that
+        did not exist.
+
+        Only a venue balance BELOW the DB is acted on. A balance above it is
+        expected and fine — the operator may hold the same coin outside the
+        strategy, and that is none of our business.
+        """
+        if self.paper or pos.paper or pos.spot_qty <= 0:
+            return
+        if pos.state in (pm.PENDING_ENTRY, pm.ENTERING):
+            return                      # spot still in flux mid-entry
+        now = time.monotonic()
+        if now - self._spot_check_at.get(pos.id, 0.0) < config.SPOT_CHECK_INTERVAL_SECONDS:
+            return
+        self._spot_check_at[pos.id] = now
+        pair = self.md.pair_maps.get(pos.symbol)
+        info = self.md.mexc_info.get(pair.mexc_symbol) if pair else None
+        if pair is None or info is None:
+            return
+        try:
+            account = await self.mexc.account()
+        except ExchangeError:
+            log.exception("spot integrity: MEXC account fetch failed")
+            return
+        venue = Decimal(0)
+        for b in account.get("balances", []):
+            if b.get("asset") == info.base_asset:
+                venue = _dec_or_zero(b.get("free")) + _dec_or_zero(b.get("locked"))
+                break
+        deficit = pos.spot_qty - venue
+        tolerance = max(
+            info.step_size,
+            pos.spot_qty * config.HEDGE_BREAK_TOLERANCE_PCT / Decimal(100),
+        )
+        if deficit <= tolerance:
+            self._spot_deficit_since.pop(pos.id, None)
+            return
+        first = self._spot_deficit_since.get(pos.id)
+        if first is None:
+            self._spot_deficit_since[pos.id] = now
+            journal(self.conn, f"position {pos.id}: SPOT DEFICIT db={pos.spot_qty}"
+                    f" venue={venue} — confirming", "ERROR")
+            return
+        if now - first < config.HEDGE_BREAK_CONFIRM_SECONDS:
+            return
+        self._spot_deficit_since.pop(pos.id, None)
+        # Confirmed: book the missing spot as sold at the current bid so the DB
+        # matches reality and the position can finish closing.
+        book = self.md.mexc_books.get(pair.mexc_symbol)
+        price = book.bid if book and book.bid > 0 else (pos.spot_entry_avg or Decimal(0))
+        qty = info.round_qty(deficit)
+        if qty <= 0 or price <= 0:
+            return
+        self.positions.record_fill(
+            pos.id, "mexc", "exit", "SELL", qty, price,
+            Decimal(0),            # fee already taken on the venue, if it filled
+        )
+        journal(self.conn, f"position {pos.id}: spot reconciled to venue"
+                f" (-{qty} @ {price})", "ERROR")
+        await self.notifier.alert(
+            f"🔧 position {pos.id} {pos.symbol}: DB held {pos.spot_qty} spot but"
+            f" MEXC shows {venue} — booking the missing {qty} as sold @ {price}"
+            f" so the position can close. Likely an AMBIGUOUS sale that did fill;"
+            f" verify the real price in your MEXC trade history."
+        )
 
     async def _stand_down_for_liq(self, pos: pm.Position, dist: float) -> None:
         """Near liquidation, a WAITING order is a liability.
@@ -1788,6 +1867,7 @@ class Engine:
                         # Liquidation risk exists in any state while the perp short
                         # is open, so check it independently of the basis logic.
                         await self._check_liquidation(pos)
+                        await self._check_spot_integrity(pos)
                         if pos.state == pm.OPEN:
                             if await self._check_hedge_integrity(pos):
                                 continue   # guard took over; skip basis checks
@@ -1806,6 +1886,9 @@ class Engine:
                 for gone in set(self._tp_confirm) - active_ids:
                     self._tp_confirm.pop(gone, None)
                 self._liq_protect &= active_ids
+                for gone in set(self._spot_check_at) - active_ids:
+                    self._spot_check_at.pop(gone, None)
+                    self._spot_deficit_since.pop(gone, None)
             except Exception:
                 log.exception("safety loop error")
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS * 5)

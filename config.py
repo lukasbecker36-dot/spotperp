@@ -185,6 +185,12 @@ HEDGE_BREAK_RISK_FRESH_SECONDS = float(
     os.environ.get("HEDGE_BREAK_RISK_FRESH_SECONDS", "45")
 )
 HEDGE_BREAK_TOLERANCE_PCT = Decimal(os.environ.get("HEDGE_BREAK_TOLERANCE_PCT", "1"))
+# How often to compare a position's DB spot leg against the MEXC balance.
+# Cheap (one account call) but not needed every sweep; the divergence it
+# catches (an ambiguous sale that actually filled) is rare and static.
+SPOT_CHECK_INTERVAL_SECONDS = float(
+    os.environ.get("SPOT_CHECK_INTERVAL_SECONDS", "60")
+)
 ADL_SELL_TRANCHE_PCT = Decimal(os.environ.get("ADL_SELL_TRANCHE_PCT", "10"))
 ADL_SELL_INTERVAL_SECONDS = float(os.environ.get("ADL_SELL_INTERVAL_SECONDS", "10"))
 # When the perp deficit is explained by OUR OWN /stops STOP_MARKET having fired

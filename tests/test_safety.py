@@ -82,6 +82,8 @@ def engine(tmp_path, monkeypatch):
     eng._auto_stops_attempt = {}
     eng._tp_confirm = {}
     eng._liq_protect = set()
+    eng._spot_check_at = {}
+    eng._spot_deficit_since = {}
     eng._stops_orders = {}
     eng._stop_grace = {}
     eng._hedge_break = {}
@@ -1300,3 +1302,62 @@ async def test_stand_down_latch_rearms_after_recovery(engine):
     }
     await engine._check_liquidation(engine.positions.get(pid))
     assert pid not in engine._liq_protect
+
+
+class _BalanceClient(_StopClient):
+    """MEXC stub returning a fixed base-asset balance."""
+
+    def __init__(self, qty):
+        super().__init__()
+        self._qty = str(qty)
+
+    async def account(self):
+        return {"balances": [{"asset": "BTC", "free": self._qty, "locked": "0"}]}
+
+
+async def test_spot_deficit_reconciled_to_venue(engine, monkeypatch):
+    """STONK #189: DB held 366 spot, MEXC had 4. An ambiguous sale that DID
+    fill is never recorded, so the DB believes it holds coins that aren't
+    there and the exit wedges trying to sell them."""
+    monkeypatch.setattr(config, "SPOT_CHECK_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(config, "HEDGE_BREAK_CONFIRM_SECONDS", 0.0)
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    before = engine.positions.get(pid)
+    assert before.spot_qty == Decimal("9.95")
+    engine.mexc = _BalanceClient("2.0")          # venue has far less
+
+    await engine._check_spot_integrity(engine.positions.get(pid))   # confirm
+    await engine._check_spot_integrity(engine.positions.get(pid))   # act
+
+    after = engine.positions.get(pid)
+    assert after.spot_qty == Decimal("2.0")      # reconciled down to venue
+    assert any("MEXC shows" in m for m in engine.notifier.messages)
+
+
+async def test_spot_surplus_is_left_alone(engine, monkeypatch):
+    """A balance ABOVE the DB is the operator's own coin, not our business."""
+    monkeypatch.setattr(config, "SPOT_CHECK_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(config, "HEDGE_BREAK_CONFIRM_SECONDS", 0.0)
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.mexc = _BalanceClient("500")          # they hold extra separately
+
+    await engine._check_spot_integrity(engine.positions.get(pid))
+    await engine._check_spot_integrity(engine.positions.get(pid))
+
+    assert engine.positions.get(pid).spot_qty == Decimal("9.95")   # untouched
+
+
+async def test_spot_deficit_needs_confirmation(engine, monkeypatch):
+    """One reading must not act — a transient API blip shouldn't book a sale."""
+    monkeypatch.setattr(config, "SPOT_CHECK_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(config, "HEDGE_BREAK_CONFIRM_SECONDS", 999.0)
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.mexc = _BalanceClient("2.0")
+
+    await engine._check_spot_integrity(engine.positions.get(pid))
+    await engine._check_spot_integrity(engine.positions.get(pid))
+
+    assert engine.positions.get(pid).spot_qty == Decimal("9.95")   # not yet
