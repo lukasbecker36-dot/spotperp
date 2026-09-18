@@ -74,6 +74,15 @@ SCREEN_FILL_MIN_VOLUME_USD = float(
     os.environ.get("SCREEN_FILL_MIN_VOLUME_USD", "50000")
 )
 SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
+# Reject a basis that jumps wildly tick to tick: a resting order can't be
+# worked against it, because the price you get is a lottery (BULLA printed
+# -0.3/+158/-160/+27 inside a minute and a taker close fired on -160 then
+# filled at +27). Measured as the mean absolute change between consecutive 5m
+# samples, so a smooth drift is NOT penalised — only flicker. Check a symbol
+# you trade happily in /screen fill and calibrate from its jit column.
+SCREEN_MAX_BASIS_JITTER_BPS = float(
+    os.environ.get("SCREEN_MAX_BASIS_JITTER_BPS", "25")
+)
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

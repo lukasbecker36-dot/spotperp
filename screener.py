@@ -80,6 +80,10 @@ class ScreenerRow:
     net_edge_bps_avg: float = 0.0
     samples: int = 0          # samples in the window
     window_s: float = 0.0     # span covered by those samples (seconds)
+    # Mean absolute change between consecutive samples in the window. A basis
+    # that jumps wildly every tick can't be worked by a resting order: the fill
+    # price is a lottery (BULLA printed -0.3/+158/-160/+27 inside a minute).
+    entry_bps_jitter: float = 0.0
     # 24h mean of the entry basis (filled by DailyBasis). Tells a DISLOCATION
     # (entry_bps >> this -> likely to revert) apart from a pair that simply
     # always trades rich (entry_bps ~ this -> no convergence to capture).
@@ -129,6 +133,14 @@ class RollingBasis:
         row.net_edge_bps_avg = sum(x[2] for x in dq) / n
         row.samples = n
         row.window_s = (dq[-1][0] - dq[0][0]) / 1000.0
+        # Mean absolute change BETWEEN CONSECUTIVE samples, not a standard
+        # deviation: a basis drifting smoothly +10 -> +80 across the window is
+        # perfectly tradeable yet has a big std, while one bouncing +150/-150
+        # each sample is not. Only successive change separates them.
+        if n >= 2:
+            row.entry_bps_jitter = sum(
+                abs(dq[i][1] - dq[i - 1][1]) for i in range(1, n)
+            ) / (n - 1)
         return row
 
 
@@ -200,6 +212,18 @@ def rank_rows(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     return eligible[: config.SCREENER_TOP_N]
 
 
+def _too_jittery(row: ScreenerRow) -> bool:
+    """True when the basis flickers too hard to work a resting order against.
+
+    Needs at least 3 samples to mean anything; with fewer we cannot judge, so
+    fail OPEN rather than hiding a name for lack of data.
+    """
+    return (
+        row.samples >= 3
+        and row.entry_bps_jitter > config.SCREEN_MAX_BASIS_JITTER_BPS
+    )
+
+
 def rank_rows_by_dislocation(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     """Rank by how far the 5m entry basis sits ABOVE the pair's own 24h mean.
 
@@ -246,6 +270,7 @@ def rank_rows_by_swing(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         and r.hours_24h >= config.SCREEN_DIFF_MIN_HOURS
         and r.basis_p10_24h <= config.SCREEN_SWING_EXIT_BPS
         and r.funding_8h_bps >= config.SCREEN_SWING_MIN_FUNDING_BPS
+        and not _too_jittery(r)
     ]
     eligible.sort(key=lambda r: r.entry_bps_avg - r.basis_p10_24h, reverse=True)
     return eligible[: config.SCREENER_TOP_N]
@@ -271,6 +296,7 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
         and r.perp_volume_24h >= config.SCREEN_FILL_MIN_VOLUME_USD
         and r.hours_tradeable_24h >= config.SCREEN_FILL_MIN_HOURS
+        and not _too_jittery(r)
         # Enterable RIGHT NOW. Dwell says a name is reliably workable, but a
         # row you cannot act on today is a watchlist entry, not a candidate.
         and r.entry_bps_avg >= float(config.ENTRY_MIN_EDGE_FLOOR_BPS)

@@ -397,3 +397,61 @@ def test_fillability_requires_current_enterability(monkeypatch):
         _fill_row("ENTERABLE", 40.0, 5, 200_000),
     ]
     assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == ["ENTERABLE"]
+
+
+def _jitter_row(symbol, entry, jitter, samples=20):
+    r = _fill_row(symbol, entry, hours_tradeable=20, volume=1_000_000, trades=24_000)
+    r.entry_bps_jitter = jitter
+    r.samples = samples
+    return r
+
+
+def test_fillability_drops_flickering_basis(monkeypatch):
+    """BULLA printed -0.3/+158/-160/+27 inside a minute. A resting order can't
+    be worked against that — the fill price is a lottery."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "SCREEN_MAX_BASIS_JITTER_BPS", 25.0)
+    rows = [
+        _jitter_row("FLICKER", 90.0, jitter=180.0),
+        _jitter_row("STEADY", 40.0, jitter=4.0),
+    ]
+    assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == ["STEADY"]
+
+
+def test_jitter_filter_fails_open_without_enough_samples(monkeypatch):
+    """With under 3 samples we can't judge — don't hide a name for lack of
+    data."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "SCREEN_MAX_BASIS_JITTER_BPS", 25.0)
+    rows = [_jitter_row("NEW", 40.0, jitter=999.0, samples=2)]
+    assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == ["NEW"]
+
+
+def test_jitter_measures_successive_change_not_spread():
+    """A smooth drift must NOT be penalised: only tick-to-tick flicker."""
+    import time as _time
+    now = int(_time.time() * 1000)
+
+    def jitter_of(series):
+        rb = screener.RollingBasis(300.0)
+        for i, v in enumerate(series):
+            rb.add("XUSDT", now - (len(series) - i) * 15_000, v, v)
+        row = screener.ScreenerRow(
+            symbol="XUSDT", entry_bps=series[-1], close_bps=0.0,
+            spread_cost_bps=0.0, fees_bps=0.0, funding_8h_bps=0.0,
+            net_edge_bps=0.0, max_notional_usd=0.0, aster_ask="1",
+            mexc_ask="1", ts_ms=0,
+        )
+        rb.annotate(row)
+        return row.entry_bps_jitter
+
+    drift = [float(v) for v in range(10, 90, 4)]          # smooth 10 -> 86
+    flicker = [150.0 if i % 2 else -150.0 for i in range(20)]
+    # The drift spans 76bps — a std would flag it — but each step is ~4bps.
+    assert jitter_of(drift) < 10
+    # The flicker spans the same kind of range but reverses every sample.
+    assert jitter_of(flicker) > 100

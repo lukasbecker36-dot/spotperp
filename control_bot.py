@@ -483,19 +483,21 @@ class ControlBot:
                 return f"{v / 1e3:.0f}k"
             return f"{v:.0f}"
 
-        hdr = (f"{'symbol':<13}{'entry':>7}{'lo24':>7}{'swing':>7}{'hrs':>5}"
-               f"{'tr/h':>7}{'dep$':>7}")
+        hdr = (f"{'symbol':<12}{'entry':>6}{'lo24':>6}{'swing':>6}{'hrs':>4}"
+               f"{'tr/h':>6}{'jit':>6}{'dep$':>6}")
         sep = "-" * len(hdr)
         lines = [f"fillability screen ({age_s:.0f}s old)", hdr, sep]
         for r in rows:
             entry_avg = r.get("entry_bps_avg", r["entry_bps"])
             lo = r.get("basis_p10_24h", entry_avg)
+            jit = r.get("entry_bps_jitter", 0.0)
+            jit_s = f"{jit:>6.1f}" if r.get("samples", 0) >= 3 else f"{'-':>6}"
             lines.append(
-                f"{r['symbol'][:12]:<13}{entry_avg:>7.1f}{lo:>7.1f}"
-                f"{entry_avg - lo:>7.1f}"
-                f"{r.get('hours_tradeable_24h', 0):>5.0f}"
-                f"{r.get('perp_trades_24h', 0) / 24.0:>7.1f}"
-                f"{r['max_notional_usd']:>7,.0f}"
+                f"{r['symbol'][:11]:<12}{entry_avg:>6.1f}{lo:>6.1f}"
+                f"{entry_avg - lo:>6.1f}"
+                f"{r.get('hours_tradeable_24h', 0):>4.0f}"
+                f"{r.get('perp_trades_24h', 0) / 24.0:>6.1f}{jit_s}"
+                f"{r['max_notional_usd']:>6,.0f}"
             )
         lines.append(sep)
         lines.append(
@@ -511,6 +513,12 @@ class ControlBot:
         lines.append(
             "swing = entry - lo24, the round trip if it returns to its own low."
             " lo24 below 0 means it reaches a NEGATIVE basis you can exit into."
+        )
+        lines.append(
+            f"jit = mean bps the basis moves BETWEEN 5m samples. A smooth drift"
+            f" scores low; flicker scores high. Rows above"
+            f" {config.SCREEN_MAX_BASIS_JITTER_BPS:.0f} are dropped as"
+            " untradeable — calibrate off a name you trade happily."
         )
         return "\n".join(lines)
 
