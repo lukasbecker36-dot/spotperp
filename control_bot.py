@@ -455,11 +455,23 @@ class ControlBot:
         age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
         rows = (snap.get("fill_rows") or [])[:n]
         if not rows:
+            # Say WHICH gate is empty rather than listing both: no volume at all
+            # means the 24h ticker call is failing, which is a bug, not a market.
+            main = snap.get("rows") or []
+            if main and not any(r.get("perp_volume_24h") for r in main):
+                return (
+                    "no fillable candidates — and NO perp volume data at all, so"
+                    " the Aster 24h ticker call is failing. Check:"
+                    " journalctl -u basis-trade | grep -i 'perp 24h volume'"
+                )
+            best_hrs = max((r.get("hours_tradeable_24h", 0) or 0) for r in main) if main else 0
             return (
                 "no fillable candidates — needs 24h perp volume >= "
                 f"${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f} and the basis workable"
-                f" for >= {config.SCREEN_FILL_MIN_HOURS:.0f}h of the last 24."
-                " If you just deployed, give it a slow scan."
+                f" for >= {config.SCREEN_FILL_MIN_HOURS:.0f}h of the last 24"
+                f" (best right now: {best_hrs:.0f}h)."
+                " If you just deployed, give it a slow scan — the dwell hours"
+                " build from the seeded basis history."
             )
 
         def vol(v: float) -> str:

@@ -237,9 +237,22 @@ class AsterClient(_BaseClient):
         wide basis on a symbol nobody trades is untradeable however good the
         number looks.
         """
-        payload = await self._request(
-            "GET", "/fapi/v1/ticker/24hr", venue=self.VENUE
-        )
+        # Aster serves some market data on v3 (bookTicker, premiumIndex, depth)
+        # and some only on v1 (klines, fundingRate). Try both rather than guess:
+        # a silent failure here leaves every row at volume 0 and empties
+        # /screen fill with no obvious cause.
+        payload = None
+        last_err: ExchangeError | None = None
+        for path in ("/fapi/v3/ticker/24hr", "/fapi/v1/ticker/24hr"):
+            try:
+                payload = await self._request("GET", path, venue=self.VENUE)
+                break
+            except ExchangeError as exc:
+                last_err = exc
+        if payload is None:
+            raise last_err or ExchangeError(
+                self.VENUE, "ticker/24hr unavailable on v3 or v1"
+            )
         out: dict[str, dict[str, Decimal]] = {}
         for row in payload if isinstance(payload, list) else [payload]:
             sym = row.get("symbol")

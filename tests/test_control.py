@@ -151,3 +151,24 @@ def test_screen_diff_reports_when_no_dislocation_rows(tmp_path, monkeypatch):
     _screen_snapshot(tmp_path, monkeypatch, [_srow("AAAUSDT", 10.0, 5.0, 24.0)])
     out = control_bot.ControlBot._cmd_screen(_bot(), ["diff"])
     assert "no dislocation data yet" in out
+
+
+def test_screen_fill_flags_missing_volume_data(tmp_path, monkeypatch):
+    """No volume on ANY row means the Aster 24h ticker call is failing — a bug,
+    not an empty market. Say so instead of listing the thresholds."""
+    _screen_snapshot(tmp_path, monkeypatch, [
+        {**_srow("AAAUSDT", 50.0, 10.0, 24.0), "perp_volume_24h": 0,
+         "hours_tradeable_24h": 20},
+    ])
+    out = control_bot.ControlBot._cmd_screen(_bot(), ["fill"])
+    assert "NO perp volume data at all" in out
+    assert "journalctl" in out
+
+
+def test_screen_fill_reports_best_dwell_when_thresholds_unmet(tmp_path, monkeypatch):
+    _screen_snapshot(tmp_path, monkeypatch, [
+        {**_srow("AAAUSDT", 50.0, 10.0, 24.0), "perp_volume_24h": 5_000_000,
+         "hours_tradeable_24h": 2},
+    ])
+    out = control_bot.ControlBot._cmd_screen(_bot(), ["fill"])
+    assert "best right now: 2h" in out
