@@ -483,28 +483,47 @@ class ControlBot:
                 return f"{v / 1e3:.0f}k"
             return f"{v:.0f}"
 
-        hdr = (f"{'symbol':<12}{'entry':>6}{'lo24':>6}{'net':>6}{'hrs':>4}"
-               f"{'tr/h':>6}{'jit':>6}{'$clip':>7}")
+        hdr = (f"{'symbol':<11}{'score':>6}{'entry':>6}{'lo24':>7}{'net':>6}"
+               f"{'hrs':>4}{'tr/h':>6}{'jit':>5}{'$clip':>6}")
         sep = "-" * len(hdr)
         lines = [f"fillability screen ({age_s:.0f}s old)", hdr, sep]
         for r in rows:
             entry_avg = r.get("entry_bps_avg", r["entry_bps"])
             lo = r.get("basis_p10_24h", entry_avg)
             jit = r.get("entry_bps_jitter", 0.0)
-            jit_s = f"{jit:>6.1f}" if r.get("samples", 0) >= 3 else f"{'-':>6}"
+            jit_s = f"{jit:>5.1f}" if r.get("samples", 0) >= 3 else f"{'-':>5}"
             net = entry_avg - lo - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+            chances = (r.get("hours_tradeable_24h", 0.0) or 0.0) * (
+                (r.get("perp_trades_24h", 0.0) or 0.0) / 24.0
+            )
+            factor = min(
+                1.0, chances / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0)
+            )
+            score = (net - jit) * factor
+            # A lo24 well above 0 means the basis never comes back to a level
+            # you can exit at — the trip is a carry, not a round trip.
+            lo_s = (f"{f'{lo:.1f}!':>7}"
+                    if lo > config.SCREEN_FILL_FLAG_LO_BPS else f"{lo:>7.1f}")
             lines.append(
-                f"{r['symbol'][:11]:<12}{entry_avg:>6.1f}{lo:>6.1f}"
+                f"{r['symbol'][:10]:<11}{score:>+6.1f}{entry_avg:>6.1f}{lo_s}"
                 f"{net:>+6.1f}"
                 f"{r.get('hours_tradeable_24h', 0):>4.0f}"
                 f"{r.get('perp_trades_24h', 0) / 24.0:>6.1f}{jit_s}"
-                f"{net * r['max_notional_usd'] / 10000.0:>7.2f}"
+                f"{net * r['max_notional_usd'] / 10000.0:>6.1f}"
             )
         lines.append(sep)
         lines.append(
-            "Ranked by hrs x tr/h = expected taker events while workable. Dwell"
-            " alone misleads: 23h at 7 trades/h is far fewer chances than 19h"
-            " at 613."
+            "Ranked by score = (net - jit) x min(1, hrs x tr/h /"
+            f" {config.SCREEN_FILL_TARGET_CHANCES:.0f}): what the trip is worth"
+            " after costs, haircut by how much the basis moves against a"
+            " resting order, scaled down if there is too little taker flow to"
+            " lift it. It is the whole board in one number — read the columns"
+            " only to see WHY a row scores what it does."
+        )
+        lines.append(
+            "Score is NOT weighted by depth, on purpose: top-of-book"
+            " understates exactly the names worth trading here. Size is a"
+            " separate question — read $clip."
         )
         lines.append(
             "hrs = hours of the last 24 the basis cleared the entry floor."
@@ -515,8 +534,11 @@ class ControlBot:
             f"net = (entry - lo24) - {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps"
             " round-trip cost: what the trip is actually WORTH. lo24 is where"
             " to set your exit target — a lo24 of +32 will never fill an /exit"
-            f" at 0. Rows under +{config.SCREEN_FILL_MIN_NET_SWING_BPS:.0f} are"
-            " dropped as not worth working."
+            f" at 0; '!' marks lo24 above"
+            f" +{config.SCREEN_FILL_FLAG_LO_BPS:.0f}, i.e. a basis that never"
+            " comes back to flat. Rows under"
+            f" +{config.SCREEN_FILL_MIN_NET_SWING_BPS:.0f} net are dropped as"
+            " not worth working."
         )
         lines.append(
             "$clip = net x TOP-OF-BOOK depth: what one clip at the touch is"

@@ -99,6 +99,18 @@ SCREEN_MAX_BASIS_JITTER_BPS = float(
 SCREEN_FILL_MIN_NET_SWING_BPS = float(
     os.environ.get("SCREEN_FILL_MIN_NET_SWING_BPS", "5")
 )
+# Expected taker events at which a resting order is reliably lifted. The fill
+# factor in fill_score saturates here: below it a name may not fill at all;
+# above it more flow adds nothing to a SINGLE round trip, so a hyperactive book
+# must not outrank a much fatter edge on a quieter one.
+SCREEN_FILL_TARGET_CHANCES = float(
+    os.environ.get("SCREEN_FILL_TARGET_CHANCES", "500")
+)
+# Flag a 24h low above this as "never comes near zero": the net is real only if
+# the exit target is set up there, and a basis that has never approached zero
+# may be structurally rich rather than mean-reverting (BASECAT: 149 entry, 24h
+# low +100.6).
+SCREEN_FILL_FLAG_LO_BPS = float(os.environ.get("SCREEN_FILL_FLAG_LO_BPS", "25"))
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

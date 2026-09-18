@@ -475,3 +475,72 @@ def test_fillability_drops_a_round_trip_that_cannot_clear_costs(monkeypatch):
     rows[0].basis_p10_24h = 32.3     # net (44.9-32.3)-12 = +0.6 -> dropped
     rows[1].basis_p10_24h = 2.8      # net (20.2-2.8)-12  = +5.4 -> kept
     assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == ["WORTHIT"]
+
+
+def _score_row(symbol, entry, lo, hours_tradeable, trades, jitter=0.0):
+    r = _fill_row(symbol, entry, hours_tradeable, 1_000_000, trades=trades)
+    r.basis_p10_24h = lo
+    r.entry_bps_jitter = jitter
+    return r
+
+
+def test_fill_score_haircuts_the_quoted_basis_by_its_jitter(monkeypatch):
+    """A resting order is adverse-selected, so the quoted basis overstates what
+    it locks by roughly how far the basis travels between samples. Two rows with
+    identical net edge and identical flow must not score the same when one
+    flickers 18bps between samples and the other 1bps."""
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
+    steady = _score_row("STEADY", 60.0, 0.0, 20, 24_000, jitter=1.0)
+    flicker = _score_row("FLICKER", 60.0, 0.0, 20, 24_000, jitter=18.0)
+    assert screener.fill_score(steady) == pytest.approx(48.0 - 1.0)
+    assert screener.fill_score(flicker) == pytest.approx(48.0 - 18.0)
+
+
+def test_fill_score_scales_down_thin_flow_but_saturates(monkeypatch):
+    """Below the target a resting order may simply never be lifted, so the edge
+    is discounted. Above it, extra flow adds nothing to a SINGLE round trip —
+    100x the taker events does not make the trip worth 100x."""
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
+    # 20h x (3000/24) = 2500 chances -> 5x the target, still factor 1.0.
+    busy = _score_row("BUSY", 60.0, 0.0, 20, 3_000)
+    torrent = _score_row("TORRENT", 60.0, 0.0, 20, 300_000)
+    thin = _score_row("THIN", 60.0, 0.0, 20, 300)     # 250 chances -> 0.5
+    assert screener.fill_score(busy) == pytest.approx(48.0)
+    assert screener.fill_score(torrent) == pytest.approx(48.0)
+    assert screener.fill_score(thin) == pytest.approx(24.0)
+
+
+def test_fill_score_ignores_depth(monkeypatch):
+    """Top-of-book depth understates exactly the names worth trading here —
+    STONK shows ~$8 at the touch yet fills $42-99 clips. Weighting the score by
+    depth would re-bury them, which is the bug the depth floor was lowered to
+    fix. Size is a separate question ($clip), not a ranking input."""
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
+    thin_book = _score_row("STONKLIKE", 60.0, 0.0, 20, 24_000)
+    deep_book = _score_row("DEEP", 60.0, 0.0, 20, 24_000)
+    thin_book.max_notional_usd = 8.0
+    deep_book.max_notional_usd = 50_000.0
+    assert screener.fill_score(thin_book) == screener.fill_score(deep_book)
+
+
+def test_fillability_ranking_prefers_the_rich_steady_name_over_pure_flow(
+    monkeypatch,
+):
+    """The board this replaced ranked on flow alone, which put a +2.9 net name
+    with huge volume above a +60 net name that fills a few hundred times a day.
+    The composite has to reverse that."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_NET_SWING_BPS", 5.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
+    rows = [
+        _score_row("RICH", 90.0, 0.0, 22, 1_200, jitter=3.0),      # 1100 chances
+        _score_row("BUSYTHIN", 22.0, 2.0, 24, 600_000, jitter=4.0),
+    ]
+    assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == [
+        "RICH", "BUSYTHIN",
+    ]

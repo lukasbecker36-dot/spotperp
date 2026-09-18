@@ -308,19 +308,48 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
         >= config.SCREEN_FILL_MIN_NET_SWING_BPS
     ]
-    # Rank by EXPECTED TAKER EVENTS while the basis is workable:
-    #   dwell hours x trades/hour
-    # Dwell alone is misleading — a name workable for 23h on 176 trades/day
-    # (~7/hour) gives a resting order far fewer chances than one workable for
-    # 19h on 14,700 trades/day (~613/hour), even though dwell ranks the first
-    # higher. This is the product that matters.
-    eligible.sort(key=_fill_chances, reverse=True)
+    # Rank by the composite: risk-adjusted edge, discounted by how reliably it
+    # will fill. Neither half works alone — fill frequency put a flickering book
+    # with 4,104 chances above a 2x better, far steadier edge, and raw edge put
+    # names that never fill on top. See fill_score.
+    eligible.sort(key=fill_score, reverse=True)
     return eligible[: config.SCREENER_TOP_N]
 
 
 def _fill_chances(row: ScreenerRow) -> float:
     """Expected number of taker events while the basis is workable."""
     return row.hours_tradeable_24h * (row.perp_trades_24h / 24.0)
+
+
+def fill_score(row: ScreenerRow) -> float:
+    """One number for "how good is this trade", in bps.
+
+        (net - jitter) x min(1, chances / SCREEN_FILL_TARGET_CHANCES)
+
+    net      what the round trip is worth after round-trip costs.
+    -jitter  the QUOTED basis overstates what you realise by roughly how far
+             the basis travels between samples: a resting order is adverse-
+             selected, so it fills on the bad side of that movement (STONK #186
+             quoted +121bps across its clips and locked +58.8). Subtracting the
+             whole jitter is the conservative reading.
+    xfactor  saturating fill probability. Below the target a resting order may
+             never be lifted; above it, extra flow adds nothing to a single
+             round trip.
+
+    Deliberately NOT multiplied by depth. Top-of-book depth understates exactly
+    the names worth trading here (STONK shows ~$8 at the touch yet fills $42-99
+    clips), so weighting by it would re-bury them — the very bug the screen
+    depth floor was lowered to fix. Size is a separate question: read $clip.
+    """
+    net = (
+        row.entry_bps_avg
+        - row.basis_p10_24h
+        - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+    )
+    factor = min(
+        1.0, _fill_chances(row) / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0)
+    )
+    return (net - row.entry_bps_jitter) * factor
 
 
 def write_snapshot(
