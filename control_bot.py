@@ -519,9 +519,10 @@ class ControlBot:
             " dropped as not worth working."
         )
         lines.append(
-            "$clip = net x top-of-book depth: what ONE clip is worth in MONEY."
-            " bps on a thin book is not a trade — 5bps on $220 of depth earns"
-            " 12 cents however easily it fills."
+            "$clip = net x TOP-OF-BOOK depth: what one clip at the touch is"
+            " worth. It UNDERSTATES a name you work over time — STONK shows ~$8"
+            " at the touch yet fills $42-99 clips — so read it with hrs, which"
+            " is what such a name actually trades on."
         )
         lines.append(
             f"jit = mean bps the basis moves BETWEEN 5m samples. A smooth drift"

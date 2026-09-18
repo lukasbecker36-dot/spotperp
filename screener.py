@@ -206,7 +206,7 @@ def rank_rows(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     eligible = [
         r
         for r in rows
-        if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
+        if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
     ]
     eligible.sort(key=lambda r: r.net_edge_bps_avg, reverse=True)
     return eligible[: config.SCREENER_TOP_N]
@@ -238,7 +238,7 @@ def rank_rows_by_dislocation(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     eligible = [
         r
         for r in rows
-        if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
+        if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
         and r.hours_24h >= config.SCREEN_DIFF_MIN_HOURS
     ]
     eligible.sort(
@@ -266,7 +266,7 @@ def rank_rows_by_swing(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     eligible = [
         r
         for r in rows
-        if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
+        if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
         and r.hours_24h >= config.SCREEN_DIFF_MIN_HOURS
         and r.basis_p10_24h <= config.SCREEN_SWING_EXIT_BPS
         and r.funding_8h_bps >= config.SCREEN_SWING_MIN_FUNDING_BPS
@@ -293,7 +293,7 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     eligible = [
         r
         for r in rows
-        if r.max_notional_usd >= float(config.MIN_DEPTH_NOTIONAL_USD)
+        if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
         and r.perp_volume_24h >= config.SCREEN_FILL_MIN_VOLUME_USD
         and r.hours_tradeable_24h >= config.SCREEN_FILL_MIN_HOURS
         and not _too_jittery(r)

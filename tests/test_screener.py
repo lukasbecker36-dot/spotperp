@@ -237,15 +237,18 @@ def test_dislocation_excludes_thin_24h_history(monkeypatch):
     assert [r.symbol for r in ranked] == ["SEASONED"]
 
 
-def test_dislocation_excludes_thin_depth(monkeypatch):
+def test_dislocation_excludes_empty_books(monkeypatch):
+    """Only outright-empty books are dropped now: the screen depth floor is
+    deliberately tiny, because top-of-book depth is the wrong measure for names
+    that are worked over time (STONK shows ~$8 yet fills $42-99 clips)."""
     monkeypatch.setattr(config, "SCREEN_DIFF_MIN_HOURS", 6.0)
-    monkeypatch.setattr(config, "MIN_DEPTH_NOTIONAL_USD", Decimal("200"))
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 5.0)
     rows = [
-        _row("THIN", 5.0, -50.0, depth=10.0),
-        _row("DEEP", 10.0, 5.0, depth=1000.0),
+        _row("EMPTY", 5.0, -50.0, depth=0.0),
+        _row("THINBUTREAL", 10.0, 5.0, depth=8.0),   # STONK-like, now kept
     ]
     ranked = screener.rank_rows_by_dislocation(rows)
-    assert [r.symbol for r in ranked] == ["DEEP"]
+    assert [r.symbol for r in ranked] == ["THINBUTREAL"]
 
 
 def test_write_snapshot_carries_diff_rows(tmp_path, monkeypatch):

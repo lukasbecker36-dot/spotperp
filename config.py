@@ -41,6 +41,14 @@ SCREENER_MIN_NET_EDGE_BPS = Decimal("0") # show rows above this net edge
 SLIPPAGE_BUFFER_BPS = Decimal("2.0")     # haircut for taker slippage per round trip
 QUOTE_STALE_SECONDS = 10                 # ignore quotes older than this
 MIN_DEPTH_NOTIONAL_USD = Decimal("200")  # min top-of-book notional on both sides
+# Depth floor for the SCREENS only (nothing in execution reads this). Kept far
+# below MIN_DEPTH_NOTIONAL_USD on purpose: top-of-book depth is the wrong
+# measure for how these names actually trade. STONK shows ~$8 at the touch yet
+# fills $42-99 clips by working an order over time, so a $200 floor silently
+# excluded it — and every name like it — from all four screens while admitting
+# deep books with no edge. The dwell, net-swing, jitter and $clip columns now
+# do the discriminating; this only drops books that are outright empty.
+SCREEN_MIN_DEPTH_USD = float(os.environ.get("SCREEN_MIN_DEPTH_USD", "5"))
 BASIS_LOG_SECONDS = 60.0                 # touch-basis CSV sampling cadence
 # /screen reports a time-windowed mean of entry/net basis (sampled once per
 # slow scan) so a persistent edge is distinguishable from a one-tick blip, and
