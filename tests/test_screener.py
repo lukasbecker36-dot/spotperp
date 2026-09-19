@@ -608,3 +608,88 @@ def test_quote_reject_fails_open_on_missing_data(monkeypatch):
                             jitter=99.0, samples=1)
     assert screener.quote_reject_reason(no_vol) is None
     assert screener.quote_reject_reason(one_sample) is None
+
+
+def _carry_row(symbol, entry, lo, jitter=0.0, trades=100_000.0):
+    r = _quote_row(symbol, entry, entry, depth=100.0)
+    r.entry_bps_avg = entry
+    r.basis_p10_24h = lo
+    r.entry_bps_jitter = jitter
+    r.perp_trades_24h = trades
+    return r
+
+
+def test_carry_score_adds_a_one_off_basis_to_a_funding_stream(monkeypatch):
+    """The two halves of a carry trade are in different units. The basis is
+    captured ONCE (entry down to the level an exit fills at); funding accrues
+    per 8h. They are only comparable over a stated horizon."""
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "FUNDING_SCORE_HOLD_HOURS", 24.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
+    r = _carry_row("X", entry=32.6, lo=-47.8, jitter=10.9)
+    # one-off (32.6 + 47.8 - 10.9 - 12) = 57.5, stream 11.3 x 3 = 33.9
+    assert screener.carry_score(r, 11.3, 15.6) == pytest.approx(91.4)
+
+
+def test_carry_score_takes_the_lower_of_average_and_latest_funding(monkeypatch):
+    """CATEUSDT averaged 61.7bps/8h while its latest settlement was 22.2 — the
+    carry had collapsed. Ranking on the average alone kept it top of the board
+    on a number that no longer existed. The reverse case (one spiky settlement
+    on a modest average) must not flatter a row either."""
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "FUNDING_SCORE_HOLD_HOURS", 24.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
+    r = _carry_row("FLAT", entry=12.0, lo=0.0)     # one-off 0, score is all carry
+    decaying = screener.carry_score(r, 61.7, 22.2)
+    spiking = screener.carry_score(r, 10.6, 34.5)
+    assert decaying == pytest.approx(22.2 * 3)
+    assert spiking == pytest.approx(10.6 * 3)
+
+
+def test_carry_score_haircuts_the_basis_but_not_the_funding(monkeypatch):
+    """A resting order fills on the bad side of the basis, but funding accrues
+    at the same rate whatever price you got in at. Jitter must not scale the
+    stream, or a steady book would look like it earned more funding."""
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "FUNDING_SCORE_HOLD_HOURS", 24.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
+    steady = _carry_row("STEADY", entry=40.0, lo=0.0, jitter=1.0)
+    rough = _carry_row("ROUGH", entry=40.0, lo=0.0, jitter=11.0)
+    assert (
+        screener.carry_score(steady, 10.0, 10.0)
+        - screener.carry_score(rough, 10.0, 10.0)
+    ) == pytest.approx(10.0)
+
+
+def test_carry_score_demotes_a_basis_below_its_own_24h_low(monkeypatch):
+    """CATEUSDT quoted +104.5 with a 24h low of +120.9 — the basis had fallen
+    out of its range, so there is no convergence left to capture and the range
+    is describing a regime that ended. The one-off half must go NEGATIVE."""
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "FUNDING_SCORE_HOLD_HOURS", 24.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
+    cate = _carry_row("CATE", entry=104.5, lo=120.9, jitter=18.2)
+    koma = _carry_row("KOMA", entry=32.6, lo=-47.8, jitter=10.9)
+    # Ranked on raw 24h carry CATE (61.7) beat KOMA (11.3) five times over.
+    assert screener.carry_score(cate, 61.7, 22.2) < screener.carry_score(
+        koma, 11.3, 15.6
+    )
+
+
+def test_carry_score_scales_by_fill_chances_but_not_depth(monkeypatch):
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "FUNDING_SCORE_HOLD_HOURS", 24.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
+    busy = _carry_row("BUSY", entry=40.0, lo=0.0, trades=5_000.0)
+    quiet = _carry_row("QUIET", entry=40.0, lo=0.0, trades=250.0)
+    assert screener.carry_score(quiet, 10.0, 10.0) == pytest.approx(
+        screener.carry_score(busy, 10.0, 10.0) / 2
+    )
+    # Depth is a sizing question, not a ranking input — same as fill_score.
+    deep = _carry_row("DEEP", entry=40.0, lo=0.0)
+    deep.max_notional_usd = 50_000.0
+    thin = _carry_row("THIN", entry=40.0, lo=0.0)
+    thin.max_notional_usd = 6.0
+    assert screener.carry_score(deep, 10.0, 10.0) == screener.carry_score(
+        thin, 10.0, 10.0
+    )

@@ -383,6 +383,45 @@ def fill_score(row: ScreenerRow) -> float:
     return (net - row.entry_bps_jitter) * factor
 
 
+def carry_score(
+    row: ScreenerRow, avg_8h_bps: float, current_8h_bps: float
+) -> float:
+    """One number for a /funding row, in bps: what entering NOW and holding for
+    FUNDING_SCORE_HOLD_HOURS is worth.
+
+        (entry - lo24 - jit - floor) + carry x hold/8
+
+    The two halves of a carry trade are in different units and the board made
+    you convert between them by eye. The basis is a ONE-OFF — you capture
+    (entry - exit) once, and lo24 is where the exit realistically fills — while
+    funding is a STREAM. They only become comparable over a stated horizon.
+
+    carry is min(24h average, latest settlement), the conservative read of the
+    stream. Taking the average alone lets a collapsed carry keep flattering a
+    row (CATEUSDT averaged 61.7bps/8h while its latest settle was 22.2);
+    taking the latest alone lets one spiky settlement do the same. The lower of
+    the two is wrong only when the carry is genuinely recovering, which costs
+    you a missed entry rather than a bad one.
+
+    jit is subtracted from the BASIS half only: a resting order fills on the
+    bad side of the basis, but funding accrues at the same rate whatever price
+    you got in at.
+
+    As with fill_score, not weighted by depth — that is a sizing question, read
+    depth$ — and scaled by a saturating fill factor, since an edge on a book
+    with no takers is not an edge.
+    """
+    floor = float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+    one_off = row.entry_bps_avg - row.basis_p10_24h - row.entry_bps_jitter - floor
+    carry = min(avg_8h_bps, current_8h_bps)
+    stream = carry * config.FUNDING_SCORE_HOLD_HOURS / 8.0
+    factor = min(
+        1.0,
+        row.perp_trades_24h / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0),
+    ) if row.perp_trades_24h else 1.0
+    return (one_off + stream) * factor
+
+
 def write_snapshot(
     rows: list[ScreenerRow],
     diff_rows: list[ScreenerRow] | None = None,

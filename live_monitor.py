@@ -558,8 +558,12 @@ class Engine:
                 "basis_p10_24h": screen.basis_p10_24h,
                 "basis_p90_24h": screen.basis_p90_24h,
                 "hours_24h": screen.hours_24h,
+                # The board's one number: basis one-off + carry stream over a
+                # fixed horizon. Sorting on this replaces ranking by raw carry,
+                # which put a collapsed 61bps average on a $5 book on top.
+                "score": screener.carry_score(screen, stat.avg_24h_8h_bps, current_8h),
             })
-        rows.sort(key=lambda r: r["avg_24h_8h_bps"], reverse=True)
+        rows.sort(key=lambda r: r["score"], reverse=True)
         config.FUNDING_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "ts_ms": now,

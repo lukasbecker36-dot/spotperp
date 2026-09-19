@@ -120,6 +120,13 @@ SCREEN_FILL_FLAG_LO_BPS = float(os.environ.get("SCREEN_FILL_FLAG_LO_BPS", "25"))
 SCREEN_MAX_SPREAD_COST_BPS = float(
     os.environ.get("SCREEN_MAX_SPREAD_COST_BPS", "100")
 )
+# Holding period the /funding score assumes. The carry is a stream and the
+# basis is a one-off, so they are only comparable over a stated horizon; 24h
+# is one day of funding (3 settlements at the 8h-normalised rate) and roughly
+# how long these positions are actually held.
+FUNDING_SCORE_HOLD_HOURS = float(
+    os.environ.get("FUNDING_SCORE_HOLD_HOURS", "24")
+)
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

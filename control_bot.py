@@ -585,8 +585,8 @@ class ControlBot:
         if not rows:
             return "no funding data yet"
         win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
-        hdr = (f"{'symbol':<11}{'iv':>3}{'24h':>5}{'fund':>5}{'next':>5}"
-               f"{'entry':>6}{'lo24':>6}{'hi24':>7}{'jit':>5}{'be':>5}"
+        hdr = (f"{'symbol':<11}{'score':>6}{'iv':>3}{'24h':>5}{'fund':>5}"
+               f"{'next':>5}{'entry':>6}{'lo24':>6}{'hi24':>7}{'jit':>5}"
                f"{'depth$':>7}")
         sep = "-" * len(hdr)
         lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
@@ -620,31 +620,30 @@ class ControlBot:
 
             lo24 = rng(r.get("basis_p10_24h"), 6)
             hi24 = rng(r.get("basis_p90_24h"), 7)
-            # Hours of funding needed to pay for getting in. The entry basis is
-            # a ONE-OFF (a credit when positive, a cost when negative); funding
-            # is the recurring stream. This is the number that decides whether a
-            # fat carry on a deeply negative basis is worth having.
-            carry = r.get("avg_24h_8h_bps") or 0.0
-            cost = floor - (ev if ev is not None else 0.0)
-            if cost <= 0:
-                be = f"{'0':>5}"          # paid to enter
-            elif carry <= 0:
-                be = f"{'nvr':>5}"        # carry does not pay it back
-            else:
-                be = f"{cost / carry * 8.0:>4.0f}h"
+            sc = r.get("score")
+            score = f"{sc:>+6.0f}" if sc is not None else f"{'-':>6}"
             lines.append(
-                f"{_pad(r['symbol'], 11)}{r['interval_hours']:>2}h"
+                f"{_pad(r['symbol'], 11)}{score}{r['interval_hours']:>2}h"
                 f"{r['avg_24h_8h_bps']:>5.1f}{r['current_8h_bps']:>5.1f}{nxt}"
-                f"{entry}{lo24}{hi24}{jit}{be}{depth}"
+                f"{entry}{lo24}{hi24}{jit}{depth}"
             )
         lines.append(sep)
-        lines.append("iv=interval; 24h=avg carry/8h; fund=settled/8h; next=to settle")
         lines.append(
-            f"entry = {win_m:.0f}m avg basis (short perp gets +funding)."
-            f" be = hours of carry to pay off the entry basis + {floor:.0f}bps"
-            " round-trip cost: '0' = the basis already pays you to enter,"
-            " 'never' = negative carry, so the entry cost is never repaid."
+            f"score = bps from entering now and holding"
+            f" {config.FUNDING_SCORE_HOLD_HOURS:.0f}h:"
+            f" (entry - lo24 - jit - {floor:.0f}bps cost) + carry x"
+            f" {config.FUNDING_SCORE_HOLD_HOURS / 8.0:.0f}. The basis is a"
+            " ONE-OFF you capture once; funding is a STREAM. This is the whole"
+            " board in one number — read the columns only to see WHY."
         )
+        lines.append(
+            "carry is the LOWER of 24h and fund, so a collapsed carry cannot"
+            " flatter a row on its average. jit is taken off the basis half"
+            " only (funding accrues whatever price you got in at). Not weighted"
+            " by depth — that is sizing, read depth$."
+        )
+        lines.append("iv=interval; 24h=avg carry/8h; fund=settled/8h; next=to settle")
+        lines.append(f"entry = {win_m:.0f}m avg basis (short perp gets +funding).")
         lines.append(
             "lo24/hi24 = p10/p90 of the HOURLY mean basis over 24h — where this"
             " pair has actually traded today. entry near hi24 = rich end, a"
