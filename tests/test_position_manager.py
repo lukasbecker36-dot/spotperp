@@ -231,3 +231,65 @@ def test_unwind_larger_than_every_entry_does_not_inflate_qty(manager):
     mgr.record_fill(pos.id, "aster", "unwind", "BUY", Decimal(1500),
                     Decimal("0.03"), Decimal(0))
     assert mgr.get(pos.id).perp_qty == Decimal(-500)
+
+
+def test_closed_today_includes_cancelled_entries(manager):
+    """A CANCELLED position is an entry that filled and was unwound. It books a
+    real cost and belongs in the day's realised total — but nobody placed it as
+    a trade, which is exactly the line that makes a daily figure look
+    inexplicable until it is itemised."""
+    import time as _time
+    now = int(_time.time() * 1000)
+    closed = manager.create("AUSDT", Decimal(100), paper=False)
+    manager.set_state(closed.id, pm.CLOSED)
+    cancelled = manager.create("BUSDT", Decimal(100), paper=False)
+    manager.set_state(cancelled.id, pm.CANCELLED)
+    for pid, pnl in ((closed.id, "47.10"), (cancelled.id, "-2.10")):
+        manager._conn.execute(
+            "UPDATE positions SET realized_pnl_usd=?, closed_ms=? WHERE id=?",
+            (pnl, now, pid),
+        )
+    manager._conn.commit()
+    ids = [p.id for p in manager.closed_today()]
+    assert ids == [closed.id, cancelled.id]
+    assert manager.pnl_summary()["live_today"] == Decimal("45.00")
+
+
+def test_closed_today_excludes_paper_and_older_days(manager):
+    import time as _time
+    now = int(_time.time() * 1000)
+    paper = manager.create("AUSDT", Decimal(100), paper=True)
+    old = manager.create("BUSDT", Decimal(100), paper=False)
+    manager._conn.execute(
+        "UPDATE positions SET realized_pnl_usd='9', closed_ms=? WHERE id=?",
+        (now, paper.id),
+    )
+    manager._conn.execute(
+        "UPDATE positions SET realized_pnl_usd='9', closed_ms=? WHERE id=?",
+        (now - 3 * 86_400_000, old.id),
+    )
+    manager._conn.commit()
+    assert manager.closed_today() == []
+
+
+def test_finalize_pnl_prices_the_kept_size_not_the_reversed_one(manager):
+    """The averages exclude an unwound clip, so the quantities must too —
+    mixing a raw entry count with an unwind-aware average prices the wrong
+    size."""
+    pos = manager.create("GUSDT", Decimal(200), paper=False)
+    manager.record_fill(pos.id, "aster", "entry", "SELL", Decimal(1000),
+                        Decimal("1.00"), Decimal(0))
+    manager.record_fill(pos.id, "mexc", "entry", "BUY", Decimal(1000),
+                        Decimal("1.00"), Decimal(0))
+    # A second clip fills and is unwound at the same price: costs nothing.
+    manager.record_fill(pos.id, "aster", "entry", "SELL", Decimal(5000),
+                        Decimal("1.00"), Decimal(0))
+    manager.record_fill(pos.id, "aster", "unwind", "BUY", Decimal(5000),
+                        Decimal("1.00"), Decimal(0))
+    # Close the real 1000 at a 1% profit on the perp leg.
+    manager.record_fill(pos.id, "aster", "exit", "BUY", Decimal(1000),
+                        Decimal("0.99"), Decimal(0))
+    manager.record_fill(pos.id, "mexc", "exit", "SELL", Decimal(1000),
+                        Decimal("0.99"), Decimal(0))
+    # perp +10 (short 1.00 -> 0.99), spot -10, unwind 0 -> flat.
+    assert manager.finalize_pnl(pos.id) == Decimal(0)

@@ -918,11 +918,36 @@ class ControlBot:
         # Say what this number is NOT: it counts closed positions only, so it
         # misses funding still accruing, coins held outside the strategy and
         # idle margin. /equity is the complete picture.
-        return (
+        head = (
             f"realised P&L (USD)\n"
             f"live:  today {float(s['live_today']):+.2f} | all-time {float(s['live_all_time']):+.2f}\n"
-            f"paper: today {float(s['paper_today']):+.2f} | all-time {float(s['paper_all_time']):+.2f}\n"
-            f"\nclosed trades only — /equity for total account value"
+            f"paper: today {float(s['paper_today']):+.2f} | all-time {float(s['paper_all_time']):+.2f}"
+        )
+        # Itemise today. A daily total is unverifiable on its own, and the
+        # lines that make it puzzling are the ones nobody placed: a CANCELLED
+        # position is an entry that filled and was unwound, which books a real
+        # cost without ever being a trade.
+        today = self._positions.closed_today()
+        if today:
+            lines = [head, "", f"today's {len(today)} closed position(s):"]
+            for p in today:
+                when = (time.strftime("%H:%M", time.localtime(p.closed_ms / 1000))
+                        if p.closed_ms else "--:--")
+                tag = "  (entry unwound, never a trade)" if p.state == "CANCELLED" else ""
+                lines.append(
+                    f"  {when}  #{p.id} {p.symbol:<12}"
+                    f" {float(p.realized_pnl_usd or 0):>+9.2f}{tag}"
+                )
+            lines.append("")
+            lines.append(
+                "closed positions only — funding still accruing on an open one,"
+                " and any coin held outside the strategy, are not in here."
+                " /equity is the whole account; /trades breaks a line down."
+            )
+            return "\n".join(lines)
+        return (
+            head + "\n\nnothing closed today."
+            "\nclosed positions only — /equity for total account value"
         )
 
     def _cmd_log(self, args: list[str]) -> str:

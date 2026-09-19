@@ -414,6 +414,8 @@ class PositionManager:
         )
         kept_qty = sum((q for q, _ in open_entries), Decimal(0))
         return {
+            "entry_qty": kept_qty,
+            "exit_qty": out_qty,
             "entry_avg": in_cost / kept_qty if kept_qty > 0 else None,
             "exit_avg": out_cost / out_qty if out_qty > 0 else None,
             "qty": in_qty - out_qty,
@@ -472,15 +474,16 @@ class PositionManager:
         """
         pos = self.get(position_id)
         perp_pnl = spot_pnl = Decimal(0)
-        entry_qty_perp = self._phase_qty(position_id, "aster", "entry")
-        exit_qty_perp = self._exited_qty(position_id, "aster")
+        # Quantities from the same derivation that produced the averages, so a
+        # reversed (unwound) entry is excluded from both. Mixing a raw entry
+        # count with an unwind-aware average prices the wrong size.
+        perp = self._derive_legs(position_id, "aster")
+        spot = self._derive_legs(position_id, "mexc")
         if pos.perp_entry_avg is not None and pos.perp_exit_avg is not None:
-            qty = min(entry_qty_perp, exit_qty_perp)
+            qty = min(perp["entry_qty"], perp["exit_qty"])
             perp_pnl = (pos.perp_entry_avg - pos.perp_exit_avg) * qty
-        entry_qty_spot = self._phase_qty(position_id, "mexc", "entry")
-        exit_qty_spot = self._exited_qty(position_id, "mexc")
         if pos.spot_entry_avg is not None and pos.spot_exit_avg is not None:
-            qty = min(entry_qty_spot, exit_qty_spot)
+            qty = min(spot["entry_qty"], spot["exit_qty"])
             spot_pnl = (pos.spot_exit_avg - pos.spot_entry_avg) * qty
         # Unwound clips closed at a price of their own; that money is real but
         # belongs to neither average (see _derive_legs).
@@ -512,6 +515,22 @@ class PositionManager:
             "perp_exit": self._exited_qty(position_id, "aster"),
             "spot_exit": self._exited_qty(position_id, "mexc"),
         }
+
+    def closed_today(self) -> list[Position]:
+        """Positions whose realised P&L lands in today's /pnl figure.
+
+        Includes CANCELLED ones: an entry that filled and was unwound books a
+        real (negative) result, so it belongs in the day's total — but it is
+        not a trade anyone placed, which is exactly the kind of line that makes
+        a daily figure look inexplicable until you see it.
+        """
+        day_start_ms = (_now_ms() // 86_400_000) * 86_400_000
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE paper=0 AND realized_pnl_usd IS NOT"
+            " NULL AND closed_ms >= ? ORDER BY closed_ms",
+            (day_start_ms,),
+        ).fetchall()
+        return [Position.from_row(r) for r in rows]
 
     def pnl_summary(self) -> dict[str, Decimal]:
         out: dict[str, Decimal] = {}
