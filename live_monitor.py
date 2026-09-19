@@ -419,14 +419,14 @@ class Engine:
             mexc = self.md.mexc_books.get(pair.mexc_symbol)
             if aster is None or mexc is None:
                 continue
-            funding_rate = (
-                self.md.funding.get(pair.aster_symbol) or {}
-            ).get("funding_rate")
+            fund_row = self.md.funding.get(pair.aster_symbol) or {}
+            funding_rate = fund_row.get("funding_rate")
             stat = self.md.funding_stats.get(pair.aster_symbol)
             interval = stat.interval_hours if stat else 8
             row = screener.compute_row(
                 pair, aster, mexc, funding_rate, now_ms=now,
                 funding_interval_hours=interval,
+                index_price=fund_row.get("index_price"),
             )
             if row is not None:
                 self._basis_avg.add(sym, now, row.entry_bps, row.net_edge_bps)
@@ -496,6 +496,7 @@ class Engine:
                 screen = screener.compute_row(
                     pair, aster, mexc, live_rate,
                     now_ms=now, funding_interval_hours=stat.interval_hours,
+                    index_price=fund_row.get("index_price"),
                 )
                 # compute_row returns None on a stale / zero-priced book (common
                 # for thin microcaps); only annotate a real row. The screener

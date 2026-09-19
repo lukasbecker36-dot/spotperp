@@ -127,6 +127,15 @@ SCREEN_MAX_SPREAD_COST_BPS = float(
 FUNDING_SCORE_HOLD_HOURS = float(
     os.environ.get("FUNDING_SCORE_HOLD_HOURS", "24")
 )
+# Aster's own index (built from real spot venues) vs the MEXC mid. They should
+# agree to within a spread; 5% apart means the two symbols are not the same
+# asset or the contract multiplier is wrong, and the "basis" is arithmetic on
+# two unrelated prices. This is the only gate that tests the quotes against an
+# outside reference — depth/spread/jitter all test the two against EACH OTHER,
+# so a consistently wrong price sails through them.
+SCREEN_MAX_INDEX_DIVERGENCE_BPS = float(
+    os.environ.get("SCREEN_MAX_INDEX_DIVERGENCE_BPS", "500")
+)
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

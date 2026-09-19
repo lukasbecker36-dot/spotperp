@@ -98,6 +98,12 @@ class ScreenerRow:
     perp_volume_24h: float = 0.0    # Aster perp 24h quote volume (USDT)
     perp_trades_24h: float = 0.0    # ...and how many trades made it up
     hours_tradeable_24h: float = 0.0  # hours the basis sat at/above the floor
+    # Aster's OWN index price vs the MEXC mid, in bps. Aster builds its index
+    # from real spot venues, so it should agree with MEXC to within a spread.
+    # A large gap means the two symbols are not the same asset, or the contract
+    # multiplier is wrong — in which case the basis is arithmetic on two
+    # unrelated prices. None when premiumIndex has not supplied one.
+    index_divergence_bps: float | None = None
 
 
 class RollingBasis:
@@ -152,6 +158,7 @@ def compute_row(
     *,
     now_ms: int,
     funding_interval_hours: int = 8,
+    index_price: Decimal | None = None,
 ) -> ScreenerRow | None:
     stale_ms = config.QUOTE_STALE_SECONDS * 1000
     if now_ms - aster.ts_ms > stale_ms or now_ms - mexc.ts_ms > stale_ms:
@@ -166,6 +173,13 @@ def compute_row(
 
     entry_bps = (aster_ask - mexc.ask) / mexc.ask * BPS
     close_bps = (aster_bid - mexc.bid) / mexc.bid * BPS
+    index_divergence_bps = None
+    if index_price is not None and index_price > 0:
+        mexc_mid = (mexc.ask + mexc.bid) / 2
+        if mexc_mid > 0:
+            index_divergence_bps = float(
+                (index_price / mult - mexc_mid) / mexc_mid * BPS
+            )
     fees_bps = (config.ENTRY_FEE + config.EXIT_FEE_PASSIVE) * BPS
     net_edge_bps = (
         entry_bps
@@ -197,6 +211,7 @@ def compute_row(
         aster_ask=str(aster_ask),
         mexc_ask=str(mexc.ask),
         ts_ms=now_ms,
+        index_divergence_bps=index_divergence_bps,
     )
 
 
@@ -207,9 +222,29 @@ def rank_rows(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         r
         for r in rows
         if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
+        and not _bad_index(r)
     ]
     eligible.sort(key=lambda r: r.net_edge_bps_avg, reverse=True)
     return eligible[: config.SCREENER_TOP_N]
+
+
+def _bad_index(row: ScreenerRow) -> bool:
+    """True when Aster's own index disagrees with MEXC spot by so much that the
+    two symbols cannot be the same asset at the same scale.
+
+    This is the one error the other gates cannot see. depth, spread and jitter
+    all test the RELATIONSHIP between the two quotes, so a pair that is
+    mis-mapped or on the wrong contract multiplier passes every one of them: a
+    consistently wrong price is still a tight, deep, steady quote. ONEUSDT
+    printed a +2674bps entry that had sat above +1500 all day, on a $6 book
+    with a -101bps carry, and looked perfectly workable.
+
+    Aster builds its index from real spot venues, so index vs MEXC mid is an
+    independent check that the two sides are the same thing. Fails OPEN when
+    premiumIndex has not supplied an index.
+    """
+    d = row.index_divergence_bps
+    return d is not None and abs(d) > config.SCREEN_MAX_INDEX_DIVERGENCE_BPS
 
 
 def _too_jittery(row: ScreenerRow) -> bool:
@@ -240,6 +275,8 @@ def quote_reject_reason(row: ScreenerRow) -> str | None:
     UNREAL instead: an untransactable gap between the books, a book too thin
     to have a price at all, a basis that flickers, and no flow to fill against.
     """
+    if _bad_index(row):
+        return "index"
     if row.max_notional_usd < config.SCREEN_MIN_DEPTH_USD:
         return "depth"
     # Entry (ask/ask) minus close (bid/bid) is what crossing both books costs
@@ -302,6 +339,7 @@ def rank_rows_by_swing(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         and r.basis_p10_24h <= config.SCREEN_SWING_EXIT_BPS
         and r.funding_8h_bps >= config.SCREEN_SWING_MIN_FUNDING_BPS
         and not _too_jittery(r)
+        and not _bad_index(r)
     ]
     eligible.sort(key=lambda r: r.entry_bps_avg - r.basis_p10_24h, reverse=True)
     return eligible[: config.SCREENER_TOP_N]
@@ -328,6 +366,7 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         and r.perp_volume_24h >= config.SCREEN_FILL_MIN_VOLUME_USD
         and r.hours_tradeable_24h >= config.SCREEN_FILL_MIN_HOURS
         and not _too_jittery(r)
+        and not _bad_index(r)
         # Enterable RIGHT NOW. Dwell says a name is reliably workable, but a
         # row you cannot act on today is a watchlist entry, not a candidate.
         and r.entry_bps_avg >= float(config.ENTRY_MIN_EDGE_FLOOR_BPS)

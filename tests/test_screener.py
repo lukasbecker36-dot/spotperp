@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+import time
 import pytest
 
 import config
@@ -693,3 +694,54 @@ def test_carry_score_scales_by_fill_chances_but_not_depth(monkeypatch):
     assert screener.carry_score(deep, 10.0, 10.0) == screener.carry_score(
         thin, 10.0, 10.0
     )
+
+
+def test_index_gate_catches_a_pair_the_other_gates_cannot(monkeypatch):
+    """ONEUSDT printed a +2674bps entry that had sat above +1500 all day, on a
+    tight book with a steady quote. Every other gate tests the two quotes
+    against EACH OTHER, so a mis-mapped symbol or a wrong contract multiplier
+    passes all of them — a consistently wrong price is still tight and steady.
+    Aster's own index is the outside reference that catches it."""
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 5.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_SPREAD_COST_BPS", 100.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_INDEX_DIVERGENCE_BPS", 500.0)
+    # Tight spread, deep book, steady: indistinguishable from a good row...
+    bad = _quote_row("ONE", 2673.8, 2670.0, depth=500.0)
+    assert screener.quote_reject_reason(bad) is None      # ...to the old gates
+    bad.index_divergence_bps = -2100.0                    # index says 21% off
+    assert screener.quote_reject_reason(bad) == "index"
+
+
+def test_index_gate_fails_open_without_an_index(monkeypatch):
+    """premiumIndex may not carry an index for every contract; a missing one
+    must not blank the board."""
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 5.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_SPREAD_COST_BPS", 100.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    r = _quote_row("NOINDEX", 40.0, 35.0, depth=200.0)
+    assert r.index_divergence_bps is None
+    assert screener.quote_reject_reason(r) is None
+
+
+def test_compute_row_measures_index_divergence_through_the_multiplier():
+    """The index is quoted per contract-unit like the book, so it has to be
+    divided by qty_multiplier before comparing with MEXC — otherwise every
+    1000X-style contract would look mis-mapped by 1000x."""
+    pair = PairMap(
+        aster_symbol="1000PEPEUSDT", mexc_symbol="PEPEUSDT",
+        qty_multiplier=Decimal(1000),
+    )
+    now = int(time.time() * 1000)
+    aster = BookTicker("1000PEPEUSDT", Decimal("10.0"), Decimal(1),
+                       Decimal("10.1"), Decimal(1), now)
+    mexc = BookTicker("PEPEUSDT", Decimal("0.0100"), Decimal(1),
+                      Decimal("0.0101"), Decimal(1), now)
+    row = screener.compute_row(
+        pair, aster, mexc, None, now_ms=now, index_price=Decimal("10.05")
+    )
+    assert abs(row.index_divergence_bps) < 1.0      # same asset, same scale
+    row = screener.compute_row(
+        pair, aster, mexc, None, now_ms=now, index_price=Decimal("12.0")
+    )
+    assert row.index_divergence_bps > 1800          # ~19% apart -> mis-mapped

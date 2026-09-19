@@ -621,7 +621,15 @@ class ControlBot:
             lo24 = rng(r.get("basis_p10_24h"), 6)
             hi24 = rng(r.get("basis_p90_24h"), 7)
             sc = r.get("score")
-            score = f"{sc:>+6.0f}" if sc is not None else f"{'-':>6}"
+            # The score subtracts jit, but jit needs 3 samples to exist. After
+            # a restart every row scores with a zero haircut, which flatters
+            # the flickery ones most — mark it rather than hide it.
+            if sc is None:
+                score = f"{'-':>6}"
+            elif r.get("samples", 0) < 3:
+                score = f"{f'{sc:+.0f}*':>6}"
+            else:
+                score = f"{sc:>+6.0f}"
             lines.append(
                 f"{_pad(r['symbol'], 11)}{score}{r['interval_hours']:>2}h"
                 f"{r['avg_24h_8h_bps']:>5.1f}{r['current_8h_bps']:>5.1f}{nxt}"
@@ -641,6 +649,9 @@ class ControlBot:
             " flatter a row on its average. jit is taken off the basis half"
             " only (funding accrues whatever price you got in at). Not weighted"
             " by depth — that is sizing, read depth$."
+            " '*' = under 3 samples, so no jitter haircut was applied yet"
+            " (normal for a few minutes after a restart) — treat it as an"
+            " upper bound."
         )
         lines.append("iv=interval; 24h=avg carry/8h; fund=settled/8h; next=to settle")
         lines.append(f"entry = {win_m:.0f}m avg basis (short perp gets +funding).")
@@ -662,9 +673,13 @@ class ControlBot:
             lines.append(
                 "hidden as unworkable: "
                 + ", ".join(f"{v} {k}" for k, v in sorted(hid.items()))
-                + f" (spread = books >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps"
-                " apart, so the quote is not a real price; depth/volume = too"
-                " thin to fill; jitter = flickers too hard to work)"
+                + f" (index = Aster's own index disagrees with MEXC spot by"
+                f" >{config.SCREEN_MAX_INDEX_DIVERGENCE_BPS / 100:.0f}%, so the"
+                " two symbols are not the same asset at the same scale and the"
+                " basis is fiction; spread = books"
+                f" >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps apart, so the"
+                " quote is not a real price; depth/volume = too thin to fill;"
+                " jitter = flickers too hard to work)"
             )
         return "\n".join(lines)
 
