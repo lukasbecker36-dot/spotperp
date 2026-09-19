@@ -364,8 +364,14 @@ def _report(scored: list[dict], phase: str, by: str) -> float:
     else:
         edges = [round(pctile(sorted(vals), p), 2) for p in (25, 50, 75)]
         groups = {}
+        skipped = 0
         for r in scored:
             j = r[by]
+            # size_frac is blank when the logs carried no depth for that
+            # minute. Those rows are absent from this cut, not zero.
+            if not isinstance(j, (int, float)):
+                skipped += 1
+                continue
             name = (f"<{edges[0]:g}" if j < edges[0] else
                     f">={edges[-1]:g}" if j >= edges[-1] else
                     next(f"{edges[i-1]:g}..{edges[i]:g}"
@@ -374,6 +380,9 @@ def _report(scored: list[dict], phase: str, by: str) -> float:
         order = ([f"<{edges[0]:g}"]
                  + [f"{edges[i-1]:g}..{edges[i]:g}" for i in range(1, len(edges))]
                  + [f">={edges[-1]:g}"])
+        if skipped:
+            print(f"  ({skipped} clips have no {by} and are left out of this"
+                  f" cut)", file=sys.stderr)
     ratio_hdr = "slip/jit" if by == "jit_bps" else "med " + by
     hdr = (f"{by:<14}{'clips':>7}{'med quoted':>12}"
            f"{'med locked':>12}{'med slip':>10}{ratio_hdr[:10]:>11}")

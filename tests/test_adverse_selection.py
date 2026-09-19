@@ -186,3 +186,16 @@ def test_ols_skips_rows_with_a_missing_feature():
     rows.append({"a": "", "y": 99.0})
     beta, _r2, n = adv._ols(rows, "y", ["a"])
     assert n == 20 and beta[1] == pytest.approx(2.0, abs=1e-6)
+
+
+def test_report_skips_rows_whose_bucket_column_is_blank(capsys):
+    """size_frac is blank when the logs had no depth for that minute. Bucketing
+    compared those against a float and crashed the whole run."""
+    rows = [
+        {"phase": "entry", "symbol": "A", "quoted_bps": 10.0,
+         "locked_bps": 5.0, "slippage_bps": 5.0, "jit_bps": 1.0,
+         "size_frac": (0.5 if i % 3 else "")}
+        for i in range(40)
+    ]
+    assert adv._report(rows, "entry", "size_frac") == 5.0
+    assert "no size_frac" in capsys.readouterr().err
