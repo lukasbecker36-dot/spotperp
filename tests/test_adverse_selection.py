@@ -107,8 +107,9 @@ def test_quoted_window_uses_only_quotes_before_the_fill():
     for i in range(10):
         # +50 before the fill instant, then a jump to +200 after it.
         s.append(1_000 + i * 60_000, 50.0 if i < 5 else 200.0, 44.0, 1.0, 100.0)
-    mean, jit, n = adv.quoted_before(s, 1_000 + 5 * 60_000, window_min=5)
+    mean, jit, n, depth = adv.quoted_before(s, 1_000 + 5 * 60_000, window_min=5)
     assert mean == 50.0 and n == 5 and jit == 0.0
+    assert depth == 100.0
 
 
 def test_exit_clips_pair_the_same_way(conn):
@@ -150,3 +151,38 @@ def test_quote_series_matches_the_phase():
     at = 1_000 + 6 * 60_000
     assert adv.quoted_before(s, at, 10, "entry")[0] == 50.0
     assert adv.quoted_before(s, at, 10, "exit")[0] == 44.0
+
+
+def test_ols_recovers_a_known_relationship():
+    """Pure-Python least squares, because this runs on the trading box and a
+    few features over a few hundred clips does not need a linear algebra
+    dependency. It still has to be right."""
+    import random
+    random.seed(4)
+    rows = [
+        {"notional_usd": n, "size_frac": f,
+         "slippage_bps": 2.0 + 0.05 * n + 3.0 * f + random.gauss(0, 0.4)}
+        for n, f in (
+            (random.uniform(5, 150), random.uniform(0.01, 3.0))
+            for _ in range(400)
+        )
+    ]
+    beta, r2, n = adv._ols(rows, "slippage_bps", ["notional_usd", "size_frac"])
+    assert beta[0] == pytest.approx(2.0, abs=0.3)
+    assert beta[1] == pytest.approx(0.05, abs=0.01)
+    assert beta[2] == pytest.approx(3.0, abs=0.2)
+    assert r2 > 0.95 and n == 400
+
+
+def test_ols_refuses_a_sample_too_small_to_fit():
+    rows = [{"a": 1.0, "y": 1.0}, {"a": 2.0, "y": 2.0}]
+    assert adv._ols(rows, "y", ["a"]) is None
+
+
+def test_ols_skips_rows_with_a_missing_feature():
+    """size_frac is blank when the logs had no depth for that minute. Those
+    rows must drop out of the fit rather than be read as zero."""
+    rows = [{"a": float(i), "y": 2.0 * i} for i in range(20)]
+    rows.append({"a": "", "y": 99.0})
+    beta, _r2, n = adv._ols(rows, "y", ["a"])
+    assert n == 20 and beta[1] == pytest.approx(2.0, abs=1e-6)

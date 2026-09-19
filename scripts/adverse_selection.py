@@ -132,7 +132,7 @@ def clip_basis(conn, phase: str = "entry", paper: bool = False) -> list[dict]:
 def quoted_before(
     s: Series, ts_ms: int, window_min: float, phase: str = "entry"
 ) -> tuple | None:
-    """(mean entry basis, jitter, samples) over the window BEFORE ts_ms.
+    """(mean basis, jitter, samples, min depth) over the window BEFORE ts_ms.
 
     Before, not at: by the moment a resting order fills the basis has already
     moved, so pricing the comparison at the fill would bake in the very effect
@@ -147,7 +147,13 @@ def quoted_before(
     if len(vals) < 3:
         return None
     jit = sum(abs(vals[i] - vals[i - 1]) for i in range(1, len(vals))) / (len(vals) - 1)
-    return sum(vals) / len(vals), jit, len(vals)
+    # Depth while the order rested, so a clip can be expressed as a FRACTION
+    # of the book rather than an absolute size. The executor already sizes a
+    # clip to the book at placement (max_hedgeable_qty) but the order fills
+    # later, against a book that has moved — so the question this answers is
+    # whether the cap should scale with depth instead of being flat.
+    depth = min(s.depth[lo:hi]) if hi > lo else 0.0
+    return sum(vals) / len(vals), jit, len(vals), depth
 
 
 def main() -> None:
@@ -168,6 +174,10 @@ def main() -> None:
                     help="which side to score (default both). The round trip"
                          " pays slippage twice, so the cost floor needs the"
                          " sum, not the entry alone")
+    ap.add_argument("--regress", action="store_true",
+                    help="also fit slippage against clip size and book"
+                         " fraction, to decide whether the clip cap should be"
+                         " flat or scale with depth")
     ap.add_argument("--paper", action="store_true", help="score paper fills instead")
     args = ap.parse_args()
 
@@ -202,7 +212,7 @@ def main() -> None:
         if q is None:
             no_quote += 1
             continue
-        quoted, jit, n = q
+        quoted, jit, n, depth = q
         # Positive always means WORSE than the board showed. An entry wants a
         # high basis so locking lower is the loss; an exit wants a low one, so
         # the sign flips.
@@ -213,6 +223,11 @@ def main() -> None:
             "quoted_bps": round(quoted, 2),
             "jit_bps": round(jit, 2),
             "quote_samples": n,
+            "depth_usd": round(depth, 0),
+            # How much of the visible book this clip was. A flat cap is right
+            # if slippage tracks notional; a depth-scaled cap is right if it
+            # tracks this instead.
+            "size_frac": round(c["notional_usd"] / depth, 3) if depth > 0 else "",
             "slippage_bps": round(slip, 2),
         })
     if no_quote:
@@ -239,6 +254,8 @@ def main() -> None:
             print(f"\nno {ph} clips scored", file=sys.stderr)
             continue
         medians[ph] = _report(rows_ph, ph, args.by)
+        if args.regress:
+            _regress(rows_ph, ph)
 
     if len(medians) > 1:
         total = sum(medians.values())
@@ -249,6 +266,76 @@ def main() -> None:
             f"SLIPPAGE_BUFFER_BPS is {float(config.SLIPPAGE_BUFFER_BPS):g}, so"
             f" the cost floor budgets that against {total:.1f} measured."
         )
+
+
+def _ols(rows: list[dict], y_key: str, x_keys: list[str]) -> tuple | None:
+    """Least squares with an intercept, solved by Gaussian elimination.
+
+    Pure Python on purpose: this runs on the trading box, which has aiohttp
+    and not much else, and a handful of features over a few hundred clips does
+    not need a linear algebra dependency.
+    """
+    data = []
+    for r in rows:
+        xs = [r.get(k) for k in x_keys]
+        y = r.get(y_key)
+        if any(not isinstance(v, (int, float)) for v in xs + [y]):
+            continue
+        data.append(([1.0] + [float(v) for v in xs], float(y)))
+    n, k = len(data), len(x_keys) + 1
+    if n <= k + 2:
+        return None
+    # Normal equations (X'X)b = X'y.
+    xtx = [[sum(row[i] * row[j] for row, _ in data) for j in range(k)]
+           for i in range(k)]
+    xty = [sum(row[i] * y for row, y in data) for i in range(k)]
+    for col in range(k):
+        piv = max(range(col, k), key=lambda r2: abs(xtx[r2][col]))
+        if abs(xtx[piv][col]) < 1e-12:
+            return None
+        xtx[col], xtx[piv] = xtx[piv], xtx[col]
+        xty[col], xty[piv] = xty[piv], xty[col]
+        d = xtx[col][col]
+        xtx[col] = [v / d for v in xtx[col]]
+        xty[col] /= d
+        for r2 in range(k):
+            if r2 == col:
+                continue
+            f = xtx[r2][col]
+            xtx[r2] = [a - f * b for a, b in zip(xtx[r2], xtx[col])]
+            xty[r2] -= f * xty[col]
+    beta = xty
+    ybar = sum(y for _, y in data) / n
+    ss_tot = sum((y - ybar) ** 2 for _, y in data)
+    ss_res = sum((y - sum(b * v for b, v in zip(beta, row))) ** 2
+                 for row, y in data)
+    r2 = 1 - ss_res / ss_tot if ss_tot else 0.0
+    return beta, r2, n
+
+
+def _regress(scored: list[dict], phase: str) -> None:
+    """Is slippage a function of absolute clip size, or of the FRACTION of the
+    book a clip takes? The answer decides whether the cap should be flat or
+    scale with depth."""
+    print(f"\n{phase}: slippage_bps regressed on ...")
+    for name, keys in (
+        ("notional only", ["notional_usd"]),
+        ("book fraction only", ["size_frac"]),
+        ("both", ["notional_usd", "size_frac"]),
+        ("both + jitter", ["notional_usd", "size_frac", "jit_bps"]),
+    ):
+        fit = _ols(scored, "slippage_bps", keys)
+        if fit is None:
+            print(f"  {name:<20} (not enough usable rows)")
+            continue
+        beta, r2, n = fit
+        terms = "  ".join(f"{k}={b:+.4g}" for k, b in zip(keys, beta[1:]))
+        print(f"  {name:<20} R2={r2:5.3f}  n={n:<5} const={beta[0]:+.2f}  {terms}")
+    print(
+        "  Compare the R2 values: whichever of notional and book fraction"
+        " explains more is the one the clip cap should key on. A low R2 on"
+        " both means clip sizing is not what drives slippage."
+    )
 
 
 def _report(scored: list[dict], phase: str, by: str) -> float:
