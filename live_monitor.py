@@ -511,12 +511,19 @@ class Engine:
                     w.writerow([
                         "ts_ms", "symbol", "entry_bps", "close_bps",
                         "funding_8h_bps", "max_notional_usd",
+                        # Flow, appended for the labelled dataset: depth says
+                        # the book is not empty, but what LIFTS a resting maker
+                        # is trades. Without it a replay can rebuild every
+                        # screen except the fill factor. Readers index by
+                        # header name, so older logs without it still load.
+                        "perp_trades_24h",
                     ])
                 for r in rows:
                     w.writerow([
                         r.ts_ms, r.symbol, f"{r.entry_bps:.2f}",
                         f"{r.close_bps:.2f}", f"{r.funding_8h_bps:.2f}",
                         f"{r.max_notional_usd:.0f}",
+                        f"{r.perp_trades_24h:.0f}",
                     ])
         except OSError:
             log.exception("basis log write failed")

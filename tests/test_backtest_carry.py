@@ -121,3 +121,23 @@ def test_carry_net_formula():
     assert t.net_bps == 16.0
     assert t.hold_hours == 24.0
     assert round(t.annualised_bps) == round(16.0 * 8760 / 24)
+
+
+def test_series_trades_column_is_optional_and_aligned():
+    """The basis log gained perp_trades_24h later than the rest. Older days
+    must still load, and a reader has to be able to tell 'no flow' apart from
+    'we were not recording flow yet'."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from backtest_divergence import Series
+
+    old = Series()
+    old.append(1, 10.0, 5.0, 1.0, 100.0)
+    assert old.trades is None                 # absent, not zero
+
+    mixed = Series()
+    mixed.append(1, 10.0, 5.0, 1.0, 100.0)    # a pre-column row...
+    mixed.append(2, 11.0, 6.0, 1.0, 100.0, 2500.0)   # ...then one with flow
+    assert len(mixed.trades) == len(mixed.ts)  # stays index-aligned with ts
+    assert mixed.trades[1] == 2500.0

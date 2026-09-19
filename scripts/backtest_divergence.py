@@ -74,7 +74,7 @@ class Series:
     in ~40 bytes each (5 x 8-byte columns) vs ~250 for a Python object — the
     difference between fitting in the 4GB box and OOM-thrashing on 11M rows."""
 
-    __slots__ = ("ts", "entry", "close", "funding", "depth")
+    __slots__ = ("ts", "entry", "close", "funding", "depth", "trades")
 
     def __init__(self):
         self.ts = array.array("q")       # int64 ms
@@ -82,14 +82,24 @@ class Series:
         self.close = array.array("d")    # bid/bid  (maker perp + taker spot sell)
         self.funding = array.array("d")  # funding_8h_bps
         self.depth = array.array("d")    # top-of-book USD
+        # Aster perp 24h trade count, added to the log later than the rest.
+        # None on days written before it existed, so a reader can tell "no
+        # flow" apart from "we were not recording flow yet".
+        self.trades = None
 
     def __len__(self):
         return len(self.ts)
 
-    def append(self, ts, e, c, f, d):
+    def append(self, ts, e, c, f, d, tr=None):
         self.ts.append(ts)
         self.entry.append(e)
         self.close.append(c)
+        if tr is not None:
+            if self.trades is None:
+                # Backfill rows that predate the column so this array stays
+                # index-aligned with ts.
+                self.trades = array.array("d", [0.0] * (len(self.ts) - 1))
+            self.trades.append(tr)
         self.funding.append(f)
         self.depth.append(d)
 
@@ -168,6 +178,7 @@ def load_logs(
                 )
             except KeyError:
                 continue
+            tr_i = idx.get("perp_trades_24h")   # absent on older logs
             for row in reader:
                 try:
                     sym = row[sym_i]
@@ -182,7 +193,8 @@ def load_logs(
                     if s is None:
                         s = by_symbol[sym] = Series()
                     s.append(int(row[ts_i]), float(row[e_i]), float(row[c_i]),
-                             float(row[fnd_i]), float(row[dep_i]))
+                             float(row[fnd_i]), float(row[dep_i]),
+                             float(row[tr_i]) if tr_i is not None else None)
                     rows_here += 1
                 except (IndexError, ValueError):
                     continue  # malformed line (partial write) — skip
