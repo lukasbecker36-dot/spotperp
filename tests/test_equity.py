@@ -97,7 +97,10 @@ def test_daily_series_takes_the_last_mark_of_each_day(tmp_path):
         database.record_equity(conn, day + offset, "0", "0", "0", total)
     database.record_equity(conn, day + 86_400_000, "0", "0", "0", "200")
     series = equity.daily_series(database.equity_history(conn))
-    assert [v for _d, v in series] == [Decimal(125), Decimal(200)]
+    assert [m.total for m in series] == [Decimal(125), Decimal(200)]
+    # The sample count travels with the mark so a day made of one reading can
+    # be flagged: it is the moment sampling started, not a day's close.
+    assert series[0].samples == 3 and series[1].samples == 1
     conn.close()
 
 
@@ -117,3 +120,18 @@ def test_chart_survives_a_flat_series():
     """A day with no change must not divide by a zero range."""
     rows = equity.sparkline([500.0] * 6, height=3)
     assert len(rows) == 3
+
+
+def test_daily_series_carries_the_components(tmp_path):
+    """The total alone cannot say WHY a day moved. A hedged book can change
+    purely because the legs are marked differently (Aster mark vs MEXC bid),
+    and that shows up as perp and coins moving in opposite directions."""
+    conn = database.init_db(tmp_path / "t.db")
+    day = 1_700_000_000_000 - (1_700_000_000_000 % 86_400_000)
+    database.record_equity(conn, day, "600", "300", "100", "1000")
+    database.record_equity(conn, day + 86_400_000, "560", "345", "100", "1005")
+    a, b = equity.daily_series(database.equity_history(conn))
+    assert b.total - a.total == Decimal(5)
+    assert b.aster - a.aster == Decimal(-40)        # legs moved against each
+    assert b.spot_coins - a.spot_coins == Decimal(45)   # other: a mark shift
+    conn.close()

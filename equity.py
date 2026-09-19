@@ -127,16 +127,39 @@ def sparkline(values: list[float], height: int = 7, width: int = 48) -> list[str
     return rows
 
 
-def daily_series(rows: list) -> list[tuple[str, Decimal]]:
-    """(UTC date, last total of that day) for each day present.
+@dataclass
+class DailyMark:
+    day: str
+    ts_ms: int
+    total: Decimal
+    aster: Decimal
+    spot_coins: Decimal
+    spot_usdt: Decimal
+    samples: int = 0
 
-    The last snapshot of a day, not the average: a daily P&L table is a
+
+def daily_series(rows: list) -> list[DailyMark]:
+    """The closing mark of each UTC day present, with its components.
+
+    The LAST snapshot of a day, not the average: a daily P&L table is a
     comparison of closing marks, and averaging would blur a day that moved.
+    The components come along because the total alone cannot say WHY a day
+    moved — a hedged book can show a daily change purely from the perp and
+    spot legs being marked differently (Aster mark vs MEXC bid), and seeing
+    the two move in opposite directions is what identifies that.
     """
-    by_day: dict[str, tuple[int, Decimal]] = {}
+    by_day: dict[str, DailyMark] = {}
     for r in rows:
         day = time.strftime("%Y-%m-%d", time.gmtime(r["ts_ms"] / 1000))
         prev = by_day.get(day)
-        if prev is None or r["ts_ms"] >= prev[0]:
-            by_day[day] = (r["ts_ms"], _dec(r["total_usd"]))
-    return [(d, v) for d, (_, v) in sorted(by_day.items())]
+        if prev is None or r["ts_ms"] >= prev.ts_ms:
+            by_day[day] = DailyMark(
+                day=day, ts_ms=r["ts_ms"], total=_dec(r["total_usd"]),
+                aster=_dec(r["aster_usd"]),
+                spot_coins=_dec(r["spot_coins_usd"]),
+                spot_usdt=_dec(r["spot_usdt_usd"]),
+                samples=(prev.samples if prev else 0) + 1,
+            )
+        else:
+            prev.samples += 1
+    return [by_day[d] for d in sorted(by_day)]

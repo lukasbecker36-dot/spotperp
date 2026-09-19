@@ -1750,39 +1750,69 @@ class Engine:
             return "\n".join(lines)
 
         lines.append("")
-        hdr = f"{'date':<11}{'value':>12}{'change':>11}{'%':>8}"
+        # Components, not just the total: a hedged book can show a daily change
+        # purely because the two legs are marked differently (Aster mark price
+        # vs MEXC bid), and seeing perp and coins move in OPPOSITE directions
+        # is what identifies that as a marking artefact rather than profit.
+        hdr = (f"{'date (UTC)':<11}{'value':>11}{'change':>9}{'%':>7}"
+               f"{'perp':>9}{'coins':>9}{'usdt':>9}")
         lines.append(hdr)
         lines.append("-" * len(hdr))
         prev = None
-        for day, value in series[-days:]:
+        for m in series[-days:]:
             if prev is None:
-                chg, pct = "-", "-"
+                cells = f"{'-':>9}{'-':>7}{'-':>9}{'-':>9}{'-':>9}"
             else:
-                d = value - prev
-                chg = f"{float(d):+,.2f}"
-                pct = f"{float(d / prev * 100):+.2f}" if prev else "-"
-            lines.append(
-                f"{day:<11}{float(value):>12,.2f}{chg:>11}{pct:>8}"
-            )
-            prev = value
-        first, last = series[0][1], series[-1][1]
+                d = m.total - prev.total
+                pct = f"{float(d / prev.total * 100):+.2f}" if prev.total else "-"
+                cells = (
+                    f"{float(d):>+9,.2f}{pct:>7}"
+                    f"{float(m.aster - prev.aster):>+9,.2f}"
+                    f"{float(m.spot_coins - prev.spot_coins):>+9,.2f}"
+                    f"{float(m.spot_usdt - prev.spot_usdt):>+9,.2f}"
+                )
+            lines.append(f"{m.day:<11}{float(m.total):>11,.2f}{cells}")
+            prev = m
+        first, last = series[0].total, series[-1].total
         move = last - first
         lines.append("-" * len(hdr))
         lines.append(
             f"{len(series)}d change {float(move):+,.2f}"
             + (f" ({float(move / first * 100):+.2f}%)" if first else "")
         )
+        if series[0].samples < 2:
+            lines.append(
+                f"⚠️ {series[0].day} has only {series[0].samples} sample, so it"
+                " is the moment sampling started, not a full day's close — the"
+                " first change figure spans less than a day."
+            )
+        # What the closed trades actually earned, to sit beside the marks. A
+        # gap between the two is mark-to-market on open positions, funding, or
+        # a transfer — not an error in either number.
+        realised = self.positions.pnl_summary().get("live_today", Decimal(0))
+        if len(series) >= 2:
+            lines.append(
+                f"today: marks {float(series[-1].total - series[-2].total):+,.2f}"
+                f" vs closed trades {float(realised):+,.2f}"
+            )
 
-        chart = equity.sparkline([float(v) for _d, v in series[-days:]])
+        chart = equity.sparkline([float(m.total) for m in series[-days:]])
         if chart:
             lines.append("")
             lines += chart
         lines.append("")
         lines.append(
-            "This is venue truth, so it includes funding on open positions,"
-            " coins held outside the strategy and idle margin — everything"
-            " /pnl cannot see. But a change in account value is P&L only if no"
-            " money moved in or out: a deposit looks exactly like a profit."
+            "A day's change is the difference between two MARKS, not a sum of"
+            " trades. It moves when nothing is traded: the perp leg is valued"
+            " at Aster's mark price and the spot leg at the MEXC bid, so a"
+            " change in the basis — or a wide spot book — shifts the total on"
+            " its own. perp and coins moving opposite ways by similar amounts"
+            " is that, and it reverses when the basis does."
+        )
+        lines.append(
+            "Real money in the number: funding received, fees paid, realised"
+            " trades. Not P&L at all: deposits and withdrawals, which look"
+            " exactly like profit here."
         )
         return "\n".join(lines)
 
