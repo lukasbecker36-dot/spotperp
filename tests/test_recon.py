@@ -123,13 +123,16 @@ def test_format_report_shows_mark_liq_and_warns_when_close(monkeypatch):
     assert "+8.0% to liq" in close and "⚠️" in close  # <15% -> warn
 
 
-def test_format_report_shows_funding_rates(monkeypatch):
+def test_format_report_shows_funding_rates_per_hour(monkeypatch):
+    """Rates are stored 8h-equivalent — the only way to compare contracts that
+    settle on 1h, 4h and 8h — but shown per HOUR so they weigh directly against
+    how long the position has been held."""
     monkeypatch.setattr(config, "ASTER_MAKER_FEE", Decimal("0.0"))
     monkeypatch.setattr(config, "MEXC_TAKER_FEE", Decimal("0.0"))
     out = recon.format_report(
         [_pair(funding_now_8h_bps=5.2, funding_avg_8h_bps=4.8)], []
     )
-    assert "fund rate now +5.2 / 24h +4.8 bps/8h" in out
+    assert "fund rate now +0.65 / 24h +0.60 bps/h" in out
 
 
 def test_format_report_liq_na_when_missing(monkeypatch):

@@ -173,9 +173,12 @@ def format_report(pairs: list[PairRecon], notes: list[str]) -> str:
             f"  funding {float(p.funding_usd):+.2f}"
             f"   fees -{float(p.fees):.2f}"
         )
+        # Stored 8h-equivalent (the only way to compare 1h/4h/8h contracts),
+        # shown per HOUR so it weighs directly against how long this position
+        # has been held — same convention as /funding, /book and /screen.
         lines.append(
-            f"  fund rate now {p.funding_now_8h_bps:+.1f}"
-            f" / 24h {p.funding_avg_8h_bps:+.1f} bps/8h"
+            f"  fund rate now {p.funding_now_8h_bps / 8:+.2f}"
+            f" / 24h {p.funding_avg_8h_bps / 8:+.2f} bps/h"
         )
         lines.append(f"  NET {float(p.net_pnl):+.2f}")
         if abs(p.hedge_imbalance) > p.perp_base * _QTY_TOL:
