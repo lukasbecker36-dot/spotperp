@@ -940,10 +940,15 @@ class Executor:
                 perp_ref, pair.mexc_symbol,
                 unhedged * pair.qty_multiplier, pair.qty_multiplier,
             )
-            if (
-                live_basis is not None
-                and live_basis < config.ENTRY_HEDGE_MIN_BPS
-            ):
+            # Never unwind for filling at the level you ASKED for: a target
+            # below the absolute floor is a deliberate discount entry, not a
+            # collapse. For a premium target the absolute floor is already the
+            # lower of the two, so those entries behave exactly as before.
+            hedge_min = min(
+                config.ENTRY_HEDGE_MIN_BPS,
+                Decimal(str(entry_floor)) - config.ENTRY_HEDGE_SLIP_BPS,
+            )
+            if live_basis is not None and live_basis < hedge_min:
                 # Below the salvage floor: holding would lock a loss, so unwind
                 # rather than hedge into it.
                 naked = unhedged
@@ -953,7 +958,7 @@ class Executor:
                 await self._notifier.alert(
                     f"🛑 position {position.id} {symbol}: entry basis collapsed to"
                     f" {live_basis:.1f}bps (below hedge-min"
-                    f" {float(config.ENTRY_HEDGE_MIN_BPS):.0f}bps) by hedge time"
+                    f" {float(hedge_min):.0f}bps) by hedge time"
                     f" — unwinding {naked} perp units instead of locking a loss"
                 )
                 await self._unwind_perp(position, naked)

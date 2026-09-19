@@ -626,6 +626,94 @@ async def test_entry_salvages_when_basis_below_floor_but_above_min(env, monkeypa
     assert final.spot_qty == final.perp_qty            # fully hedged and held
 
 
+async def test_entry_salvages_a_deliberately_negative_target(env, monkeypatch):
+    """A negative entry target is a real trade, not a mistake. Short perp +
+    long spot pays (entry - exit), so entering at -15 to exit at -50 earns
+    35bps, and a positive carry pays you to wait. The absolute salvage floor
+    assumed every entry was a premium trade and unwound the fill for being
+    negative — refusing the position the user actually asked for (AINUSDT
+    #194: "collapsed to -14.9bps (below hedge-min 0bps)")."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_HEDGE_SLIP_BPS", Decimal(15))
+    monkeypatch.setattr(config, "ENTRY_MAX_CLIP_NOTIONAL_USD", Decimal("100000"))
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    calls = {"n": 0}
+
+    async def flip_depth(symbol, side, limit=20):
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return [(Decimal("100.0"), Decimal(100))]
+        # Perp rests at 100.5; spot ask 100.65 -> hedge basis ~-14.9bps.
+        # Below the absolute floor of 0, but the target was -20, so this is
+        # the level that was ASKED for: floor is min(0, -20-15) = -35.
+        return [(Decimal("100.65"), Decimal(100))]
+    executor._trader.spot_depth = flip_depth
+
+    pos = positions.create(
+        "BTCUSDT", Decimal(1000), paper=True, min_entry_bps=Decimal(-20)
+    )
+    executor.start_entry(pos)
+    await wait_for_state(positions, pos.id, pm.OPEN)      # entered, not refused
+    final = positions.get(pos.id)
+    assert final.perp_qty > 0
+    assert final.spot_qty == final.perp_qty
+    assert not any("collapsed" in m for m in notifier.messages)
+
+
+async def test_entry_still_unwinds_far_below_a_negative_target(env, monkeypatch):
+    """The relative floor must not become no floor: a fill far below even a
+    negative target is still a collapse and must unwind."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_HEDGE_SLIP_BPS", Decimal(15))
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    calls = {"n": 0}
+
+    async def flip_depth(symbol, side, limit=20):
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return [(Decimal("100.0"), Decimal(100))]
+        return [(Decimal("101.0"), Decimal(100))]    # ~-49.5bps, below -35
+    executor._trader.spot_depth = flip_depth
+
+    pos = positions.create(
+        "BTCUSDT", Decimal(1000), paper=True, min_entry_bps=Decimal(-20)
+    )
+    executor.start_entry(pos)
+    await wait_for_message(notifier, "collapsed")
+    await wait_for_state(positions, pos.id, pm.CANCELLED)
+    assert positions.get(pos.id).spot_qty == 0
+
+
+async def test_premium_entry_salvage_floor_is_unchanged(env, monkeypatch):
+    """Regression guard on the change above: for a premium target the absolute
+    floor is already the lower of the two, so a +30 entry must still unwind at
+    +1bps exactly as before — the relative floor must not loosen it."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_HEDGE_SLIP_BPS", Decimal(15))
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    calls = {"n": 0}
+
+    async def flip_depth(symbol, side, limit=20):
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return [(Decimal("100.0"), Decimal(100))]
+        return [(Decimal("100.6"), Decimal(100))]    # ~-10bps, below 0
+    executor._trader.spot_depth = flip_depth
+
+    pos = positions.create(
+        "BTCUSDT", Decimal(1000), paper=True, min_entry_bps=Decimal(30)
+    )
+    executor.start_entry(pos)
+    await wait_for_message(notifier, "collapsed")
+    await wait_for_state(positions, pos.id, pm.CANCELLED)
+
+
 async def test_aggressive_exit_closes_immediately(env):
     md, positions, executor, notifier, conn = env
     pos_id = await open_position(md, positions, executor)

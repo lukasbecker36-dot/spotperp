@@ -306,6 +306,15 @@ HEDGE_RETRY_ATTEMPTS = 3
 #   - ALERT (but still enter) if the final realized basis lands more than
 #     ENTRY_REALIZED_ALERT_BPS below the floor, so it is never a silent miss.
 ENTRY_HEDGE_MIN_BPS = Decimal(os.environ.get("ENTRY_HEDGE_MIN_BPS", "0"))
+# ...but an absolute floor assumes every entry is a premium trade. Entering at
+# a DELIBERATELY negative basis is a real trade — short perp + long spot pays
+# (entry - exit), so entering at -15 to exit at -50 earns 35bps, and a positive
+# carry pays you to wait. Unwinding such a fill for being negative refuses the
+# position the user actually asked for. So the salvage floor is the LOWER of
+# ENTRY_HEDGE_MIN_BPS and (the entry target you set - this slack): never
+# unwind merely for filling at the level you asked for. Premium entries are
+# unaffected, since for a +30 target the absolute 0 floor is already lower.
+ENTRY_HEDGE_SLIP_BPS = Decimal(os.environ.get("ENTRY_HEDGE_SLIP_BPS", "15"))
 ENTRY_REALIZED_ALERT_BPS = Decimal(os.environ.get("ENTRY_REALIZED_ALERT_BPS", "10"))
 # Buffer added past the live depth level that completes the hedge fill (the
 # IOC is priced to cross real resting depth up to the needed size, then this
