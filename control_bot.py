@@ -60,7 +60,8 @@ HELP = """Commands:
 /truefill ID|SYMBOL — re-price a mark-booked exit (ADL / lost stop) from Aster's real trades and recompute P&L
 /recompute ID|SYMBOL — re-derive quantities, averages and entry basis from the fill history (DB only)
 /trades [n] — last closed trades (avg venue prices, open/close basis, funding, commission, P&L; default 5)
-/pnl — realised P&L summary
+/pnl — realised P&L summary (closed trades only)
+/equity [days] — total account value (perp margin + upnl, spot coins, USDT), daily change table and chart
 /log [n] — last journal lines
 /mode — show paper/live
 /paper — switch to paper (restarts engine)
@@ -242,6 +243,11 @@ class ControlBot:
             return await advisor.review_text(self._session, self._conn)
         if command == "positions":
             return self._cmd_positions()
+        if command == "equity":
+            days = args[0] if args else None
+            return await self._queue_and_wait(
+                "equity", {"days": days}, wait=30
+            )
         if command == "recompute":
             if not args:
                 return ("usage: /recompute ID|SYMBOL — re-derive a position's"
@@ -909,10 +915,14 @@ class ControlBot:
 
     def _cmd_pnl(self) -> str:
         s = self._positions.pnl_summary()
+        # Say what this number is NOT: it counts closed positions only, so it
+        # misses funding still accruing, coins held outside the strategy and
+        # idle margin. /equity is the complete picture.
         return (
             f"realised P&L (USD)\n"
             f"live:  today {float(s['live_today']):+.2f} | all-time {float(s['live_all_time']):+.2f}\n"
-            f"paper: today {float(s['paper_today']):+.2f} | all-time {float(s['paper_all_time']):+.2f}"
+            f"paper: today {float(s['paper_today']):+.2f} | all-time {float(s['paper_all_time']):+.2f}\n"
+            f"\nclosed trades only — /equity for total account value"
         )
 
     def _cmd_log(self, args: list[str]) -> str:

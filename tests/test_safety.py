@@ -1725,3 +1725,55 @@ async def test_recompute_does_not_book_pnl_on_an_open_position(engine):
     engine.positions.set_state(pos.id, pm.OPEN)
     await engine._cmd_recompute({"position_id": str(pos.id)})
     assert engine.positions.get(pos.id).realized_pnl_usd is None
+
+
+class _EquityClient:
+    """Venue stub returning fixed balances, for the equity sampler."""
+    def __init__(self, aster=True):
+        self._aster = aster
+
+    async def balances(self):
+        return [{"asset": "USDT", "balance": "1000", "crossUnPnl": "0"}]
+
+    async def account(self):
+        return {"balances": [{"asset": "USDT", "free": "500", "locked": "0"}]}
+
+
+async def test_equity_sampler_skips_paper(engine):
+    """Paper has no venue balances; a zero row would poison the history with a
+    cliff on the day the mode was switched."""
+    engine.paper = True
+    await engine._sample_equity()
+    assert database.equity_history(engine.conn) == []
+
+
+async def test_equity_sampler_records_and_then_throttles(engine, monkeypatch):
+    monkeypatch.setattr(config, "EQUITY_SNAPSHOT_MINUTES", 30.0)
+    engine.paper = False
+    engine.aster = _EquityClient()
+    engine.mexc = _EquityClient(aster=False)
+    engine._last_equity = float("-inf")
+    await engine._sample_equity()
+    assert len(database.equity_history(engine.conn)) == 1
+    await engine._sample_equity()          # within the interval
+    assert len(database.equity_history(engine.conn)) == 1
+
+
+async def test_equity_sampler_does_not_store_a_partial_snapshot(engine):
+    """A venue that failed contributes 0. Storing that would put a fake crash
+    in the history that no later reading can undo."""
+    from exchange_client import ExchangeError
+
+    class _Broken:
+        async def balances(self):
+            raise ExchangeError("aster", "down")
+
+        async def account(self):
+            return {"balances": []}
+
+    engine.paper = False
+    engine.aster = _Broken()
+    engine.mexc = _Broken()
+    engine._last_equity = float("-inf")
+    await engine._sample_equity()
+    assert database.equity_history(engine.conn) == []

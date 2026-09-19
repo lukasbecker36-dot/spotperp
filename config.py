@@ -135,6 +135,10 @@ SCREEN_MAX_SPREAD_COST_BPS = float(
 FUNDING_SCORE_HOLD_HOURS = float(
     os.environ.get("FUNDING_SCORE_HOLD_HOURS", "24")
 )
+# How often total account value is sampled into equity_snapshots. The daily
+# table reads the LAST sample of each UTC day, so this also sets how close the
+# daily mark lands to midnight.
+EQUITY_SNAPSHOT_MINUTES = float(os.environ.get("EQUITY_SNAPSHOT_MINUTES", "30"))
 # Aster's own index (built from real spot venues) vs the MEXC mid. They should
 # agree to within a spread; 5% apart means the two symbols are not the same
 # asset or the contract multiplier is wrong, and the "basis" is arithmetic on

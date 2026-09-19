@@ -20,6 +20,7 @@ py-modules = [
     "config", "auth", "exchange_client", "screener", "executor",
     "position_manager", "database", "intents", "recovery",
     "live_monitor", "control_bot", "notify", "funding", "book", "recon",
+    "equity", "advisor",
 ]
 
 [tool.pytest.ini_options]

@@ -15,6 +15,7 @@ import aiohttp
 
 import config
 import database
+import equity
 import funding
 import intents
 import position_manager as pm
@@ -55,6 +56,10 @@ class Engine:
         self.conn = database.init_db()
         self.md = MarketData()
         self._last_basis_log = 0.0
+        # -inf so the first slow scan samples immediately: time.monotonic() is
+        # small early in a process's life, so a 0.0 sentinel would suppress the
+        # first sample for a whole interval after every restart.
+        self._last_equity = float("-inf")
         self.notifier = Notifier(session)
         self.positions = pm.PositionManager(self.conn)
 
@@ -294,6 +299,10 @@ class Engine:
             await self._refresh_position_risk()
         except Exception:
             log.exception("slow scan: position risk refresh failed")
+        try:
+            await self._sample_equity()
+        except Exception:
+            log.exception("slow scan: equity snapshot failed")
         for label, fn in (
             ("screener snapshot", self._write_screener_snapshot),
             ("funding snapshot", self._write_funding_snapshot),
@@ -303,6 +312,29 @@ class Engine:
                 fn()
             except Exception:
                 log.exception("slow scan: %s write failed", label)
+
+    async def _sample_equity(self) -> None:
+        """Record total account value on its own cadence inside the slow scan.
+
+        Live only: paper has no venue balances, and a zero row would poison the
+        history with a cliff the day the mode was switched.
+        """
+        if self.paper:
+            return
+        now = time.monotonic()
+        if now - self._last_equity < config.EQUITY_SNAPSHOT_MINUTES * 60:
+            return
+        self._last_equity = now
+        eq = await equity.snapshot(self.aster, self.mexc, self.md.mexc_books)
+        if eq.errors:
+            # A venue that failed contributes 0, which would read as a crash in
+            # account value. Skip the sample rather than record a lie.
+            log.warning("equity snapshot incomplete, not stored: %s", eq.errors)
+            return
+        database.record_equity(
+            self.conn, int(time.time() * 1000), eq.aster_usd,
+            eq.spot_coins_usd, eq.spot_usdt_usd, eq.total_usd,
+        )
 
     async def _refresh_books(self) -> None:
         aster_books, mexc_books = await asyncio.gather(
@@ -1217,6 +1249,8 @@ class Engine:
                 return await self._cmd_balance()
             if command == "refresh":
                 return await self._cmd_refresh()
+            if command == "equity":
+                return await self._cmd_equity(args)
             if command == "recompute":
                 return await self._cmd_recompute(args)
             if command == "truefill":
@@ -1669,6 +1703,88 @@ class Engine:
             + (f" {stops_seen} stop order(s) hidden." if stops_seen else "")
         )
         return "\n".join(out)
+
+    async def _cmd_equity(self, args: dict) -> str:
+        """Total account value now, the daily change table, and a chart."""
+        if self.paper:
+            return "equity needs LIVE mode — paper has no venue balances"
+        days = int(args.get("days") or 14)
+        eq = await equity.snapshot(self.aster, self.mexc, self.md.mexc_books)
+        lines = ["account value"]
+        lines.append(
+            f"  Aster perp  {float(eq.aster_usd):>12,.2f}"
+            f"   (margin {float(eq.aster_margin_usd):,.2f},"
+            f" upnl {float(eq.aster_upnl_usd):+,.2f})"
+        )
+        lines.append(f"  MEXC coins  {float(eq.spot_coins_usd):>12,.2f}")
+        lines.append(f"  MEXC USDT   {float(eq.spot_usdt_usd):>12,.2f}")
+        lines.append(f"  TOTAL       {float(eq.total_usd):>12,.2f}")
+        if eq.coins:
+            top = "  ".join(
+                f"{a} {float(v):,.0f}" for a, _q, v in eq.coins[:6]
+            )
+            lines.append(f"  holdings: {top}")
+        if eq.unpriced:
+            lines.append(
+                "  not priced (no MEXC USDT book): "
+                + ", ".join(sorted(set(eq.unpriced))[:10])
+            )
+        for e in eq.errors:
+            lines.append(f"  ⚠️ {e}")
+
+        # Store this reading too, so asking always extends the history.
+        if not eq.errors:
+            database.record_equity(
+                self.conn, int(time.time() * 1000), eq.aster_usd,
+                eq.spot_coins_usd, eq.spot_usdt_usd, eq.total_usd,
+            )
+        since = int(time.time() * 1000) - days * 86_400_000
+        series = equity.daily_series(database.equity_history(self.conn, since))
+        if len(series) < 2:
+            lines.append("")
+            lines.append(
+                f"no daily history yet — sampled every"
+                f" {config.EQUITY_SNAPSHOT_MINUTES:.0f}min, so the table fills"
+                " in from tomorrow."
+            )
+            return "\n".join(lines)
+
+        lines.append("")
+        hdr = f"{'date':<11}{'value':>12}{'change':>11}{'%':>8}"
+        lines.append(hdr)
+        lines.append("-" * len(hdr))
+        prev = None
+        for day, value in series[-days:]:
+            if prev is None:
+                chg, pct = "-", "-"
+            else:
+                d = value - prev
+                chg = f"{float(d):+,.2f}"
+                pct = f"{float(d / prev * 100):+.2f}" if prev else "-"
+            lines.append(
+                f"{day:<11}{float(value):>12,.2f}{chg:>11}{pct:>8}"
+            )
+            prev = value
+        first, last = series[0][1], series[-1][1]
+        move = last - first
+        lines.append("-" * len(hdr))
+        lines.append(
+            f"{len(series)}d change {float(move):+,.2f}"
+            + (f" ({float(move / first * 100):+.2f}%)" if first else "")
+        )
+
+        chart = equity.sparkline([float(v) for _d, v in series[-days:]])
+        if chart:
+            lines.append("")
+            lines += chart
+        lines.append("")
+        lines.append(
+            "This is venue truth, so it includes funding on open positions,"
+            " coins held outside the strategy and idle margin — everything"
+            " /pnl cannot see. But a change in account value is P&L only if no"
+            " money moved in or out: a deposit looks exactly like a profit."
+        )
+        return "\n".join(lines)
 
     async def _cmd_recompute(self, args: dict) -> str:
         """Re-derive a position's legs from its fills.

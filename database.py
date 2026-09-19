@@ -102,6 +102,18 @@ CREATE TABLE IF NOT EXISTS stop_orders (
     updated_ms INTEGER NOT NULL
 );
 
+-- Total account value across both venues, sampled periodically. Realised
+-- trade P&L cannot see funding on an open position, a coin held outside the
+-- strategy or idle margin; account value can, so its change over time is the
+-- only complete measure. (Only if no money moved in or out — see equity.py.)
+CREATE TABLE IF NOT EXISTS equity_snapshots (
+    ts_ms INTEGER PRIMARY KEY,
+    aster_usd TEXT NOT NULL,
+    spot_coins_usd TEXT NOT NULL,
+    spot_usdt_usd TEXT NOT NULL,
+    total_usd TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_positions_state ON positions(state);
 CREATE INDEX IF NOT EXISTS idx_fills_position ON fills(position_id);
 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
@@ -246,3 +258,21 @@ def load_stop_orders(conn) -> dict[int, dict]:
 def clear_stop_orders(conn, position_id: int) -> None:
     conn.execute("DELETE FROM stop_orders WHERE position_id=?", (position_id,))
     conn.commit()
+
+
+def record_equity(conn, ts_ms: int, aster, spot_coins, spot_usdt, total) -> None:
+    """Store one account-value sample. Keyed on the timestamp, so a retry at
+    the same instant replaces rather than duplicates."""
+    conn.execute(
+        "INSERT OR REPLACE INTO equity_snapshots (ts_ms, aster_usd,"
+        " spot_coins_usd, spot_usdt_usd, total_usd) VALUES (?,?,?,?,?)",
+        (int(ts_ms), str(aster), str(spot_coins), str(spot_usdt), str(total)),
+    )
+    conn.commit()
+
+
+def equity_history(conn, since_ms: int = 0) -> list:
+    return list(conn.execute(
+        "SELECT * FROM equity_snapshots WHERE ts_ms >= ? ORDER BY ts_ms",
+        (int(since_ms),),
+    ))
