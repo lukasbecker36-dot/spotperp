@@ -37,6 +37,7 @@ import argparse
 import array
 import bisect
 import csv
+import glob
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -167,26 +168,41 @@ def features_at(s: Series, hourly: Hourly, i: int, floor: float) -> dict | None:
     }
 
 
-def outcomes(s: Series, i: int, feat: dict, horizon_h: int, floor: float) -> dict:
-    """What actually happened in the `horizon_h` hours after sample i."""
-    end_ts = s.ts[i] + horizon_h * HOUR_MS
-    j = bisect.bisect_right(s.ts, end_ts)
-    if j <= i + 1:
+def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float) -> dict:
+    """What actually happened after sample i, for EVERY horizon at once.
+
+    One forward walk to the longest horizon, snapshotting as it crosses each
+    shorter one. Scanning per horizon instead costs the sum of them — 264h of
+    samples per row for the 24/72/168 default — and over 100 days of logs and
+    400 symbols that is the difference between minutes and hours.
+    """
+    longest = max(horizons)
+    end_ts = s.ts[i] + longest * HOUR_MS
+    j_end = bisect.bisect_right(s.ts, end_ts)
+    if j_end <= i + 1:
         return {}
     entry_at = feat["entry_bps"]
     target_close = feat["lo24_close"]
-    min_close = min_close_ts = None
-    max_close = None
+    bounds = sorted(horizons)
+    b = 0                               # next horizon boundary to snapshot at
+    snaps: dict[int, tuple] = {}
+    min_close = max_close = None
+    funding_at_min = 0.0
     hit_zero_ts = hit_target_ts = hit_profit_ts = None
     dwell_after = 0.0
     accrued = 0.0
-    for k in range(i + 1, j):
+    ts0 = s.ts[i]
+    for k in range(i + 1, j_end):
+        # Snapshot every boundary this sample has passed, before folding it in.
+        while b < len(bounds) and s.ts[k] > ts0 + bounds[b] * HOUR_MS:
+            snaps[bounds[b]] = (min_close, max_close, s.close[k - 1],
+                                accrued, funding_at_min, dwell_after)
+            b += 1
         c = s.close[k]
-        accrued += s.funding[k - 1] / 8.0 * min(
-            (s.ts[k] - s.ts[k - 1]) / HOUR_MS, FUNDING_STEP_CAP_HOURS
-        )
+        dt_h = min((s.ts[k] - s.ts[k - 1]) / HOUR_MS, FUNDING_STEP_CAP_HOURS)
+        accrued += s.funding[k - 1] / 8.0 * dt_h
         if min_close is None or c < min_close:
-            min_close, min_close_ts = c, s.ts[k]
+            min_close, funding_at_min = c, accrued
         if max_close is None or c > max_close:
             max_close = c
         if hit_zero_ts is None and c <= 0:
@@ -202,35 +218,43 @@ def outcomes(s: Series, i: int, feat: dict, horizon_h: int, floor: float) -> dic
         # Time the ENTRY basis stayed workable, as a fill-chance proxy: the log
         # says where the price was, never whether a resting order was lifted.
         if s.entry[k] >= entry_at - 5.0:
-            dwell_after += min(
-                (s.ts[k] - s.ts[k - 1]) / HOUR_MS, FUNDING_STEP_CAP_HOURS
-            )
-    best_j = bisect.bisect_left(s.ts, min_close_ts) if min_close_ts else i
-    funding_to_best = _accrue_funding(s, i, best_j)
-    funding_full = _accrue_funding(s, i, j - 1)
-    def _hours(t):
-        return round((t - s.ts[i]) / HOUR_MS, 2) if t else ""
-    return {
-        f"h{horizon_h}_min_close": round(min_close, 2),
-        f"h{horizon_h}_max_close": round(max_close, 2),
-        f"h{horizon_h}_end_close": round(s.close[j - 1], 2),
-        f"h{horizon_h}_hours_to_zero": _hours(hit_zero_ts),
-        f"h{horizon_h}_hours_to_lo24": _hours(hit_target_ts),
-        f"h{horizon_h}_reached_lo24": int(hit_target_ts is not None),
-        f"h{horizon_h}_hours_to_profit": _hours(hit_profit_ts),
-        f"h{horizon_h}_reached_profit": int(hit_profit_ts is not None),
-        f"h{horizon_h}_funding_bps": round(funding_full, 2),
-        # What the round trip was worth if you had exited at the best moment
-        # the horizon offered — an upper bound, since nobody times that.
-        f"h{horizon_h}_best_pnl_bps": round(
-            entry_at - min_close + funding_to_best - floor, 2
-        ),
-        # ...and what simply holding the whole horizon would have paid.
-        f"h{horizon_h}_hold_pnl_bps": round(
-            entry_at - s.close[j - 1] + funding_full - floor, 2
-        ),
-        f"h{horizon_h}_dwell_after_h": round(dwell_after, 2),
-    }
+            dwell_after += dt_h
+    while b < len(bounds):              # horizons the data ran out inside
+        snaps[bounds[b]] = (min_close, max_close, s.close[j_end - 1],
+                            accrued, funding_at_min, dwell_after)
+        b += 1
+
+    def _hours(t, limit_h):
+        """Crossing times are monotonic, so one first-crossing serves every
+        horizon — it just doesn't count for the ones that ended before it."""
+        if not t or (t - ts0) / HOUR_MS > limit_h:
+            return ""
+        return round((t - ts0) / HOUR_MS, 2)
+
+    out: dict = {}
+    for h in horizons:
+        mn, mx, end_close, fund, fund_at_min, dwell = snaps[h]
+        if mn is None:
+            continue
+        to_lo24, to_profit = _hours(hit_target_ts, h), _hours(hit_profit_ts, h)
+        out.update({
+            f"h{h}_min_close": round(mn, 2),
+            f"h{h}_max_close": round(mx, 2),
+            f"h{h}_end_close": round(end_close, 2),
+            f"h{h}_hours_to_zero": _hours(hit_zero_ts, h),
+            f"h{h}_hours_to_lo24": to_lo24,
+            f"h{h}_reached_lo24": int(to_lo24 != ""),
+            f"h{h}_hours_to_profit": to_profit,
+            f"h{h}_reached_profit": int(to_profit != ""),
+            f"h{h}_funding_bps": round(fund, 2),
+            # What the round trip was worth if you had exited at the best
+            # moment the horizon offered — an upper bound, nobody times that.
+            f"h{h}_best_pnl_bps": round(entry_at - mn + fund_at_min - floor, 2),
+            # ...and what simply holding the whole horizon would have paid.
+            f"h{h}_hold_pnl_bps": round(entry_at - end_close + fund - floor, 2),
+            f"h{h}_dwell_after_h": round(dwell, 2),
+        })
+    return out
 
 
 def log_span_hours(series: dict[str, Series]) -> float:
@@ -244,6 +268,7 @@ def build(
     floor: float, min_depth: float, min_entry: float,
 ) -> list[dict]:
     rows: list[dict] = []
+    done = 0
     stride_ms = int(stride_h * HOUR_MS)
     longest = max(horizons)
     for symbol, s in sorted(series.items()):
@@ -266,17 +291,22 @@ def build(
             if feat is None:
                 continue
             last_emit = s.ts[i]
-            row = {"symbol": symbol, **feat}
-            for h in horizons:
-                row.update(outcomes(s, i, feat, h, floor))
-            rows.append(row)
+            out = outcomes(s, i, feat, horizons, floor)
+            if out:
+                rows.append({"symbol": symbol, **feat, **out})
+        done += 1
+        if done % 25 == 0:
+            print(f"  {done}/{len(series)} symbols, {len(rows):,} rows",
+                  file=sys.stderr, flush=True)
     return rows
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("logs", nargs="+", help="output/basis_log_*.csv[.gz]")
+    ap.add_argument("logs", nargs="+",
+                    help="output/basis_log_*.csv[.gz]; globs are expanded here"
+                         " too, so a quoted pattern works")
     ap.add_argument("-o", "--out", default="output/dataset.csv")
     ap.add_argument("--stride-hours", type=float, default=1.0,
                     help="how often to emit a candidate row per symbol (default 1)")
@@ -293,9 +323,23 @@ def main() -> None:
     ap.add_argument("--symbols", default="", help="comma-separated filter")
     args = ap.parse_args()
 
+    # Expand globs ourselves as well as letting the shell do it: quoting the
+    # pattern is a natural instinct, and an unexpanded one otherwise reaches
+    # open() as a literal filename and fails with a confusing ENOENT.
+    paths: list[str] = []
+    for pattern in args.logs:
+        hits = sorted(glob.glob(pattern))
+        if hits:
+            paths.extend(hits)
+        elif Path(pattern).exists():
+            paths.append(pattern)
+        else:
+            print(f"no files match {pattern!r}", file=sys.stderr)
+    if not paths:
+        return
     horizons = [int(h) for h in args.horizons.split(",") if h.strip()]
     filt = {s.strip().upper() for s in args.symbols.split(",") if s.strip()} or None
-    series = load_logs(args.logs, filt, every=args.every)
+    series = load_logs(paths, filt, every=args.every)
     span = log_span_hours(series)
     print(f"loaded {len(series)} symbols spanning {span:.1f}h", file=sys.stderr)
     rows = build(
