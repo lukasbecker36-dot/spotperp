@@ -150,6 +150,10 @@ def main() -> None:
                     help="minutes of quotes before the fill to average (default 5)")
     ap.add_argument("--min-notional", type=float, default=0.0,
                     help="ignore clips smaller than this (dust distorts medians)")
+    ap.add_argument("--by", default="jit_bps",
+                    help="column to bucket by (default jit_bps). notional_usd"
+                         " separates a constant spread-crossing cost from one"
+                         " that grows as a clip walks the book")
     ap.add_argument("--paper", action="store_true", help="score paper fills instead")
     args = ap.parse_args()
 
@@ -215,15 +219,21 @@ def main() -> None:
     print(f"  median slippage {pctile(slip, 50):+8.1f} bps"
           f"   (p25 {pctile(slip, 25):+.1f}, p75 {pctile(slip, 75):+.1f})")
 
-    edges = [round(pctile([r["jit_bps"] for r in scored], p), 2)
+    by = args.by
+    if scored and by not in scored[0]:
+        print(f"no column {by!r}; try one of: "
+              + ", ".join(k for k in scored[0] if k != "symbol"), file=sys.stderr)
+        return
+    edges = [round(pctile(sorted(r[by] for r in scored), p), 2)
              for p in (25, 50, 75)]
-    hdr = (f"\n{'jit at rest':<14}{'clips':>7}{'med quoted':>12}"
-           f"{'med locked':>12}{'med slip':>10}{'slip/jit':>10}")
+    ratio_hdr = "slip/jit" if by == "jit_bps" else "med " + by
+    hdr = (f"\n{by:<14}{'clips':>7}{'med quoted':>12}"
+           f"{'med locked':>12}{'med slip':>10}{ratio_hdr:>10}")
     print(hdr)
     print("-" * (len(hdr) - 1))
     groups: dict[str, list] = {}
     for r in scored:
-        j = r["jit_bps"]
+        j = r[by]
         name = (f"<{edges[0]:g}" if j < edges[0] else
                 f">={edges[-1]:g}" if j >= edges[-1] else
                 next(f"{edges[i-1]:g}..{edges[i]:g}"
@@ -236,26 +246,31 @@ def main() -> None:
         g = groups.get(name, [])
         if not g:
             continue
-        med_j = pctile(sorted(r["jit_bps"] for r in g), 50)
+        med_j = pctile(sorted(r[by] for r in g), 50)
         med_s = pctile(sorted(r["slippage_bps"] for r in g), 50)
+        # Against jitter the useful number is the implied haircut; against
+        # anything else it is just the bucket's own median.
+        tail = (med_s / med_j if med_j else 0.0) if by == "jit_bps" else med_j
         print(
             f"{name:<14}{len(g):>7}"
             f"{pctile(sorted(r['quoted_bps'] for r in g), 50):>12.1f}"
             f"{pctile(sorted(r['locked_bps'] for r in g), 50):>12.1f}"
-            f"{med_s:>10.1f}{(med_s / med_j if med_j else 0):>10.2f}"
+            f"{med_s:>10.1f}{tail:>10.2f}"
         )
     print("-" * (len(hdr) - 1))
     print(
         "slippage = quoted - locked, so POSITIVE means the board promised more"
-        " than the clip got. slip/jit is the haircut the data implies:"
-        " fill_score currently subtracts 1.00 x jitter."
+        " than the clip got."
     )
-    print(
-        "If slip/jit is flat near zero the haircut is demoting rows for"
-        " nothing. If it is flat near one the haircut is about right. If it"
-        " rises with jitter, the shape is right and the size is the number in"
-        " the last column."
-    )
+    if by == "jit_bps":
+        print(
+            "slip/jit is the haircut the data implies against the 1.00x"
+            " fill_score applies. Flat near zero and the haircut demotes rows"
+            " for nothing; flat near one and it is about right; rising and the"
+            " shape is right with the size in the last column. A FALLING ratio"
+            " with flat slippage means the cost is a constant, not a multiple"
+            " of jitter — read the med slip column, not this one."
+        )
 
 
 if __name__ == "__main__":
