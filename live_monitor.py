@@ -151,6 +151,18 @@ class Engine:
             log.info("seeded 24h basis window with %d samples", seeded)
         except Exception:
             log.exception("24h basis seed failed (continuing without history)")
+        # Stops outlive the process: without their ids the hedge guard cannot
+        # tell our own stop firing from an ADL, and dumps spot at market while
+        # the sell LIMIT rests at the stop price (position 191).
+        stops = database.load_stop_orders(self.conn)
+        for pid, row in stops.items():
+            self._stops_orders[pid] = {
+                "aster_id": row["aster_id"], "mexc_id": row["mexc_id"],
+            }
+            self._stops_qty[pid] = Decimal(row["perp_qty"] or "0")
+        if stops:
+            log.info("recovered /stops orders for %d position(s)", len(stops))
+
         await recovery.reconcile(
             self.conn, self.positions, self.aster, self.mexc, self.notifier,
             paper=self.paper,
@@ -743,7 +755,22 @@ class Engine:
         # Was this OUR OWN /stops STOP_MARKET firing rather than an ADL? If the
         # stop order executed, reconcile the perp at its REAL fill price and
         # treat the resting MEXC sell LIMIT as the preferred spot exit.
-        stop_ids = self._stops_orders.get(pos.id) or {}
+        stop_ids = dict(self._stops_orders.get(pos.id) or {})
+        if not stop_ids.get("mexc_id"):
+            # Last-ditch recovery: the spot twin of a stop is a resting sell
+            # LIMIT, so it is still OPEN and findable by its client-id prefix
+            # even when we have lost the id. Worth the extra call — without it
+            # this path cancels a good limit at the stop price and dumps the
+            # spot at market instead.
+            try:
+                for o in await self.mexc.open_orders(pair.mexc_symbol):
+                    if o.client_order_id.startswith(f"sp_stop_{pos.id}_"):
+                        stop_ids["mexc_id"] = o.order_id
+                        journal(self.conn, f"position {pos.id}: recovered spot"
+                                f" stop-limit {o.order_id} by client id")
+                        break
+            except ExchangeError:
+                log.exception("spot stop recovery failed for position %s", pos.id)
         stop_order = None
         if stop_ids.get("aster_id"):
             try:
@@ -804,6 +831,7 @@ class Engine:
         )
         self._stops_qty.pop(pos.id, None)
         self._stops_orders.pop(pos.id, None)
+        database.clear_stop_orders(self.conn, pos.id)
 
         mexc_info = self.md.mexc_info.get(pair.mexc_symbol)
         fresh = self.positions.get(pos.id)
@@ -821,10 +849,12 @@ class Engine:
             await self.executor._complete_exit(pos.id, floor)
             return True
 
-        if (
-            stop_order is not None
-            and mexc_order is not None and mexc_order.is_open
-        ):
+        # The spot decision turns ONLY on whether a sell LIMIT is resting at
+        # the stop price — not on whether we managed to identify the Aster
+        # stop, which affects the P&L booking above and nothing else. An ADL
+        # that happens to leave our limit resting is served just as well by
+        # trying it for the grace window before dumping at market.
+        if mexc_order is not None and mexc_order.is_open:
             # Our stop fired and its spot twin is still resting AT THE CHOSEN
             # STOP PRICE. Don't cancel it and market-dump — give it a grace
             # window to fill at that price (MEXC often lags Aster's mark by
@@ -836,10 +866,14 @@ class Engine:
                 "floor": floor,
             }
             self.positions.set_state(pos.id, pm.EXITING)
+            how = (
+                f"liq-protection STOP FIRED on Aster (perp closed @"
+                f" ~{stop_order.avg_price})" if stop_order is not None
+                else f"perp leg reduced on Aster by {deficit}"
+            )
             await self.notifier.alert(
-                f"🛑 position {pos.id} {pos.symbol}: liq-protection STOP FIRED"
-                f" on Aster (perp closed @ ~{stop_order.avg_price}). The MEXC"
-                f" sell LIMIT is still resting at the stop price — giving it"
+                f"🛑 position {pos.id} {pos.symbol}: {how}. The MEXC sell LIMIT"
+                f" is still resting at the stop price — giving it"
                 f" {config.STOP_SPOT_GRACE_SECONDS:.0f}s to fill there before"
                 f" falling back to tranche market sells."
             )
@@ -1299,6 +1333,7 @@ class Engine:
         STOP doesn't fire mid-close. No-op in paper / when no pair."""
         self._stops_qty.pop(pos.id, None)   # no longer managing stops for it
         self._stops_orders.pop(pos.id, None)
+        database.clear_stop_orders(self.conn, pos.id)
         self._stop_grace.pop(pos.id, None)
         if self.paper:
             return 0
@@ -1408,6 +1443,7 @@ class Engine:
         self._liq_alerted.pop(pos.id, None)
         self._stops_qty.pop(pos.id, None)
         self._stops_orders.pop(pos.id, None)
+        database.clear_stop_orders(self.conn, pos.id)
         self._stop_grace.pop(pos.id, None)
         cancelled = 0
         pair = self.md.pair_maps.get(pos.symbol)
@@ -1709,6 +1745,7 @@ class Engine:
         # the position is later resized (a size-up otherwise leaves the added
         # portion unprotected until the operator remembers to re-run /stops).
         self._stops_qty[pos.id] = perp_qty
+        database.save_stop_orders(self.conn, pos.id, aster_id, mexc_id, perp_qty)
         # ...and the venue order ids, so the hedge guard can tell OUR OWN stop
         # firing apart from an ADL and read the real fill prices. In-memory:
         # after a restart the guard degrades to the mark-price ADL path.

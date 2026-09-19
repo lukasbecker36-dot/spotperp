@@ -84,6 +84,20 @@ CREATE TABLE IF NOT EXISTS journal (
     message TEXT NOT NULL
 );
 
+-- Liquidation-protection orders placed by /stops, keyed by position. Held in
+-- the DB rather than only in memory: the engine restarts on every /update, and
+-- without these ids the hedge guard cannot tell its OWN stop firing from an
+-- ADL. It then books the perp close at mark instead of the stop's real fill
+-- price, and market-dumps the spot in tranches while the matching sell LIMIT
+-- was resting at the stop price, ready to fill.
+CREATE TABLE IF NOT EXISTS stop_orders (
+    position_id INTEGER PRIMARY KEY,
+    aster_id TEXT,
+    mexc_id TEXT,
+    perp_qty TEXT NOT NULL DEFAULT '0',
+    updated_ms INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_positions_state ON positions(state);
 CREATE INDEX IF NOT EXISTS idx_fills_position ON fills(position_id);
 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
@@ -195,3 +209,35 @@ def abandon_running_commands(conn: sqlite3.Connection) -> int:
     )
     conn.commit()
     return cur.rowcount
+
+
+def save_stop_orders(
+    conn, position_id: int, aster_id, mexc_id, perp_qty
+) -> None:
+    """Record the /stops order ids for a position, replacing any prior pair."""
+    conn.execute(
+        "INSERT INTO stop_orders (position_id, aster_id, mexc_id, perp_qty,"
+        " updated_ms) VALUES (?,?,?,?,?)"
+        " ON CONFLICT(position_id) DO UPDATE SET aster_id=excluded.aster_id,"
+        " mexc_id=excluded.mexc_id, perp_qty=excluded.perp_qty,"
+        " updated_ms=excluded.updated_ms",
+        (position_id, aster_id, mexc_id, str(perp_qty), int(time.time() * 1000)),
+    )
+    conn.commit()
+
+
+def load_stop_orders(conn) -> dict[int, dict]:
+    """{position_id: {aster_id, mexc_id, perp_qty}} for every tracked stop."""
+    return {
+        row["position_id"]: {
+            "aster_id": row["aster_id"],
+            "mexc_id": row["mexc_id"],
+            "perp_qty": row["perp_qty"],
+        }
+        for row in conn.execute("SELECT * FROM stop_orders")
+    }
+
+
+def clear_stop_orders(conn, position_id: int) -> None:
+    conn.execute("DELETE FROM stop_orders WHERE position_id=?", (position_id,))
+    conn.commit()

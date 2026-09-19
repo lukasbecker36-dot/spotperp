@@ -1495,3 +1495,96 @@ async def test_orders_does_not_warn_when_the_level_is_already_met(engine):
     out = await engine._cmd_orders({})
     assert "ready — the level is met right now" in out
     assert "may never fill" not in out
+
+
+class _StopOrderClient(_StopClient):
+    """_StopClient that can also answer get_order, for hedge-guard tests."""
+    def __init__(self, orders=None, open_orders=None):
+        super().__init__(open_orders=open_orders)
+        self._orders = orders or {}
+
+    async def get_order(self, symbol, order_id):
+        from exchange_client import ExchangeError
+        if order_id not in self._orders:
+            raise ExchangeError("test", "no such order")
+        return self._orders[order_id]
+
+
+def _stop_stub(oid, cid, side, status="NEW", executed="0", price="100"):
+    """A /stops order as the venue would report it. Named distinctly from the
+    _order helper above, which builds grace-window orders."""
+    from exchange_client import OrderResult
+    return OrderResult(
+        venue="v", symbol="BTCUSDT", order_id=oid, client_order_id=cid,
+        side=side, status=status, price=Decimal(price),
+        orig_qty=Decimal("9.95"), executed_qty=Decimal(executed),
+        avg_price=Decimal(price),
+    )
+
+
+async def test_stops_order_ids_survive_a_restart(engine):
+    """Position 191: /stops recorded its order ids IN MEMORY only, the engine
+    restarted on an /update, and the hedge guard then could not tell its own
+    stop firing from an ADL — booking the perp at mark and market-dumping the
+    spot while the sell LIMIT rested at the stop price."""
+    pid = await _make_live_open(engine)
+    database.save_stop_orders(engine.conn, pid, "aster-1", "mexc-1", Decimal(5))
+    # Simulate the restart: fresh in-memory state, same DB.
+    engine._stops_orders = {}
+    engine._stops_qty = {}
+    loaded = database.load_stop_orders(engine.conn)
+    assert loaded[pid]["aster_id"] == "aster-1"
+    assert loaded[pid]["mexc_id"] == "mexc-1"
+    assert Decimal(loaded[pid]["perp_qty"]) == Decimal(5)
+
+
+async def test_hedge_guard_waits_on_a_resting_spot_limit_after_a_restart(engine):
+    """With the ids recovered, a fired stop whose spot twin is still resting
+    gets the grace window instead of the tranche market sell."""
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "0")
+    fired = _stop_stub("aster-1", f"sp_stop_{pid}_1", "BUY", "FILLED", "9.95", "100")
+    resting = _stop_stub("mexc-1", f"sp_stop_{pid}_1", "SELL")
+    engine.aster = _StopOrderClient(orders={"aster-1": fired})
+    engine.mexc = _StopOrderClient(orders={"mexc-1": resting})
+    engine._stops_orders[pid] = {"aster_id": "aster-1", "mexc_id": "mexc-1"}
+    engine._hedge_break[pid] = _time.monotonic() - 999   # confirmation elapsed
+
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
+    assert pid in engine._stop_grace
+    assert any("resting at the stop price" in m for m in engine.notifier.messages)
+    assert not any("tranches" in m for m in engine.notifier.messages)
+
+
+async def test_hedge_guard_recovers_the_spot_twin_by_client_id(engine):
+    """Belt and braces for a lost DB record: the spot twin is a RESTING sell
+    LIMIT, so it is still open and findable by its sp_stop_<id>_ prefix. Without
+    this the guard cancels a good limit at the stop price and dumps at market."""
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "0")
+    resting = _stop_stub("mexc-1", f"sp_stop_{pid}_1", "SELL")
+    engine.aster = _StopOrderClient()
+    engine.mexc = _StopOrderClient(
+        orders={"mexc-1": resting}, open_orders=[resting]
+    )
+    engine._stops_orders = {}                    # ids lost entirely
+    engine._hedge_break[pid] = _time.monotonic() - 999
+
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
+    assert pid in engine._stop_grace
+    assert not any("tranches" in m for m in engine.notifier.messages)
+
+
+async def test_hedge_guard_still_tranche_sells_a_real_adl(engine):
+    """No resting spot limit = nothing better to do than tranche-sell. The
+    change above must not turn every ADL into an indefinite wait."""
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "0")
+    engine.aster = _StopOrderClient()
+    engine.mexc = _StopOrderClient()              # no open orders at all
+    engine._stops_orders = {}
+    engine._hedge_break[pid] = _time.monotonic() - 999
+
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
+    assert pid not in engine._stop_grace
+    assert any("tranches" in m for m in engine.notifier.messages)
