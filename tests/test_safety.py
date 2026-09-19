@@ -1777,3 +1777,36 @@ async def test_equity_sampler_does_not_store_a_partial_snapshot(engine):
     engine._last_equity = float("-inf")
     await engine._sample_equity()
     assert database.equity_history(engine.conn) == []
+
+
+def test_basis_log_keeps_an_existing_file_at_its_own_width(engine, tmp_path, monkeypatch):
+    """perp_trades_24h was appended to the log format later. A file started
+    before the upgrade keeps its header for the rest of the day — appending a
+    wider row under a narrower header leaves a ragged CSV."""
+    import csv as _csv
+    monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(config, "BASIS_LOG_SECONDS", 0.0)
+    day = _time.strftime("%Y%m%d", _time.gmtime())
+    old = tmp_path / f"basis_log_{day}.csv"
+    old.write_text(
+        "ts_ms,symbol,entry_bps,close_bps,funding_8h_bps,max_notional_usd\n"
+        "1,BTCUSDT,10.00,5.00,1.00,100\n"
+    )
+    row = screener.ScreenerRow(
+        symbol="BTCUSDT", entry_bps=12.0, close_bps=6.0, spread_cost_bps=6.0,
+        fees_bps=0.0, funding_8h_bps=1.0, net_edge_bps=12.0,
+        max_notional_usd=100.0, aster_ask="1", mexc_ask="1", ts_ms=2,
+    )
+    row.perp_trades_24h = 2500.0
+    engine._last_basis_log = 0.0
+    engine._log_basis_rows([row])
+    widths = {len(r) for r in _csv.reader(old.open()) if r}
+    assert widths == {6}                       # stayed narrow, no ragged rows
+
+    # A fresh day gets the full format.
+    monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path / "next")
+    engine._last_basis_log = 0.0
+    engine._log_basis_rows([row])
+    new = next((tmp_path / "next").glob("basis_log_*.csv"))
+    rows = list(_csv.reader(new.open()))
+    assert "perp_trades_24h" in rows[0] and len(rows[1]) == 7

@@ -503,28 +503,39 @@ class Engine:
         day = time.strftime("%Y%m%d", time.gmtime(now))
         path = config.OUTPUT_DIR / f"basis_log_{day}.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
-        new_file = not path.exists()
+        # perp_trades_24h was appended to this format later: depth says the
+        # book is not empty, but what LIFTS a resting maker is trades, and
+        # without it a replay can rebuild every screen except the fill factor.
+        # A file started before the upgrade keeps its own header for the rest
+        # of the day — appending a wider row under a narrower header would
+        # leave a ragged CSV. Readers index by header name, so both widths
+        # load; the new column simply begins with tomorrow's file.
+        wide = True
+        if path.exists():
+            try:
+                with open(path, newline="") as f:
+                    header = next(csv.reader(f), [])
+                wide = "perp_trades_24h" in header
+            except OSError:
+                log.exception("basis log header read failed")
+                return
         try:
             with open(path, "a", newline="") as f:
                 w = csv.writer(f)
-                if new_file:
+                if not path.stat().st_size:
                     w.writerow([
                         "ts_ms", "symbol", "entry_bps", "close_bps",
-                        "funding_8h_bps", "max_notional_usd",
-                        # Flow, appended for the labelled dataset: depth says
-                        # the book is not empty, but what LIFTS a resting maker
-                        # is trades. Without it a replay can rebuild every
-                        # screen except the fill factor. Readers index by
-                        # header name, so older logs without it still load.
-                        "perp_trades_24h",
+                        "funding_8h_bps", "max_notional_usd", "perp_trades_24h",
                     ])
                 for r in rows:
-                    w.writerow([
+                    row = [
                         r.ts_ms, r.symbol, f"{r.entry_bps:.2f}",
                         f"{r.close_bps:.2f}", f"{r.funding_8h_bps:.2f}",
                         f"{r.max_notional_usd:.0f}",
-                        f"{r.perp_trades_24h:.0f}",
-                    ])
+                    ]
+                    if wide:
+                        row.append(f"{r.perp_trades_24h:.0f}")
+                    w.writerow(row)
         except OSError:
             log.exception("basis log write failed")
 
