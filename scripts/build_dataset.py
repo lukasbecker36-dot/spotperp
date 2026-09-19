@@ -233,6 +233,12 @@ def outcomes(s: Series, i: int, feat: dict, horizon_h: int, floor: float) -> dic
     }
 
 
+def log_span_hours(series: dict[str, Series]) -> float:
+    """Hours between the first and last sample anywhere in the logs."""
+    spans = [(s.ts[-1] - s.ts[0]) / HOUR_MS for s in series.values() if len(s) > 1]
+    return max(spans) if spans else 0.0
+
+
 def build(
     series: dict[str, Series], *, stride_h: float, horizons: list[int],
     floor: float, min_depth: float, min_entry: float,
@@ -290,14 +296,42 @@ def main() -> None:
     horizons = [int(h) for h in args.horizons.split(",") if h.strip()]
     filt = {s.strip().upper() for s in args.symbols.split(",") if s.strip()} or None
     series = load_logs(args.logs, filt, every=args.every)
-    print(f"loaded {len(series)} symbols", file=sys.stderr)
+    span = log_span_hours(series)
+    print(f"loaded {len(series)} symbols spanning {span:.1f}h", file=sys.stderr)
     rows = build(
         series, stride_h=args.stride_hours, horizons=horizons,
         floor=args.floor, min_depth=args.min_depth, min_entry=args.min_entry,
     )
     if not rows:
-        print("no rows: not enough history behind the longest horizon?",
-              file=sys.stderr)
+        # Say WHICH constraint bit. "No rows" with a 168h horizon over a 5h log
+        # is a glob that missed the gzipped days, not a broken build.
+        longest = max(horizons)
+        # A row needs 24h of history in front of it and the longest horizon
+        # behind it, so the log has to span more than the two combined.
+        need = longest + 24
+        msg = ["no rows written."]
+        if span < need:
+            msg.append(
+                f"The logs span {span:.1f}h but a {longest}h horizon needs"
+                f" {need:.0f}h (24h of history before each row, then the"
+                f" horizon after it)."
+            )
+            msg.append(
+                "If older days are gzipped the glob missed them — basis_log_*"
+                ".csv does not match .csv.gz. Try output/basis_log_*.csv* ."
+            )
+            fits = [h for h in (6, 12, 24, 48, 72) if h + 24 < span]
+            if fits:
+                msg.append(
+                    f"With this much data, try --horizons {','.join(map(str, fits))}."
+                )
+        else:
+            msg.append(
+                "There is enough history, so a filter excluded everything:"
+                f" --min-depth {args.min_depth:g}, --min-entry"
+                f" {args.min_entry:g}, or --symbols."
+            )
+        print(" ".join(msg), file=sys.stderr)
         return
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
