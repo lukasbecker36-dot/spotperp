@@ -41,7 +41,11 @@ def test_format_book_shows_funding_when_provided():
                "interval_hours": 8, "next_funding_h": 2.4}
     out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC, funding=funding)
     assert "funding" in out
-    assert "now +12.3" in out and "24h avg +8.5" in out
+    # Stored 8h-equivalent, shown per HOUR: 12.3/8 and 8.5/8. The 8h figure is
+    # the only way to compare contracts that settle on different intervals, but
+    # a per-hour rate is what weighs against a holding period.
+    assert "per hour" in out
+    assert "now +1.54" in out and "24h avg +1.06" in out
     assert "next in 2.4h" in out
     assert "short receives" in out
 

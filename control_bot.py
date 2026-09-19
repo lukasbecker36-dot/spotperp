@@ -40,7 +40,7 @@ HELP = """Commands:
 /screen diff [n] — pairs furthest ABOVE their own 24h avg basis (reversion candidates)
 /screen swing [n] — pairs that go wide then return to closeable (round-trip candidates)
 /screen fill [n] — pairs with real perp volume + a persistently workable basis (you can actually get filled)
-/funding [n] — top funding carry (24h avg, 8h-equiv)
+/funding [n] — top funding carry (bps per hour)
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
 /positions — active positions detail (bot DB)
@@ -105,6 +105,14 @@ BOT_COMMANDS = [
     {"command": "update", "description": "Git pull + restart (deploy latest code)"},
 ]
 
+
+
+def _hourly(bps_8h: float | None) -> float:
+    """Funding is computed and stored 8h-equivalent (contracts settle on
+    different intervals, so an 8h normalisation is the only way to add them
+    up). Displaying it that way makes rates hard to compare against a holding
+    period measured in hours, so every board shows bps PER HOUR."""
+    return (bps_8h or 0.0) / 8.0
 
 
 def _pad(text: str, width: int) -> str:
@@ -362,12 +370,13 @@ class ControlBot:
             lines.append(
                 f"{sym:<14}{entry_avg:>6.1f}{d24_s}{net_avg:>6.1f}"
                 f"{r['net_edge_bps']:>6.1f}"
-                f"{r['funding_8h_bps']:>6.2f}{r['max_notional_usd']:>8,.0f}"
+                f"{_hourly(r['funding_8h_bps']):>6.2f}"
+                f"{r['max_notional_usd']:>8,.0f}"
             )
         lines.append(sep)
         lines.append(
             f"bps: entry/net = {win_m:.0f}m avg (<={max_n} samples), ranked by net;"
-            " now = live net edge, fund = 8h rate"
+            " now = live net edge, fund = funding in bps per HOUR"
         )
         lines.append(
             f"24h = 24h avg entry basis (<={max_h:.0f}h history)."
@@ -454,7 +463,7 @@ class ControlBot:
             hi = r.get("basis_p90_24h", entry_avg)
             lines.append(
                 f"{r['symbol'][:12]:<13}{entry_avg:>7.1f}{lo:>7.1f}{hi:>7.1f}"
-                f"{entry_avg - lo:>+7.1f}{r['funding_8h_bps']:>6.2f}"
+                f"{entry_avg - lo:>+7.1f}{_hourly(r['funding_8h_bps']):>6.2f}"
                 f"{r['max_notional_usd']:>7,.0f}"
             )
         lines.append(sep)
@@ -502,7 +511,7 @@ class ControlBot:
                 f"${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f} and the basis workable"
                 f" for >= {config.SCREEN_FILL_MIN_HOURS:.0f}h of the last 24"
                 f" (best right now: {best_hrs:.0f}h), and funding at or above"
-            f" {config.SCREEN_FILL_MIN_FUNDING_BPS:+.0f}bps/8h."
+            f" {_hourly(config.SCREEN_FILL_MIN_FUNDING_BPS):+.2f}bps/h funding."
                 " If you just deployed, give it a slow scan — the dwell hours"
                 " build from the seeded basis history."
             )
@@ -539,7 +548,7 @@ class ControlBot:
                     if lo > config.SCREEN_FILL_FLAG_LO_BPS else f"{lo:>7.1f}")
             lines.append(
                 f"{_pad(r['symbol'], 11)}{score:>+6.1f}{entry_avg:>6.1f}{lo_s}"
-                f"{net:>+7.1f}{r.get('funding_8h_bps', 0.0):>+6.1f}"
+                f"{net:>+7.1f}{_hourly(r.get('funding_8h_bps')):>+6.2f}"
                 f"{r.get('hours_tradeable_24h', 0):>4.0f}"
                 f"{r.get('perp_trades_24h', 0) / 24.0:>6.1f}{jit_s}"
                 f"{net * r['max_notional_usd'] / 10000.0:>6.1f}"
@@ -580,10 +589,11 @@ class ControlBot:
             " is what such a name actually trades on."
         )
         lines.append(
-            "fund = 8h-equivalent funding; + means the SHORT receives, so it"
-            " pays you to wait while the round trip works. Rows below"
-            f" {config.SCREEN_FILL_MIN_FUNDING_BPS:+.0f} are dropped: a"
-            " negative rate makes the wait a cost and takes time off your side."
+            "fund = funding in bps per HOUR; + means the SHORT receives, so"
+            " it pays you to wait while the round trip works. Rows below"
+            f" {_hourly(config.SCREEN_FILL_MIN_FUNDING_BPS):+.2f} are dropped:"
+            " a negative rate makes the wait a cost and takes time off your"
+            " side."
         )
         lines.append(
             f"jit = mean bps the basis moves BETWEEN 5m samples. A smooth drift"
@@ -605,8 +615,11 @@ class ControlBot:
         if not rows:
             return "no funding data yet"
         win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
-        hdr = (f"{'symbol':<11}{'score':>6}{'iv':>3}{'24h':>5}{'fund':>5}"
-               f"{'next':>5}{'entry':>6}{'lo24':>6}{'hi24':>7}{'jit':>5}"
+        # No interval column: normalising to a per-hour rate is precisely what
+        # makes the settlement interval stop mattering for comparison. 'next'
+        # still says when the cash lands, and /book has the interval.
+        hdr = (f"{'symbol':<11}{'score':>6}{'24h':>7}{'fund':>6}"
+               f"{'next':>5}{'entry':>6}{'lo24':>7}{'hi24':>7}{'jit':>5}"
                f"{'depth$':>7}")
         sep = "-" * len(hdr)
         lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
@@ -623,7 +636,7 @@ class ControlBot:
             jv = r.get("entry_bps_jitter")
             jit = (f"{jv:>5.1f}" if jv is not None and r.get("samples", 0) >= 3
                    else f"{'-':>5}")
-            depth = f"{r['max_notional_usd']:>7,.0f}" if r.get("max_notional_usd") else f"{'-':>7}"
+            depth = f"{r['max_notional_usd']:>6,.0f}" if r.get("max_notional_usd") else f"{'-':>6}"
             nh = r.get("next_funding_h")
             nxt = f"{nh:>4.1f}h" if nh is not None and nh >= 0 else f"{'-':>5}"
             # Where the live basis sits inside the pair's own 24h range. A '?'
@@ -638,7 +651,7 @@ class ControlBot:
                     return f"{'-':>{w}}"
                 return f"{f'{v:.0f}?':>{w}}" if thin else f"{v:>{w}.1f}"
 
-            lo24 = rng(r.get("basis_p10_24h"), 6)
+            lo24 = rng(r.get("basis_p10_24h"), 7)
             hi24 = rng(r.get("basis_p90_24h"), 7)
             sc = r.get("score")
             # The score subtracts jit, but jit needs 3 samples to exist. After
@@ -651,16 +664,17 @@ class ControlBot:
             else:
                 score = f"{sc:>+6.0f}"
             lines.append(
-                f"{_pad(r['symbol'], 11)}{score}{r['interval_hours']:>2}h"
-                f"{r['avg_24h_8h_bps']:>5.1f}{r['current_8h_bps']:>5.1f}{nxt}"
+                f"{_pad(r['symbol'], 11)}{score}"
+                f"{_hourly(r['avg_24h_8h_bps']):>7.2f}"
+                f"{_hourly(r['current_8h_bps']):>7.2f}{nxt}"
                 f"{entry}{lo24}{hi24}{jit}{depth}"
             )
         lines.append(sep)
         lines.append(
             f"score = bps from entering now and holding"
             f" {config.FUNDING_SCORE_HOLD_HOURS:.0f}h:"
-            f" (entry - lo24 - jit - {floor:.0f}bps cost) + carry x"
-            f" {config.FUNDING_SCORE_HOLD_HOURS / 8.0:.0f}. The basis is a"
+            f" (entry - lo24 - jit - {floor:.0f}bps cost) + carry/h x"
+            f" {config.FUNDING_SCORE_HOLD_HOURS:.0f}. The basis is a"
             " ONE-OFF you capture once; funding is a STREAM. This is the whole"
             " board in one number — read the columns only to see WHY."
         )
@@ -673,7 +687,13 @@ class ControlBot:
             " (normal for a few minutes after a restart) — treat it as an"
             " upper bound."
         )
-        lines.append("iv=interval; 24h=avg carry/8h; fund=settled/8h; next=to settle")
+        lines.append(
+            "all funding in bps per HOUR — comparable across contracts"
+            " whatever interval they settle on, and directly against a holding"
+            " period. 24h = average over the last 24h; fund = the latest"
+            " settlement; next = hours until the next one (/book has the"
+            " settlement interval)."
+        )
         lines.append(f"entry = {win_m:.0f}m avg basis (short perp gets +funding).")
         lines.append(
             "lo24/hi24 = p10/p90 of the HOURLY mean basis over 24h — where this"

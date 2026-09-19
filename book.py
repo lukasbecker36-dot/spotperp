@@ -131,17 +131,24 @@ def format_book(
             )
 
     if funding:
+        # Funding is stored 8h-equivalent (contracts settle on different
+        # intervals, so normalising is the only way to compare them at all),
+        # but a rate per HOUR is what you can weigh against a holding period.
         cur = funding.get("current_8h_bps")
         avg = funding.get("avg_24h_8h_bps")
+        cur = None if cur is None else float(cur) / 8.0
+        avg = None if avg is None else float(avg) / 8.0
         nxt = funding.get("next_funding_h")
         iv = funding.get("interval_hours")
         lines.append("")
         parts = []
         if cur is not None:
-            parts.append(f"now {float(cur):+.1f}")
+            parts.append(f"now {cur:+.2f}")
         if avg is not None:
-            parts.append(f"24h avg {float(avg):+.1f}")
-        lines.append(f"funding (8h-equiv, bps): {'  '.join(parts) if parts else 'n/a'}")
+            parts.append(f"24h avg {avg:+.2f}")
+        lines.append(
+            f"funding (bps per hour): {'  '.join(parts) if parts else 'n/a'}"
+        )
         tail = []
         if iv:
             tail.append(f"settles every {iv}h")
