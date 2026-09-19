@@ -49,8 +49,29 @@ import config  # noqa: E402
 from backtest_divergence import Series, load_logs, pctile  # noqa: E402
 
 HOUR_MS = 3_600_000
-FIVE_MIN_MS = 300_000
 FUNDING_STEP_CAP_HOURS = 1.0
+
+_DROP_HELP = {
+    "window_samples": (
+        "The short window needs at least 3 samples. The basis log is written"
+        " once a minute and --every thins it further, so try --every 1 or a"
+        " larger --window."
+    ),
+    "window_gap": (
+        "The short window kept straddling logging gaps — the engine was down"
+        " for stretches. A larger --window-max-hours accepts wider windows."
+    ),
+    "no_24h_norm": (
+        "No candidate had 24h of history behind it. Check the logs are"
+        " contiguous rather than a few scattered days."
+    ),
+    "min_depth": "Every candidate was below --min-depth.",
+    "min_entry": "Every candidate's entry basis was below --min-entry.",
+    "no_outcome_window": (
+        "Features computed fine but no row had the longest horizon of data"
+        " behind it — use shorter --horizons."
+    ),
+}
 
 
 @dataclass
@@ -125,15 +146,33 @@ def _accrue_funding(s: Series, i: int, j: int) -> float:
     return total
 
 
-def features_at(s: Series, hourly: Hourly, i: int, floor: float) -> dict | None:
-    """What the screens would have shown at sample i, using only data <= ts[i]."""
+def features_at(
+    s: Series, hourly: Hourly, i: int, floor: float, *,
+    window: int, window_max_h: float, drops: dict,
+) -> dict | None:
+    """What the screens would have shown at sample i, using only data <= ts[i].
+
+    The short-window average and jitter are taken over the last `window`
+    SAMPLES rather than a fixed five minutes. The live screener samples every
+    15s but the basis log is written once a minute, and --every thins it
+    further, so a fixed time window silently holds too few points to measure
+    jitter at all — which is exactly how a 100-day archive produced no rows.
+    Counting samples is robust to whatever cadence the log happens to have.
+    """
     ts = s.ts[i]
-    lo_i = bisect.bisect_left(s.ts, ts - FIVE_MIN_MS)
+    lo_i = max(0, i - window + 1)
     recent_entry = s.entry[lo_i:i + 1]
     if len(recent_entry) < 3:
+        drops["window_samples"] = drops.get("window_samples", 0) + 1
         return None                     # too few samples for jitter to mean anything
+    if (ts - s.ts[lo_i]) / HOUR_MS > window_max_h:
+        # The samples exist but straddle a logging gap, so their "5 minute
+        # mean" would span hours. Better no row than a fabricated one.
+        drops["window_gap"] = drops.get("window_gap", 0) + 1
+        return None
     ent24, cls24 = hourly.window(ts)
     if len(ent24) < config.SCREEN_DIFF_MIN_HOURS:
+        drops["no_24h_norm"] = drops.get("no_24h_norm", 0) + 1
         return None                     # no usable 24h norm yet
     entry_avg = _mean(recent_entry)
     close_avg = _mean(s.close[lo_i:i + 1])
@@ -266,6 +305,7 @@ def log_span_hours(series: dict[str, Series]) -> float:
 def build(
     series: dict[str, Series], *, stride_h: float, horizons: list[int],
     floor: float, min_depth: float, min_entry: float,
+    window: int, window_max_h: float, drops: dict,
 ) -> list[dict]:
     rows: list[dict] = []
     done = 0
@@ -285,15 +325,22 @@ def build(
                 break
             if s.ts[i] - last_emit < stride_ms:
                 continue
-            if s.depth[i] < min_depth or s.entry[i] < min_entry:
+            if s.depth[i] < min_depth:
+                drops["min_depth"] = drops.get("min_depth", 0) + 1
                 continue
-            feat = features_at(s, hourly, i, floor)
+            if s.entry[i] < min_entry:
+                drops["min_entry"] = drops.get("min_entry", 0) + 1
+                continue
+            feat = features_at(s, hourly, i, floor, window=window,
+                               window_max_h=window_max_h, drops=drops)
             if feat is None:
                 continue
             last_emit = s.ts[i]
             out = outcomes(s, i, feat, horizons, floor)
             if out:
                 rows.append({"symbol": symbol, **feat, **out})
+            else:
+                drops["no_outcome_window"] = drops.get("no_outcome_window", 0) + 1
         done += 1
         if done % 25 == 0:
             print(f"  {done}/{len(series)} symbols, {len(rows):,} rows",
@@ -321,6 +368,13 @@ def main() -> None:
     ap.add_argument("--every", type=int, default=1,
                     help="downsample the log 1-in-N while loading (memory)")
     ap.add_argument("--symbols", default="", help="comma-separated filter")
+    ap.add_argument("--window", type=int, default=5,
+                    help="samples in the short-window mean/jitter (default 5)."
+                         " Counted in SAMPLES, not minutes, so it survives"
+                         " whatever cadence the log has and any --every")
+    ap.add_argument("--window-max-hours", type=float, default=1.0,
+                    help="skip a row whose window straddles a logging gap"
+                         " wider than this (default 1h)")
     args = ap.parse_args()
 
     # Expand globs ourselves as well as letting the shell do it: quoting the
@@ -342,9 +396,11 @@ def main() -> None:
     series = load_logs(paths, filt, every=args.every)
     span = log_span_hours(series)
     print(f"loaded {len(series)} symbols spanning {span:.1f}h", file=sys.stderr)
+    drops: dict[str, int] = {}
     rows = build(
         series, stride_h=args.stride_hours, horizons=horizons,
         floor=args.floor, min_depth=args.min_depth, min_entry=args.min_entry,
+        window=args.window, window_max_h=args.window_max_hours, drops=drops,
     )
     if not rows:
         # Say WHICH constraint bit. "No rows" with a 168h horizon over a 5h log
@@ -369,14 +425,21 @@ def main() -> None:
                 msg.append(
                     f"With this much data, try --horizons {','.join(map(str, fits))}."
                 )
-        else:
-            msg.append(
-                "There is enough history, so a filter excluded everything:"
-                f" --min-depth {args.min_depth:g}, --min-entry"
-                f" {args.min_entry:g}, or --symbols."
+        elif drops:
+            # Report what actually rejected the candidates rather than listing
+            # the filters and leaving you to guess which one bit.
+            why = ", ".join(
+                f"{k}={v:,}" for k, v in sorted(drops.items(), key=lambda kv: -kv[1])
             )
-        print(" ".join(msg), file=sys.stderr)
+            msg.append(f"Every candidate was dropped: {why}.")
+            top = max(drops, key=drops.get)
+            msg.append(_DROP_HELP.get(top, ""))
+        print(" ".join(m for m in msg if m), file=sys.stderr)
         return
+    if drops:
+        print("  dropped: " + ", ".join(
+            f"{k}={v:,}" for k, v in sorted(drops.items(), key=lambda kv: -kv[1])
+        ), file=sys.stderr)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="") as f:
