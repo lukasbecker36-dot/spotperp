@@ -1217,6 +1217,8 @@ class Engine:
                 return await self._cmd_balance()
             if command == "refresh":
                 return await self._cmd_refresh()
+            if command == "truefill":
+                return await self._cmd_truefill(args)
             if command == "orders":
                 return await self._cmd_orders(args)
             if command == "stops":
@@ -1665,6 +1667,108 @@ class Engine:
             + (f" {stops_seen} stop order(s) hidden." if stops_seen else "")
         )
         return "\n".join(out)
+
+    async def _cmd_truefill(self, args: dict) -> str:
+        """Replace an exit price booked at MARK with the venue's real fills.
+
+        When the hedge guard cannot identify the order behind a perp close it
+        books the close at the mark price — a guess, flagged in the alert as
+        "verify the real close price on Aster". Those rows carry order_id
+        'ADL'. This looks the window up in Aster's own trade record, replaces
+        the guessed price and commission with the executed ones, rebuilds the
+        leg averages from the fills and recomputes realised P&L.
+
+        Read-only on the venue: it moves no money, it only corrects the book.
+        """
+        if self.paper:
+            return "truefill needs LIVE mode — it reads real venue trades"
+        pos = self._resolve_position(str(args.get("position_id", "")))
+        if isinstance(pos, str):
+            return pos
+        pair = self.md.pair_maps.get(pos.symbol)
+        if pair is None:
+            return f"{pos.symbol}: not cross-listed"
+        synthetic = self.positions.synthetic_fills(pos.id)
+        if not synthetic:
+            return (f"position {pos.id} {pos.symbol}: no mark-priced fills —"
+                    " every close is already booked from a real order")
+
+        before = self.positions.get(pos.id)
+        lines = [f"position {pos.id} {pos.symbol}: {len(synthetic)} mark-priced"
+                 f" fill(s) to correct"]
+        fixed = 0
+        for f in synthetic:
+            if f["venue"] != "aster":
+                continue
+            # The guard acts only after HEDGE_BREAK_CONFIRM_SECONDS of
+            # confirmation on a ~15s poll, so the real trade predates the
+            # recorded row by up to a couple of minutes. Look back generously
+            # and forward a little; a wrong window finds nothing rather than
+            # the wrong trade.
+            start = int(f["ts_ms"]) - 30 * 60_000
+            end = int(f["ts_ms"]) + 5 * 60_000
+            try:
+                trades = await self.aster.user_trades(
+                    pair.aster_symbol, start, end
+                )
+            except ExchangeError as exc:
+                return f"{lines[0]}\nAster userTrades failed: {exc}"
+            # Closing a short is a BUY. Newest first: the stop fill is the most
+            # recent buy before the guard noticed.
+            buys = sorted(
+                (t for t in trades if str(t.get("side", "")).upper() == "BUY"),
+                key=lambda t: int(t.get("time") or 0), reverse=True,
+            )
+            want = Decimal(f["qty"])
+            took = Decimal(0)
+            cost = Decimal(0)
+            fee = Decimal(0)
+            used: list[str] = []
+            for t in buys:
+                if took >= want:
+                    break
+                q = min(_dec_or_zero(t.get("qty")), want - took)
+                if q <= 0:
+                    continue
+                took += q
+                cost += q * _dec_or_zero(t.get("price"))
+                fee += _dec_or_zero(t.get("commission"))
+                used.append(str(t.get("id") or t.get("orderId") or "?"))
+            if took <= 0:
+                lines.append(f"  fill #{f['id']}: no Aster BUY trades in the"
+                             f" window — left as booked")
+                continue
+            vwap = cost / took
+            if took < want:
+                lines.append(f"  fill #{f['id']}: only found {took} of {want}"
+                             f" — corrected the part that matched")
+            self.positions.update_fill(
+                int(f["id"]), vwap, fee, f"venue:{','.join(used[:3])}"
+            )
+            lines.append(
+                f"  fill #{f['id']}: {recon._p(Decimal(f['price']))} (mark)"
+                f" -> {recon._p(vwap)} (venue), fee {float(fee):.4f}"
+            )
+            fixed += 1
+
+        if not fixed:
+            return "\n".join(lines)
+        self.positions.recompute_from_fills(pos.id)
+        pnl = self.positions.finalize_pnl(pos.id)
+        after = self.positions.get(pos.id)
+        lines.append("")
+        lines.append(
+            f"perp exit avg {recon._p(before.perp_exit_avg or Decimal(0))}"
+            f" -> {recon._p(after.perp_exit_avg or Decimal(0))}"
+        )
+        old_pnl = before.realized_pnl_usd
+        lines.append(
+            f"realised P&L {'-' if old_pnl is None else f'${float(old_pnl):+.2f}'}"
+            f" -> ${float(pnl):+.2f}"
+        )
+        journal(self.conn, f"position {pos.id}: truefill corrected {fixed}"
+                f" mark-priced fill(s), pnl -> {pnl}")
+        return "\n".join(lines)
 
     async def _cmd_stops(self, args: dict) -> str:
         """Place liquidation-protection orders for one position: a reduce-only

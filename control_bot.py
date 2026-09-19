@@ -57,6 +57,7 @@ HELP = """Commands:
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
 /stops SYMBOL — place liq-protection stop (perp) + sell limit (spot) ~1% below liq price (auto-placed on new positions and re-armed after a size change / part-reduce; AUTO_STOPS=0 to disable)
 /remove ID|SYMBOL YES — stop tracking a position closed manually on the exchange (DB only)
+/truefill ID|SYMBOL — re-price a mark-booked exit (ADL / lost stop) from Aster's real trades and recompute P&L
 /trades [n] — last closed trades (avg venue prices, open/close basis, funding, commission, P&L; default 5)
 /pnl — realised P&L summary
 /log [n] — last journal lines
@@ -232,6 +233,15 @@ class ControlBot:
             return await advisor.review_text(self._session, self._conn)
         if command == "positions":
             return self._cmd_positions()
+        if command == "truefill":
+            if not args:
+                return ("usage: /truefill ID|SYMBOL — re-price an exit that was"
+                        " booked at mark (ADL / lost stop) from Aster's real"
+                        " trade record, then recompute P&L. Corrects the book"
+                        " only; places no orders.")
+            return await self._queue_and_wait(
+                "truefill", {"position_id": args[0]}, wait=30
+            )
         if command == "orders":
             return await self._queue_and_wait("orders", {}, wait=25)
         if command == "recon":

@@ -302,6 +302,70 @@ class PositionManager:
             rows = rows[:-1]
         return sum((Decimal(r["qty"]) for r in rows), Decimal(0))
 
+    def update_fill(
+        self, fill_id: int, price: Decimal, fee_usd: Decimal, order_id: str
+    ) -> None:
+        """Correct one recorded fill in place. Used to replace a SYNTHETIC
+        price (a close booked at mark because the real order could not be
+        looked up) with the venue's own trade record."""
+        self._conn.execute(
+            "UPDATE fills SET price=?, fee_usd=?, order_id=? WHERE id=?",
+            (str(price), str(fee_usd), order_id, fill_id),
+        )
+        self._conn.commit()
+
+    def recompute_from_fills(self, position_id: int) -> None:
+        """Rebuild qty, averages and fees for both legs from the fills table.
+
+        record_fill folds each fill in incrementally, so correcting one after
+        the fact would leave the stored averages carrying the old price. This
+        recomputes them from scratch — a plain VWAP per leg per phase, which is
+        what the incremental updates converge to."""
+        sets: dict[str, str] = {}
+        total_fees = Decimal(0)
+        for venue, avg_in, avg_out, qty_col in (
+            ("aster", "perp_entry_avg", "perp_exit_avg", "perp_qty"),
+            ("mexc", "spot_entry_avg", "spot_exit_avg", "spot_qty"),
+        ):
+            rows = self._conn.execute(
+                "SELECT phase, qty, price, fee_usd FROM fills"
+                " WHERE position_id=? AND venue=? ORDER BY id",
+                (position_id, venue),
+            ).fetchall()
+            in_qty = in_cost = out_qty = out_cost = Decimal(0)
+            for r in rows:
+                q, px = Decimal(r["qty"]), Decimal(r["price"])
+                total_fees += Decimal(r["fee_usd"] or "0")
+                if r["phase"] == "entry":
+                    in_qty += q
+                    in_cost += q * px
+                else:
+                    out_qty += q
+                    out_cost += q * px
+            if in_qty > 0:
+                sets[avg_in] = str(in_cost / in_qty)
+            if out_qty > 0:
+                sets[avg_out] = str(out_cost / out_qty)
+            sets[qty_col] = str(in_qty - out_qty)
+        sets["fees_usd"] = str(total_fees)
+        assignments = ", ".join(f"{k}=?" for k in sets)
+        self._conn.execute(
+            f"UPDATE positions SET {assignments}, updated_ms=? WHERE id=?",
+            (*sets.values(), _now_ms(), position_id),
+        )
+        self._conn.commit()
+
+    def synthetic_fills(self, position_id: int) -> list[dict]:
+        """Exit fills booked at mark rather than from a real order — the ADL /
+        lost-stop path. These are the rows whose price is a guess."""
+        return [
+            dict(r) for r in self._conn.execute(
+                "SELECT * FROM fills WHERE position_id=? AND order_id='ADL'"
+                " ORDER BY id",
+                (position_id,),
+            )
+        ]
+
     # ── P&L ──
 
     def finalize_pnl(self, position_id: int) -> Decimal:

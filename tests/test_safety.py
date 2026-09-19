@@ -1588,3 +1588,96 @@ async def test_hedge_guard_still_tranche_sells_a_real_adl(engine):
     assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
     assert pid not in engine._stop_grace
     assert any("tranches" in m for m in engine.notifier.messages)
+
+
+class _TradesClient(_StopOrderClient):
+    """Adds a userTrades record, for /truefill."""
+    def __init__(self, trades=None, **kw):
+        super().__init__(**kw)
+        self._trades = trades or []
+
+    async def user_trades(self, symbol, start_ms, end_ms, limit=500):
+        return [t for t in self._trades
+                if start_ms <= int(t["time"]) <= end_ms]
+
+
+async def test_truefill_replaces_a_mark_price_with_the_venue_vwap(engine):
+    """The hedge guard books an unidentified perp close at MARK — a guess. The
+    real price lives in Aster's trade record, and until it is pulled back in
+    the position's P&L is wrong by the gap between the two."""
+    import time as _time
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    # The guard's synthetic close: 9.95 booked at mark 100, order_id 'ADL'.
+    engine.positions.record_fill(
+        pid, "aster", "exit", "BUY", Decimal("9.95"), Decimal("100"),
+        Decimal(0), order_id="ADL",
+    )
+    now = int(_time.time() * 1000)
+    engine.aster = _TradesClient(trades=[
+        # Two real partials averaging 104 — the stop filled well above mark.
+        {"id": "t1", "side": "BUY", "qty": "5", "price": "103",
+         "commission": "0.01", "time": now - 60_000},
+        {"id": "t2", "side": "BUY", "qty": "4.95", "price": "105.010101",
+         "commission": "0.01", "time": now - 50_000},
+        # A SELL in the window must be ignored: it is not a short close.
+        {"id": "t3", "side": "SELL", "qty": "9.95", "price": "1",
+         "commission": "0", "time": now - 55_000},
+    ])
+    entry_fees = engine.positions.get(pid).fees_usd    # the close booked 0
+    out = await engine._cmd_truefill({"position_id": str(pid)})
+    assert "(mark) ->" in out
+    pos = engine.positions.get(pid)
+    assert pos.perp_exit_avg > Decimal("103.9")     # venue VWAP, not 100
+    assert pos.perp_exit_avg < Decimal("104.1")
+    # The guard books zero commission on a synthetic close; the venue's real
+    # commission comes back with the price.
+    assert pos.fees_usd == entry_fees + Decimal("0.02")
+    assert pos.realized_pnl_usd is not None
+
+
+async def test_truefill_is_a_no_op_without_synthetic_fills(engine):
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _TradesClient()
+    out = await engine._cmd_truefill({"position_id": str(pid)})
+    assert "no mark-priced fills" in out
+
+
+async def test_truefill_leaves_the_fill_alone_when_no_trade_matches(engine):
+    """A wrong or empty window must leave the book as it was, not zero it."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.positions.record_fill(
+        pid, "aster", "exit", "BUY", Decimal("9.95"), Decimal("100"),
+        Decimal(0), order_id="ADL",
+    )
+    engine.aster = _TradesClient(trades=[])
+    out = await engine._cmd_truefill({"position_id": str(pid)})
+    assert "no Aster BUY trades in the window" in out
+    assert engine.positions.get(pid).perp_exit_avg == Decimal("100")
+
+
+def test_recompute_from_fills_rebuilds_averages_after_a_correction(engine):
+    """record_fill folds each fill in incrementally, so a later correction
+    would otherwise leave the stored average carrying the old price."""
+    pos = engine.positions.create("BTCUSDT", Decimal(1000), paper=True)
+    engine.positions.record_fill(
+        pos.id, "aster", "entry", "SELL", Decimal(10), Decimal(100),
+        Decimal("0.1"),
+    )
+    engine.positions.record_fill(
+        pos.id, "aster", "exit", "BUY", Decimal(10), Decimal(90), Decimal("0.1"),
+    )
+    assert engine.positions.get(pos.id).perp_exit_avg == Decimal(90)
+    fill = engine.conn.execute(
+        "SELECT id FROM fills WHERE phase='exit'"
+    ).fetchone()
+    engine.positions.update_fill(
+        fill["id"], Decimal(95), Decimal("0.2"), "venue:t1"
+    )
+    engine.positions.recompute_from_fills(pos.id)
+    after = engine.positions.get(pos.id)
+    assert after.perp_exit_avg == Decimal(95)
+    assert after.fees_usd == Decimal("0.3")     # 0.1 entry + corrected 0.2
+    assert after.perp_qty == 0

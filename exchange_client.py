@@ -464,6 +464,25 @@ class AsterClient(_BaseClient):
             "GET", f"/fapi/v3/income?{body}", venue=self.VENUE
         )
 
+    async def user_trades(
+        self, symbol: str, start_ms: int, end_ms: int, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """Executed trades for one symbol in a time window — the venue's own
+        record of what price a fill actually got. The only authority when an
+        order id has been lost (a stop that fired while the engine was
+        restarting) or when a close was booked synthetically at mark."""
+        body = self._signed_body(
+            {
+                "symbol": symbol,
+                "startTime": str(start_ms),
+                "endTime": str(end_ms),
+                "limit": str(limit),
+            }
+        )
+        return await self._request(
+            "GET", f"/fapi/v3/userTrades?{body}", venue=self.VENUE
+        )
+
     async def _post_margin(self, paths: list[str], params: dict[str, str]) -> Any:
         """POST a signed margin/leverage change, trying each path in turn.
         Aster mirrors the Binance endpoints but the version prefix is not
