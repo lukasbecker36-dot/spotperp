@@ -109,3 +109,44 @@ def test_quoted_window_uses_only_quotes_before_the_fill():
         s.append(1_000 + i * 60_000, 50.0 if i < 5 else 200.0, 44.0, 1.0, 100.0)
     mean, jit, n = adv.quoted_before(s, 1_000 + 5 * 60_000, window_min=5)
     assert mean == 50.0 and n == 5 and jit == 0.0
+
+
+def test_exit_clips_pair_the_same_way(conn):
+    """Entry and exit are mirror images — entry rests a perp SELL and takes
+    spot at the ask, exit rests a perp BUY and takes spot at the bid — so one
+    pairing serves both."""
+    pid = _position(conn)
+    conn.execute(
+        "INSERT INTO fills (position_id,venue,phase,side,qty,price,fee_usd,ts_ms)"
+        " VALUES (?,'aster','exit','BUY','1000','1.010','0',1000)", (pid,))
+    conn.execute(
+        "INSERT INTO fills (position_id,venue,phase,side,qty,price,fee_usd,ts_ms)"
+        " VALUES (?,'mexc','exit','SELL','1000','1.000','0',2000)", (pid,))
+    conn.commit()
+    assert adv.clip_basis(conn, phase="entry") == []
+    clips = adv.clip_basis(conn, phase="exit")
+    assert [c["locked_bps"] for c in clips] == [100.0]
+
+
+def test_unwind_fills_are_not_clips(conn):
+    """An unwind reverses an entry that was never hedged. There is no spot leg
+    and nothing was locked, so it is not a clip of either phase."""
+    pid = _position(conn)
+    conn.execute(
+        "INSERT INTO fills (position_id,venue,phase,side,qty,price,fee_usd,ts_ms)"
+        " VALUES (?,'aster','unwind','BUY','1000','1.010','0',1000)", (pid,))
+    conn.commit()
+    assert adv.clip_basis(conn, phase="entry") == []
+    assert adv.clip_basis(conn, phase="exit") == []
+
+
+def test_quote_series_matches_the_phase():
+    """An entry is quoted ask/ask and an exit bid/bid. Comparing a realised
+    exit against the entry series would charge it the whole spread."""
+    from backtest_divergence import Series
+    s = Series()
+    for i in range(6):
+        s.append(1_000 + i * 60_000, 50.0, 44.0, 1.0, 100.0)
+    at = 1_000 + 6 * 60_000
+    assert adv.quoted_before(s, at, 10, "entry")[0] == 50.0
+    assert adv.quoted_before(s, at, 10, "exit")[0] == 44.0

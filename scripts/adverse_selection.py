@@ -64,13 +64,19 @@ def infer_multiplier(perp_px: float, spot_px: float) -> int | None:
     return best if abs(ratio / best - 1) < 0.25 else None
 
 
-def clip_basis(conn, paper: bool = False) -> list[dict]:
-    """Every hedged entry clip: the spot buy, and the perp fills it hedged."""
+def clip_basis(conn, phase: str = "entry", paper: bool = False) -> list[dict]:
+    """Every hedged clip of one phase: a spot leg, and the perp fills it paired.
+
+    Entry and exit are mirror images — entry rests a perp SELL and takes spot
+    at the ask, exit rests a perp BUY and takes spot at the bid — so the same
+    pairing serves both. 'unwind' fills are excluded: they reverse an entry
+    that was never hedged, so there is no spot leg and nothing was locked.
+    """
     rows = conn.execute(
         "SELECT f.position_id, f.venue, f.phase, f.side, f.qty, f.price,"
         " f.ts_ms, p.symbol FROM fills f JOIN positions p ON p.id=f.position_id"
-        " WHERE f.phase='entry' AND p.paper=? ORDER BY f.position_id, f.id",
-        (int(paper),),
+        " WHERE f.phase=? AND p.paper=? ORDER BY f.position_id, f.id",
+        (phase, int(paper)),
     ).fetchall()
     by_pos: dict[int, list] = {}
     for r in rows:
@@ -123,7 +129,9 @@ def clip_basis(conn, paper: bool = False) -> list[dict]:
     return clips
 
 
-def quoted_before(s: Series, ts_ms: int, window_min: float) -> tuple | None:
+def quoted_before(
+    s: Series, ts_ms: int, window_min: float, phase: str = "entry"
+) -> tuple | None:
     """(mean entry basis, jitter, samples) over the window BEFORE ts_ms.
 
     Before, not at: by the moment a resting order fills the basis has already
@@ -133,7 +141,9 @@ def quoted_before(s: Series, ts_ms: int, window_min: float) -> tuple | None:
     """
     hi = bisect.bisect_left(s.ts, ts_ms)
     lo = bisect.bisect_left(s.ts, ts_ms - int(window_min * 60_000))
-    vals = s.entry[lo:hi]
+    # An entry is quoted ask/ask and an exit bid/bid — comparing a realised
+    # exit against the entry series would charge it the whole spread.
+    vals = (s.entry if phase == "entry" else s.close)[lo:hi]
     if len(vals) < 3:
         return None
     jit = sum(abs(vals[i] - vals[i - 1]) for i in range(1, len(vals))) / (len(vals) - 1)
@@ -154,6 +164,10 @@ def main() -> None:
                     help="column to bucket by (default jit_bps). notional_usd"
                          " separates a constant spread-crossing cost from one"
                          " that grows as a clip walks the book")
+    ap.add_argument("--phase", choices=("entry", "exit", "both"), default="both",
+                    help="which side to score (default both). The round trip"
+                         " pays slippage twice, so the cost floor needs the"
+                         " sum, not the entry alone")
     ap.add_argument("--paper", action="store_true", help="score paper fills instead")
     args = ap.parse_args()
 
@@ -167,31 +181,39 @@ def main() -> None:
 
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
-    clips = [c for c in clip_basis(conn, paper=args.paper)
-             if c["notional_usd"] >= args.min_notional]
-    if not clips:
-        print("no hedged entry clips found in the DB", file=sys.stderr)
+    phases = ["entry", "exit"] if args.phase == "both" else [args.phase]
+    all_clips: list[dict] = []
+    for ph in phases:
+        for c in clip_basis(conn, phase=ph, paper=args.paper):
+            if c["notional_usd"] >= args.min_notional:
+                all_clips.append({**c, "phase": ph})
+    if not all_clips:
+        print("no hedged clips found in the DB", file=sys.stderr)
         return
-    symbols = {c["symbol"] for c in clips}
-    print(f"{len(clips)} clips across {len(symbols)} symbols", file=sys.stderr)
+    symbols = {c["symbol"] for c in all_clips}
+    print(f"{len(all_clips)} clips across {len(symbols)} symbols", file=sys.stderr)
 
     series = load_logs(paths, symbols)
     scored = []
     no_quote = 0
-    for c in clips:
+    for c in all_clips:
         s = series.get(c["symbol"])
-        q = quoted_before(s, c["ts_ms"], args.window_min) if s else None
+        q = quoted_before(s, c["ts_ms"], args.window_min, c["phase"]) if s else None
         if q is None:
             no_quote += 1
             continue
         quoted, jit, n = q
+        # Positive always means WORSE than the board showed. An entry wants a
+        # high basis so locking lower is the loss; an exit wants a low one, so
+        # the sign flips.
+        slip = (quoted - c["locked_bps"] if c["phase"] == "entry"
+                else c["locked_bps"] - quoted)
         scored.append({
             **c,
             "quoted_bps": round(quoted, 2),
             "jit_bps": round(jit, 2),
             "quote_samples": n,
-            # Positive = the board promised more than the clip locked.
-            "slippage_bps": round(quoted - c["locked_bps"], 2),
+            "slippage_bps": round(slip, 2),
         })
     if no_quote:
         print(f"{no_quote} clips had no quotes in the logs for that window",
@@ -210,43 +232,72 @@ def main() -> None:
             w.writerows(scored)
         print(f"wrote {len(scored)} rows to {out}", file=sys.stderr)
 
+    medians = {}
+    for ph in phases:
+        rows_ph = [r for r in scored if r["phase"] == ph]
+        if not rows_ph:
+            print(f"\nno {ph} clips scored", file=sys.stderr)
+            continue
+        medians[ph] = _report(rows_ph, ph, args.by)
+
+    if len(medians) > 1:
+        total = sum(medians.values())
+        print(f"\nround trip: {medians.get('entry', 0):+.1f} entry"
+              f" {medians.get('exit', 0):+.1f} exit = {total:+.1f} bps of"
+              f" slippage per complete trade.")
+        print(
+            f"SLIPPAGE_BUFFER_BPS is {float(config.SLIPPAGE_BUFFER_BPS):g}, so"
+            f" the cost floor budgets that against {total:.1f} measured."
+        )
+
+
+def _report(scored: list[dict], phase: str, by: str) -> float:
+    """Print one phase's summary and bucket table; return its median slippage."""
     slip = sorted(r["slippage_bps"] for r in scored)
     quoted_all = sorted(r["quoted_bps"] for r in scored)
     locked_all = sorted(r["locked_bps"] for r in scored)
-    print(f"\n{len(scored)} hedged entry clips")
+    med = pctile(slip, 50)
+    print(f"\n{len(scored)} hedged {phase} clips")
     print(f"  median quoted   {pctile(quoted_all, 50):+8.1f} bps")
     print(f"  median locked   {pctile(locked_all, 50):+8.1f} bps")
-    print(f"  median slippage {pctile(slip, 50):+8.1f} bps"
+    print(f"  median slippage {med:+8.1f} bps"
           f"   (p25 {pctile(slip, 25):+.1f}, p75 {pctile(slip, 75):+.1f})")
 
-    by = args.by
-    if scored and by not in scored[0]:
+    if by not in scored[0]:
         print(f"no column {by!r}; try one of: "
-              + ", ".join(k for k in scored[0] if k != "symbol"), file=sys.stderr)
-        return
-    edges = [round(pctile(sorted(r[by] for r in scored), p), 2)
-             for p in (25, 50, 75)]
+              + ", ".join(k for k in scored[0] if k not in ("symbol", "phase")),
+              file=sys.stderr)
+        return med
+    vals = [r[by] for r in scored if isinstance(r[by], (int, float))]
+    if not vals:
+        groups: dict[str, list] = {}
+        for r in scored:
+            groups.setdefault(str(r[by]), []).append(r)
+        order = sorted(groups, key=lambda k: -len(groups[k]))[:20]
+    else:
+        edges = [round(pctile(sorted(vals), p), 2) for p in (25, 50, 75)]
+        groups = {}
+        for r in scored:
+            j = r[by]
+            name = (f"<{edges[0]:g}" if j < edges[0] else
+                    f">={edges[-1]:g}" if j >= edges[-1] else
+                    next(f"{edges[i-1]:g}..{edges[i]:g}"
+                         for i in range(1, len(edges)) if j < edges[i]))
+            groups.setdefault(name, []).append(r)
+        order = ([f"<{edges[0]:g}"]
+                 + [f"{edges[i-1]:g}..{edges[i]:g}" for i in range(1, len(edges))]
+                 + [f">={edges[-1]:g}"])
     ratio_hdr = "slip/jit" if by == "jit_bps" else "med " + by
-    hdr = (f"\n{by:<14}{'clips':>7}{'med quoted':>12}"
-           f"{'med locked':>12}{'med slip':>10}{ratio_hdr:>10}")
+    hdr = (f"{by:<14}{'clips':>7}{'med quoted':>12}"
+           f"{'med locked':>12}{'med slip':>10}{ratio_hdr[:10]:>11}")
     print(hdr)
-    print("-" * (len(hdr) - 1))
-    groups: dict[str, list] = {}
-    for r in scored:
-        j = r[by]
-        name = (f"<{edges[0]:g}" if j < edges[0] else
-                f">={edges[-1]:g}" if j >= edges[-1] else
-                next(f"{edges[i-1]:g}..{edges[i]:g}"
-                     for i in range(1, len(edges)) if j < edges[i]))
-        groups.setdefault(name, []).append(r)
-    order = ([f"<{edges[0]:g}"]
-             + [f"{edges[i-1]:g}..{edges[i]:g}" for i in range(1, len(edges))]
-             + [f">={edges[-1]:g}"])
+    print("-" * len(hdr))
     for name in order:
         g = groups.get(name, [])
         if not g:
             continue
-        med_j = pctile(sorted(r[by] for r in g), 50)
+        gv = [r[by] for r in g if isinstance(r[by], (int, float))]
+        med_j = pctile(sorted(gv), 50) if gv else 0.0
         med_s = pctile(sorted(r["slippage_bps"] for r in g), 50)
         # Against jitter the useful number is the implied haircut; against
         # anything else it is just the bucket's own median.
@@ -255,22 +306,21 @@ def main() -> None:
             f"{name:<14}{len(g):>7}"
             f"{pctile(sorted(r['quoted_bps'] for r in g), 50):>12.1f}"
             f"{pctile(sorted(r['locked_bps'] for r in g), 50):>12.1f}"
-            f"{med_s:>10.1f}{tail:>10.2f}"
+            f"{med_s:>10.1f}{tail:>11.2f}"
         )
-    print("-" * (len(hdr) - 1))
+    print("-" * len(hdr))
     print(
-        "slippage = quoted - locked, so POSITIVE means the board promised more"
-        " than the clip got."
+        "slippage = how much WORSE than the board the clip came out. An entry"
+        " wants a high basis so locking lower is the loss; an exit wants a low"
+        " one, so its sign is flipped to match."
     )
     if by == "jit_bps":
         print(
             "slip/jit is the haircut the data implies against the 1.00x"
-            " fill_score applies. Flat near zero and the haircut demotes rows"
-            " for nothing; flat near one and it is about right; rising and the"
-            " shape is right with the size in the last column. A FALLING ratio"
-            " with flat slippage means the cost is a constant, not a multiple"
-            " of jitter — read the med slip column, not this one."
+            " fill_score applies. A FALLING ratio with flat slippage means the"
+            " cost is a constant, not a multiple of jitter — read med slip."
         )
+    return med
 
 
 if __name__ == "__main__":
