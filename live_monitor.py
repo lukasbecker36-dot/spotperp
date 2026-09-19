@@ -1183,6 +1183,8 @@ class Engine:
                 return await self._cmd_balance()
             if command == "refresh":
                 return await self._cmd_refresh()
+            if command == "orders":
+                return await self._cmd_orders(args)
             if command == "stops":
                 return await self._cmd_stops(args)
             if command == "remove":
@@ -1489,6 +1491,144 @@ class Engine:
         if not added and not removed:
             lines.append("(no change — both venues already known, or fetch failed)")
         return "\n".join(lines)
+
+    def _touch_basis(self, pair) -> tuple[float | None, float | None]:
+        """(entry, exit-passive) basis at the touch, in bps, or (None, None).
+
+        Entry is ask/ask (rest the perp short at the ask, buy spot at the ask);
+        the passive exit is bid/bid (rest the perp buy-back at the bid, sell
+        spot at the bid). They are different numbers and each working order has
+        to be judged against its own one.
+        """
+        aster = self.md.aster_books.get(pair.aster_symbol)
+        mexc = self.md.mexc_books.get(pair.mexc_symbol)
+        if aster is None or mexc is None or mexc.ask <= 0 or mexc.bid <= 0:
+            return None, None
+        mult = pair.qty_multiplier
+        entry = float((aster.ask / mult - mexc.ask) / mexc.ask * Decimal(10000))
+        exit_p = float((aster.bid / mult - mexc.bid) / mexc.bid * Decimal(10000))
+        return entry, exit_p
+
+    async def _cmd_orders(self, args: dict) -> str:
+        """Every working entry and exit with the level it is waiting for, the
+        level the market is at, and the pair's own 24h range for that side.
+
+        Stops are excluded: they are protection, not an attempt to trade a
+        level, and they would swamp the list. Note they cannot be filtered by
+        ORDER TYPE — the MEXC half of a stop is a plain sell LIMIT, identical
+        in kind to a passive exit — so they are matched on the sp_stop_ client
+        id prefix instead.
+        """
+        working = [
+            p for p in self.positions.active()
+            if p.state in (pm.ENTERING, pm.EXITING)
+        ]
+        if not working:
+            n_open = len(self.positions.active())
+            return (
+                "no working orders"
+                + (f" ({n_open} position(s) OPEN, nothing resting)" if n_open
+                   else "")
+            )
+        out: list[str] = [f"working orders ({len(working)})"]
+        stops_seen = 0
+        for pos in working:
+            pair = self.md.pair_maps.get(pos.symbol)
+            if pair is None:
+                out.append(f"\n#{pos.id} {pos.symbol}: not cross-listed")
+                continue
+            entering = pos.state == pm.ENTERING
+            entry_now, exit_now = self._touch_basis(pair)
+            now = entry_now if entering else exit_now
+            lo, hi = self._basis_24h.percentiles(pos.symbol, close=not entering)
+            _, hours = self._basis_24h.stats(pos.symbol)
+            thin = hours < config.SCREEN_DIFF_MIN_HOURS
+
+            if entering:
+                target = pos.min_entry_bps
+                head = f"#{pos.id} {pos.symbol}  ENTRY"
+                # An entry rests until the basis is at or ABOVE its floor; an
+                # exit fires at or BELOW its target. Spelling out the direction
+                # stops the reader guessing which side of the level they need.
+                want = f"fires at >= {float(target):+.1f}" if target is not None else "fires at the default floor"
+            else:
+                target = pos.exit_target_bps
+                head = f"#{pos.id} {pos.symbol}  EXIT {pos.exit_mode or ''}".rstrip()
+                want = (f"fires at <= {float(target):+.1f}" if target is not None
+                        else "taker — no level to wait for")
+            out.append("")
+            out.append(f"{head}  {want}bps" if target is not None else f"{head}  {want}")
+            if now is None:
+                out.append("  now      -     (no live book)")
+            elif lo is None or hi is None or thin:
+                out.append(f"  now {now:+7.1f}   24h range: not enough history")
+            else:
+                where = ""
+                if now > hi:
+                    where = "  ABOVE 24h range"
+                elif now < lo:
+                    where = "  BELOW 24h range"
+                out.append(
+                    f"  now {now:+7.1f}   24h {lo:+.1f} to {hi:+.1f}{where}"
+                )
+                # The gap that decides whether waiting is realistic: an exit
+                # target under the 24h low, or an entry floor over the 24h
+                # high, is a level this pair has not reached all day.
+                # ...but only when the level is not already satisfied: an
+                # entry whose floor the basis ALREADY clears fills on the next
+                # tick, so warning that it "may never fill" would be nonsense.
+                if target is not None:
+                    t = float(target)
+                    satisfied = now >= t if entering else now <= t
+                    if satisfied:
+                        out.append("  ready — the level is met right now")
+                    elif entering and t > hi:
+                        out.append(
+                            f"  ⚠ floor {t:+.1f} is above the 24h high"
+                            f" {hi:+.1f} — may never fill"
+                        )
+                    elif (not entering) and t < lo:
+                        out.append(
+                            f"  ⚠ target {t:+.1f} is below the 24h low"
+                            f" {lo:+.1f} — may never fill"
+                        )
+            out.append(
+                f"  filled {pos.perp_qty} perp / {pos.spot_qty} spot"
+            )
+            if self.paper:
+                out.append("  (paper — no venue orders)")
+                continue
+            for client, sym, leg in (
+                (self.aster, pair.aster_symbol, "perp"),
+                (self.mexc, pair.mexc_symbol, "spot"),
+            ):
+                try:
+                    orders = await client.open_orders(sym)
+                except ExchangeError as exc:
+                    out.append(f"  {leg}: open-orders fetch failed ({exc})")
+                    continue
+                for o in orders:
+                    if o.client_order_id.startswith("sp_stop_"):
+                        stops_seen += 1
+                        continue
+                    mine = o.client_order_id.startswith(("sp_pent_", "sp_pext_"))
+                    tag = "" if mine else "  (not placed by the bot)"
+                    done = (f" filled {o.executed_qty}/{o.orig_qty}"
+                            if o.executed_qty > 0 else f" {o.orig_qty}")
+                    out.append(
+                        f"  {leg} {o.side}{done} @ {recon._p(o.price)}{tag}"
+                    )
+        out.append("")
+        out.append(
+            "ENTRY rests until the basis rises TO its floor; EXIT fires when"
+            " the basis falls TO its target. 'now' is that side's live touch"
+            " basis — entry is ask/ask, exit is bid/bid, so they differ."
+        )
+        out.append(
+            f"24h = p10/p90 of the hourly mean for that side."
+            + (f" {stops_seen} stop order(s) hidden." if stops_seen else "")
+        )
+        return "\n".join(out)
 
     async def _cmd_stops(self, args: dict) -> str:
         """Place liquidation-protection orders for one position: a reduce-only

@@ -44,6 +44,7 @@ HELP = """Commands:
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
 /positions — active positions detail (bot DB)
+/orders — working entries/exits: level waited for, level now, 24h range (stops excluded)
 /balance — USDT balance on each venue (Aster perp + MEXC spot)
 /recon — live exchange P&L: pairs open on the venues now, full round-trip cost
 /adopt SYMBOL — import an existing venue carry trade as a managed position
@@ -231,6 +232,8 @@ class ControlBot:
             return await advisor.review_text(self._session, self._conn)
         if command == "positions":
             return self._cmd_positions()
+        if command == "orders":
+            return await self._queue_and_wait("orders", {}, wait=25)
         if command == "recon":
             return await self._queue_and_wait("recon", {}, wait=25)
         if command == "balance":

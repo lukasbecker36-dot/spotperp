@@ -89,6 +89,15 @@ def engine(tmp_path, monkeypatch):
     eng._hedge_break = {}
     eng._position_risk_ts = 0.0
     eng._position_risk_wall_ms = 0
+    eng._basis_24h = screener.DailyBasis()
+
+    class _NoOrders:
+        """Venue stub for command handlers that list resting orders."""
+        async def open_orders(self, symbol):
+            return []
+
+    eng.aster = _NoOrders()
+    eng.mexc = _NoOrders()
     yield eng
     conn.close()
 
@@ -1394,3 +1403,95 @@ async def test_funding_snapshot_carries_the_24h_basis_range(
     row = json.loads((tmp_path / "fnd.json").read_text())["rows"][0]
     assert row["basis_p10_24h"] < row["basis_p90_24h"]
     assert row["hours_24h"] == 24.0
+
+
+async def test_orders_reports_nothing_when_no_order_is_working(engine):
+    out = await engine._cmd_orders({})
+    assert "no working orders" in out
+
+
+async def test_orders_shows_each_side_against_its_own_basis_and_range(engine):
+    """An entry waits on the ask/ask basis and an exit on the bid/bid one, and
+    they are different numbers. Each working order has to be shown against its
+    own side, and against that side's own 24h range."""
+    import time as _time
+    pos_id = await open_position(engine)
+    now = int(_time.time() * 1000)
+    for h in range(24):
+        # entry basis swings 0..60, close basis 10..70 — deliberately different
+        # so a test that mixed the two up would read the wrong bounds.
+        engine._basis_24h.add("BTCUSDT", now - h * 3_600_000,
+                              60.0 if h % 2 else 0.0, 70.0 if h % 2 else 10.0)
+    engine.positions.set_exit_request(pos_id, "passive", Decimal(5))
+    engine.positions.set_state(pos_id, pm.EXITING)
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    out = await engine._cmd_orders({})
+    assert f"#{pos_id} BTCUSDT" in out and "EXIT passive" in out
+    assert "fires at <= +5.0bps" in out
+    assert "+50.1" in out                 # bid/bid basis, not the ask/ask +50.0
+    assert "24h +10.0 to +70.0" in out    # the CLOSE range, not the entry range
+
+
+async def test_orders_warns_when_the_level_waited_for_is_out_of_range(engine):
+    """An exit target below the pair's 24h low is a level it has not reached
+    all day — the order will sit there indefinitely. That is the single most
+    useful thing this view can say."""
+    import time as _time
+    pos_id = await open_position(engine)
+    now = int(_time.time() * 1000)
+    for h in range(24):
+        engine._basis_24h.add("BTCUSDT", now - h * 3_600_000, 50.0, 50.0)
+    engine.positions.set_exit_request(pos_id, "passive", Decimal(-200))
+    engine.positions.set_state(pos_id, pm.EXITING)
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    out = await engine._cmd_orders({})
+    assert "may never fill" in out
+
+
+async def test_orders_excludes_stops_by_client_id_not_order_type(engine, monkeypatch):
+    """The MEXC half of a stop is a plain sell LIMIT — identical in KIND to a
+    passive exit — so stops can only be told apart by their client-id prefix.
+    Filtering on order type would either hide real exits or show every stop."""
+    from exchange_client import OrderResult
+    pos_id = await open_position(engine)
+    engine.positions.set_exit_request(pos_id, "passive", Decimal(5))
+    engine.positions.set_state(pos_id, pm.EXITING)
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    monkeypatch.setattr(engine, "paper", False)
+
+    def _order(cid, side):
+        return OrderResult(
+            venue="mexc", symbol="BTCUSDT", order_id="1", client_order_id=cid,
+            side=side, status="NEW", price=Decimal("100"),
+            orig_qty=Decimal(5), executed_qty=Decimal(0),
+            avg_price=Decimal(0),
+        )
+
+    async def fake_open_orders(symbol):
+        return [
+            _order("sp_pext_1_1700000000", "BUY"),    # the working exit
+            _order("sp_stop_1_1700000000", "SELL"),   # protection — same TYPE
+        ]
+    monkeypatch.setattr(type(engine.aster), "open_orders",
+                        staticmethod(fake_open_orders))
+    out = await engine._cmd_orders({})
+    assert "BUY" in out
+    assert "sp_stop" not in out
+    assert "2 stop order(s) hidden" in out
+
+
+async def test_orders_does_not_warn_when_the_level_is_already_met(engine):
+    """A floor the basis ALREADY clears fills on the next tick. Comparing the
+    target with the 24h range alone would call that 'may never fill'."""
+    import time as _time
+    now = int(_time.time() * 1000)
+    for h in range(24):
+        engine._basis_24h.add("BTCUSDT", now - h * 3_600_000, -100.0, -100.0)
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")   # +50bps live
+    pos = engine.positions.create(
+        "BTCUSDT", Decimal(1000), paper=True, min_entry_bps=Decimal(30)
+    )
+    engine.positions.set_state(pos.id, pm.ENTERING)
+    out = await engine._cmd_orders({})
+    assert "ready — the level is met right now" in out
+    assert "may never fill" not in out
