@@ -552,6 +552,12 @@ class Engine:
                 "max_notional_usd": screen.max_notional_usd,
                 "entry_bps_jitter": screen.entry_bps_jitter,
                 "perp_trades_24h": screen.perp_trades_24h,
+                # 24h range of the hourly mean basis, so /funding can say
+                # whether the live entry sits at the rich or the cheap end of
+                # where this pair has actually traded today.
+                "basis_p10_24h": screen.basis_p10_24h,
+                "basis_p90_24h": screen.basis_p90_24h,
+                "hours_24h": screen.hours_24h,
             })
         rows.sort(key=lambda r: r["avg_24h_8h_bps"], reverse=True)
         config.FUNDING_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)

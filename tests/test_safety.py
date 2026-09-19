@@ -1366,3 +1366,31 @@ async def test_spot_deficit_needs_confirmation(engine, monkeypatch):
     await engine._check_spot_integrity(engine.positions.get(pid))
 
     assert engine.positions.get(pid).spot_qty == Decimal("9.95")   # not yet
+
+
+async def test_funding_snapshot_carries_the_24h_basis_range(
+    engine, monkeypatch, tmp_path
+):
+    """/funding needs the pair's own 24h range to answer "is now a good time to
+    enter" — an entry near the 24h high is the rich end, near the low means you
+    are paying for the carry."""
+    import funding as funding_mod
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._basis_24h = screener.DailyBasis()
+    engine.md.funding_stats["BTCUSDT"] = funding_mod.summarize(
+        "BTCUSDT", [], None, now_ms=0
+    )
+    import time as _time
+    now = int(_time.time() * 1000)
+    # A day of hourly samples swinging between +10 and +90bps.
+    for h in range(24):
+        engine._basis_24h.add(
+            "BTCUSDT", now - h * 3_600_000, 90.0 if h % 2 else 10.0
+        )
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    engine._write_funding_snapshot()
+    import json
+    row = json.loads((tmp_path / "fnd.json").read_text())["rows"][0]
+    assert row["basis_p10_24h"] < row["basis_p90_24h"]
+    assert row["hours_24h"] == 24.0

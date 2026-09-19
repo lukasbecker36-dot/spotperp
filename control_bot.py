@@ -585,8 +585,9 @@ class ControlBot:
         if not rows:
             return "no funding data yet"
         win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
-        hdr = (f"{'symbol':<12}{'iv':>3}{'24h':>6}{'fund':>6}{'next':>6}"
-               f"{'entry':>7}{'jit':>5}{'be':>6}{'depth$':>8}")
+        hdr = (f"{'symbol':<11}{'iv':>3}{'24h':>5}{'fund':>5}{'next':>5}"
+               f"{'entry':>6}{'lo24':>6}{'hi24':>7}{'jit':>5}{'be':>5}"
+               f"{'depth$':>7}")
         sep = "-" * len(hdr)
         lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
 
@@ -598,13 +599,27 @@ class ControlBot:
         floor = float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
         for r in rows:
             ev = avg(r, "entry_bps_avg", "entry_bps")
-            entry = f"{ev:>7.1f}" if ev is not None else f"{'-':>7}"
+            entry = f"{ev:>6.1f}" if ev is not None else f"{'-':>6}"
             jv = r.get("entry_bps_jitter")
             jit = (f"{jv:>5.1f}" if jv is not None and r.get("samples", 0) >= 3
                    else f"{'-':>5}")
-            depth = f"{r['max_notional_usd']:>8,.0f}" if r.get("max_notional_usd") else f"{'-':>8}"
+            depth = f"{r['max_notional_usd']:>7,.0f}" if r.get("max_notional_usd") else f"{'-':>7}"
             nh = r.get("next_funding_h")
-            nxt = f"{nh:>5.1f}h" if nh is not None and nh >= 0 else f"{'-':>6}"
+            nxt = f"{nh:>4.1f}h" if nh is not None and nh >= 0 else f"{'-':>5}"
+            # Where the live basis sits inside the pair's own 24h range. A '?'
+            # marks too little history for the range to be a norm — DailyBasis
+            # falls back to the live basis there, which would otherwise read as
+            # a genuine high and low.
+            hrs24 = r.get("hours_24h") or 0.0
+            thin = hrs24 < config.SCREEN_DIFF_MIN_HOURS
+
+            def rng(v, w):
+                if v is None:
+                    return f"{'-':>{w}}"
+                return f"{f'{v:.0f}?':>{w}}" if thin else f"{v:>{w}.1f}"
+
+            lo24 = rng(r.get("basis_p10_24h"), 6)
+            hi24 = rng(r.get("basis_p90_24h"), 7)
             # Hours of funding needed to pay for getting in. The entry basis is
             # a ONE-OFF (a credit when positive, a cost when negative); funding
             # is the recurring stream. This is the number that decides whether a
@@ -612,15 +627,15 @@ class ControlBot:
             carry = r.get("avg_24h_8h_bps") or 0.0
             cost = floor - (ev if ev is not None else 0.0)
             if cost <= 0:
-                be = f"{'0':>6}"          # paid to enter
+                be = f"{'0':>5}"          # paid to enter
             elif carry <= 0:
-                be = f"{'never':>6}"      # carry does not pay it back
+                be = f"{'nvr':>5}"        # carry does not pay it back
             else:
-                be = f"{cost / carry * 8.0:>5.0f}h"
+                be = f"{cost / carry * 8.0:>4.0f}h"
             lines.append(
-                f"{_pad(r['symbol'], 12)}{r['interval_hours']:>2}h"
-                f"{r['avg_24h_8h_bps']:>6.1f}{r['current_8h_bps']:>6.1f}{nxt}"
-                f"{entry}{jit}{be}{depth}"
+                f"{_pad(r['symbol'], 11)}{r['interval_hours']:>2}h"
+                f"{r['avg_24h_8h_bps']:>5.1f}{r['current_8h_bps']:>5.1f}{nxt}"
+                f"{entry}{lo24}{hi24}{jit}{be}{depth}"
             )
         lines.append(sep)
         lines.append("iv=interval; 24h=avg carry/8h; fund=settled/8h; next=to settle")
@@ -629,6 +644,15 @@ class ControlBot:
             f" be = hours of carry to pay off the entry basis + {floor:.0f}bps"
             " round-trip cost: '0' = the basis already pays you to enter,"
             " 'never' = negative carry, so the entry cost is never repaid."
+        )
+        lines.append(
+            "lo24/hi24 = p10/p90 of the HOURLY mean basis over 24h — where this"
+            " pair has actually traded today. entry near hi24 = rich end, a"
+            " good moment to sell the perp; entry near lo24 = you are entering"
+            " at the cheap end and paying for the carry. hi24-lo24 is also the"
+            " round trip on offer, and lo24 is where an /exit will fill."
+            f" '?' = under {config.SCREEN_DIFF_MIN_HOURS:.0f}h of history, so"
+            " those two are the live basis, not a range."
         )
         lines.append(
             "jit = mean bps the basis moves between 5m samples; a resting order"
