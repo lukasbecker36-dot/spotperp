@@ -178,3 +178,56 @@ def test_unwind_does_not_count_as_an_exit(manager):
     after = mgr.get(pos.id)
     assert after.perp_exit_avg == Decimal("0.9990")   # the real close only
     assert mgr.leg_qtys(pos.id)["perp_exit"] == Decimal(1000)
+
+
+def test_unwind_only_reverses_clips_that_preceded_it(manager):
+    """GUSDT #195 reported a -533bps blended entry basis. Matching the total
+    unwind quantity against the whole entry history reverses clips that filled
+    AFTER the unwind and were hedged and kept — so a later unwind silently ate
+    the good clips and left the average on the oldest fills. An unwind can only
+    undo something that already happened."""
+    mgr = manager
+    pos = mgr.create("GUSDT", Decimal(2000), paper=False)
+
+    def basis():
+        p = mgr.get(pos.id)
+        return (p.perp_entry_avg - p.spot_entry_avg) / p.spot_entry_avg * 10000
+
+    def entry(qty, perp_px, spot_px=None):
+        mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(qty),
+                        Decimal(perp_px), Decimal(0))
+        if spot_px is not None:
+            mgr.record_fill(pos.id, "mexc", "entry", "BUY", Decimal(qty),
+                            Decimal(spot_px), Decimal(0))
+
+    def unwind(qty, px):
+        mgr.record_fill(pos.id, "aster", "unwind", "BUY", Decimal(qty),
+                        Decimal(px), Decimal(0))
+
+    entry(49005, "0.030090", "0.030000")      # hedged at +30bps
+    unwind_clip = ("0.029833", "0.029850")
+    entry(5698, unwind_clip[0])               # fills unhedged...
+    unwind(5698, unwind_clip[1])              # ...and is reversed
+    entry(4278, "0.030100", "0.030010")       # a later clip, hedged and KEPT
+    entry(2000, "0.029700")                   # another unhedged clip...
+    unwind(2000, "0.029750")                  # ...also reversed
+
+    after = mgr.get(pos.id)
+    # Only the two unhedged clips are gone; both hedged clips survive intact.
+    assert after.perp_qty == Decimal(53283)   # 49005 + 4278
+    assert round(float(basis()), 1) == 30.0
+    # Globally matching 7698 of unwind against the newest entries would have
+    # eaten the 4278 clip and left the average on the 49005 one.
+    assert after.perp_entry_avg > Decimal("0.03009")
+
+
+def test_unwind_larger_than_every_entry_does_not_inflate_qty(manager):
+    """Defensive: an unwind that cannot be matched must not leave quantity
+    behind as though it never happened."""
+    mgr = manager
+    pos = mgr.create("GUSDT", Decimal(100), paper=False)
+    mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(1000),
+                    Decimal("0.03"), Decimal(0))
+    mgr.record_fill(pos.id, "aster", "unwind", "BUY", Decimal(1500),
+                    Decimal("0.03"), Decimal(0))
+    assert mgr.get(pos.id).perp_qty == Decimal(-500)

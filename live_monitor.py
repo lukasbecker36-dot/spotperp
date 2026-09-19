@@ -1217,6 +1217,8 @@ class Engine:
                 return await self._cmd_balance()
             if command == "refresh":
                 return await self._cmd_refresh()
+            if command == "recompute":
+                return await self._cmd_recompute(args)
             if command == "truefill":
                 return await self._cmd_truefill(args)
             if command == "orders":
@@ -1667,6 +1669,55 @@ class Engine:
             + (f" {stops_seen} stop order(s) hidden." if stops_seen else "")
         )
         return "\n".join(out)
+
+    async def _cmd_recompute(self, args: dict) -> str:
+        """Re-derive a position's legs from its fills.
+
+        The stored averages are folded in as fills arrive, so a position that
+        was written by an older, wrong derivation keeps that answer until the
+        next fill lands. This replays the fills and rewrites qty, averages,
+        fees and realised P&L. Touches the book only; places no orders.
+        """
+        pos = self._resolve_position(str(args.get("position_id", "")))
+        if isinstance(pos, str):
+            return pos
+        pair = self.md.pair_maps.get(pos.symbol)
+        mult = pair.qty_multiplier if pair else Decimal(1)
+
+        def basis(p) -> str:
+            if not (p.perp_entry_avg and p.spot_entry_avg):
+                return "-"
+            v = (p.perp_entry_avg / mult - p.spot_entry_avg) / p.spot_entry_avg
+            return f"{float(v * 10000):+.1f}bps"
+
+        before = pos
+        self.positions.recompute_from_fills(pos.id)
+        after = self.positions.get(pos.id)
+        lines = [f"position {pos.id} {pos.symbol}: re-derived from fills"]
+        lines.append(f"  perp qty   {before.perp_qty} -> {after.perp_qty}")
+        lines.append(
+            f"  perp entry {recon._p(before.perp_entry_avg or Decimal(0))}"
+            f" -> {recon._p(after.perp_entry_avg or Decimal(0))}"
+        )
+        lines.append(f"  entry basis {basis(before)} -> {basis(after)}")
+        if after.unwind_pnl_usd:
+            lines.append(f"  unwind P&L ${float(after.unwind_pnl_usd):+.2f}")
+        if before.state in (pm.CLOSED, pm.CANCELLED):
+            pnl = self.positions.finalize_pnl(pos.id)
+            lines.append(f"  realised P&L -> ${float(pnl):+.2f}")
+        else:
+            # An open position has no realised P&L yet; recomputing one would
+            # book a number for a trade that has not finished.
+            self.conn.execute(
+                "UPDATE positions SET entry_basis_bps=? WHERE id=?",
+                (str((after.perp_entry_avg / mult - after.spot_entry_avg)
+                     / after.spot_entry_avg * Decimal(10000))
+                 if after.perp_entry_avg and after.spot_entry_avg else None,
+                 pos.id),
+            )
+            self.conn.commit()
+        journal(self.conn, f"position {pos.id}: recomputed from fills")
+        return "\n".join(lines)
 
     async def _cmd_truefill(self, args: dict) -> str:
         """Replace an exit price booked at MARK with the venue's real fills.

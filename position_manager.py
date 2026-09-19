@@ -373,37 +373,48 @@ class PositionManager:
             " WHERE position_id=? AND venue=? ORDER BY id",
             (position_id, venue),
         ).fetchall()
-        entries = [(Decimal(r["qty"]), Decimal(r["price"])) for r in rows
-                   if r["phase"] == "entry"]
-        exits = [(Decimal(r["qty"]), Decimal(r["price"])) for r in rows
-                 if r["phase"] == "exit"]
-        unwinds = [(Decimal(r["qty"]), Decimal(r["price"])) for r in rows
-                   if r["phase"] == "unwind"]
         fees = sum((Decimal(r["fee_usd"] or "0") for r in rows), Decimal(0))
 
-        # Match unwinds against the most recent entries first.
-        to_reverse = sum((q for q, _ in unwinds), Decimal(0))
-        unwind_cost = sum((q * p for q, p in unwinds), Decimal(0))
-        reversed_qty = Decimal(0)
-        reversed_cost = Decimal(0)
-        kept: list[tuple[Decimal, Decimal]] = []
-        for qty, price in reversed(entries):
-            take = min(qty, to_reverse - reversed_qty)
-            if take > 0:
-                reversed_qty += take
-                reversed_cost += take * price
-            if qty - take > 0:
-                kept.append((qty - take, price))
-        in_qty = sum((q for q, _ in kept), Decimal(0))
-        in_cost = sum((q * p for q, p in kept), Decimal(0))
+        # Walk the fills IN ORDER, matching each unwind against the entries
+        # that preceded it, newest first. Matching globally instead — all the
+        # unwind quantity against all the entries — silently reverses clips
+        # that filled AFTER the unwind and were hedged and kept, which is how
+        # GUSDT #195 reported a -533bps blended entry basis: a later unwind
+        # re-matched and ate the good clips, leaving the average on the oldest
+        # fills. An unwind can only undo something that already happened.
+        open_entries: list[list[Decimal]] = []   # [qty, price], oldest first
+        exits: list[tuple[Decimal, Decimal]] = []
+        reversed_qty = reversed_cost = Decimal(0)
+        unwind_cost = unmatched = Decimal(0)
+        for r in rows:
+            qty, price = Decimal(r["qty"]), Decimal(r["price"])
+            if r["phase"] == "entry":
+                open_entries.append([qty, price])
+            elif r["phase"] == "unwind":
+                unwind_cost += qty * price
+                need = qty
+                while need > 0 and open_entries:
+                    take = min(open_entries[-1][0], need)
+                    open_entries[-1][0] -= take
+                    need -= take
+                    reversed_qty += take
+                    reversed_cost += take * open_entries[-1][1]
+                    if open_entries[-1][0] <= 0:
+                        open_entries.pop()
+                unmatched += need   # unwound more than was ever entered
+            else:
+                exits.append((qty, price))
+        in_qty = sum((q for q, _ in open_entries), Decimal(0)) - unmatched
+        in_cost = sum((q * p for q, p in open_entries), Decimal(0))
         out_qty = sum((q for q, _ in exits), Decimal(0))
         out_cost = sum((q * p for q, p in exits), Decimal(0))
         # Short leg: sold at the entry price, bought back at the unwind price.
         unwind_pnl = reversed_cost - unwind_cost if venue == "aster" else (
             unwind_cost - reversed_cost
         )
+        kept_qty = sum((q for q, _ in open_entries), Decimal(0))
         return {
-            "entry_avg": in_cost / in_qty if in_qty > 0 else None,
+            "entry_avg": in_cost / kept_qty if kept_qty > 0 else None,
             "exit_avg": out_cost / out_qty if out_qty > 0 else None,
             "qty": in_qty - out_qty,
             "fees": fees,

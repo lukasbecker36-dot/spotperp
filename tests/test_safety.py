@@ -1681,3 +1681,47 @@ def test_recompute_from_fills_rebuilds_averages_after_a_correction(engine):
     assert after.perp_exit_avg == Decimal(95)
     assert after.fees_usd == Decimal("0.3")     # 0.1 entry + corrected 0.2
     assert after.perp_qty == 0
+
+
+async def test_recompute_repairs_a_stored_average(engine):
+    """Averages are folded in as fills arrive, so a position written by an
+    older, wrong derivation keeps that answer until the next fill lands.
+    /recompute replays the fills over it."""
+    pos = engine.positions.create("BTCUSDT", Decimal(1000), paper=True)
+    engine.positions.record_fill(
+        pos.id, "aster", "entry", "SELL", Decimal(100), Decimal("100.30"),
+        Decimal(0), "a",
+    )
+    engine.positions.record_fill(
+        pos.id, "mexc", "entry", "BUY", Decimal(100), Decimal("100.00"),
+        Decimal(0), "m",
+    )
+    # Corrupt the stored average the way the old derivation would have.
+    engine.conn.execute(
+        "UPDATE positions SET perp_entry_avg='95.0' WHERE id=?", (pos.id,)
+    )
+    engine.conn.commit()
+    out = await engine._cmd_recompute({"position_id": str(pos.id)})
+    assert engine.positions.get(pos.id).perp_entry_avg == Decimal("100.30")
+    assert "entry basis" in out and "+30.0bps" in out
+    # The corrected basis is written back, so /positions agrees with it.
+    row = engine.conn.execute(
+        "SELECT entry_basis_bps FROM positions WHERE id=?", (pos.id,)
+    ).fetchone()
+    assert abs(Decimal(row["entry_basis_bps"]) - Decimal(30)) < Decimal("0.01")
+
+
+async def test_recompute_does_not_book_pnl_on_an_open_position(engine):
+    """Realised P&L on a trade that has not finished would be a fiction."""
+    pos = engine.positions.create("BTCUSDT", Decimal(1000), paper=True)
+    engine.positions.record_fill(
+        pos.id, "aster", "entry", "SELL", Decimal(100), Decimal("100.30"),
+        Decimal(0), "a",
+    )
+    engine.positions.record_fill(
+        pos.id, "mexc", "entry", "BUY", Decimal(100), Decimal("100.00"),
+        Decimal(0), "m",
+    )
+    engine.positions.set_state(pos.id, pm.OPEN)
+    await engine._cmd_recompute({"position_id": str(pos.id)})
+    assert engine.positions.get(pos.id).realized_pnl_usd is None
