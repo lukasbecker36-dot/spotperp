@@ -365,6 +365,10 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
         and r.perp_volume_24h >= config.SCREEN_FILL_MIN_VOLUME_USD
         and r.hours_tradeable_24h >= config.SCREEN_FILL_MIN_HOURS
+        # Funding is the carry you collect while working the round trip. A
+        # negative rate means the short PAYS to wait, so time stops being on
+        # your side — the opposite of what this screen is selecting for.
+        and r.funding_8h_bps >= config.SCREEN_FILL_MIN_FUNDING_BPS
         and not _too_jittery(r)
         and not _bad_index(r)
         # Enterable RIGHT NOW. Dwell says a name is reliably workable, but a

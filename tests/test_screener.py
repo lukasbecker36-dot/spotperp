@@ -745,3 +745,37 @@ def test_compute_row_measures_index_divergence_through_the_multiplier():
         pair, aster, mexc, None, now_ms=now, index_price=Decimal("12.0")
     )
     assert row.index_divergence_bps > 1800          # ~19% apart -> mis-mapped
+
+
+def test_fillability_drops_negative_funding(monkeypatch):
+    """Shorting the perp is the premium trade and a positive rate means the
+    short RECEIVES. A negative rate makes the wait a cost — you pay to hold
+    while the basis converges — which is the opposite of the setup this screen
+    selects for."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_NET_SWING_BPS", 5.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_FUNDING_BPS", 0.0)
+    paying = _fill_row("PAYSYOU", 60.0, 20, 1_000_000)
+    costing = _fill_row("COSTSYOU", 90.0, 22, 5_000_000)
+    paying.funding_8h_bps = 4.0
+    costing.funding_8h_bps = -11.0        # a better basis, but time is against you
+    assert [r.symbol for r in screener.rank_rows_by_fillability(
+        [paying, costing]
+    )] == ["PAYSYOU"]
+
+
+def test_fillability_keeps_zero_funding(monkeypatch):
+    """The floor is 'not a cost', not 'must pay' — a flat rate still qualifies,
+    and the knob is there to demand more."""
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_NET_SWING_BPS", 5.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_FUNDING_BPS", 0.0)
+    flat = _fill_row("FLAT", 60.0, 20, 1_000_000)
+    flat.funding_8h_bps = 0.0
+    assert [r.symbol for r in screener.rank_rows_by_fillability([flat])] == ["FLAT"]
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_FUNDING_BPS", 5.0)
+    assert screener.rank_rows_by_fillability([flat]) == []

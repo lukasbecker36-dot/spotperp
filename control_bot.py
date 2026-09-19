@@ -501,7 +501,8 @@ class ControlBot:
                 "no fillable candidates — needs 24h perp volume >= "
                 f"${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f} and the basis workable"
                 f" for >= {config.SCREEN_FILL_MIN_HOURS:.0f}h of the last 24"
-                f" (best right now: {best_hrs:.0f}h)."
+                f" (best right now: {best_hrs:.0f}h), and funding at or above"
+            f" {config.SCREEN_FILL_MIN_FUNDING_BPS:+.0f}bps/8h."
                 " If you just deployed, give it a slow scan — the dwell hours"
                 " build from the seeded basis history."
             )
@@ -516,7 +517,7 @@ class ControlBot:
             return f"{v:.0f}"
 
         hdr = (f"{'symbol':<11}{'score':>6}{'entry':>6}{'lo24':>7}{'net':>7}"
-               f"{'hrs':>4}{'tr/h':>6}{'jit':>5}{'$clip':>6}")
+               f"{'fund':>6}{'hrs':>4}{'tr/h':>6}{'jit':>5}{'$clip':>6}")
         sep = "-" * len(hdr)
         lines = [f"fillability screen ({age_s:.0f}s old)", hdr, sep]
         for r in rows:
@@ -538,7 +539,7 @@ class ControlBot:
                     if lo > config.SCREEN_FILL_FLAG_LO_BPS else f"{lo:>7.1f}")
             lines.append(
                 f"{_pad(r['symbol'], 11)}{score:>+6.1f}{entry_avg:>6.1f}{lo_s}"
-                f"{net:>+7.1f}"
+                f"{net:>+7.1f}{r.get('funding_8h_bps', 0.0):>+6.1f}"
                 f"{r.get('hours_tradeable_24h', 0):>4.0f}"
                 f"{r.get('perp_trades_24h', 0) / 24.0:>6.1f}{jit_s}"
                 f"{net * r['max_notional_usd'] / 10000.0:>6.1f}"
@@ -577,6 +578,12 @@ class ControlBot:
             " worth. It UNDERSTATES a name you work over time — STONK shows ~$8"
             " at the touch yet fills $42-99 clips — so read it with hrs, which"
             " is what such a name actually trades on."
+        )
+        lines.append(
+            "fund = 8h-equivalent funding; + means the SHORT receives, so it"
+            " pays you to wait while the round trip works. Rows below"
+            f" {config.SCREEN_FILL_MIN_FUNDING_BPS:+.0f} are dropped: a"
+            " negative rate makes the wait a cost and takes time off your side."
         )
         lines.append(
             f"jit = mean bps the basis moves BETWEEN 5m samples. A smooth drift"

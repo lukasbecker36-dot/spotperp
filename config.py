@@ -111,6 +111,14 @@ SCREEN_FILL_TARGET_CHANCES = float(
 # may be structurally rich rather than mean-reverting (BASECAT: 149 entry, 24h
 # low +100.6).
 SCREEN_FILL_FLAG_LO_BPS = float(os.environ.get("SCREEN_FILL_FLAG_LO_BPS", "25"))
+# Shorting the perp is the premium trade, and a positive rate means the short
+# RECEIVES. A negative rate turns the wait into a cost: you are paying to hold
+# the position while the basis converges, which is the opposite of the setup
+# /screen fill is looking for. Drop those rows. Raise this to demand the carry
+# actually pays for the hold rather than merely not costing.
+SCREEN_FILL_MIN_FUNDING_BPS = float(
+    os.environ.get("SCREEN_FILL_MIN_FUNDING_BPS", "0")
+)
 # A quoted basis is only believable if the two books are close enough together
 # to transact against. spread_cost_bps = entry_bps - close_bps is exactly what
 # crossing both books costs right now, so a huge value means the quotes are far
