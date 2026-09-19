@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from decimal import Decimal
 
+import config
 import intents
 import position_manager as pm
 from database import journal
@@ -67,18 +68,19 @@ async def reconcile(
                     f" executed={final.executed_qty}",
                     "WARN",
                 )
-                if final.executed_qty > 0:
-                    await notifier.alert(
-                        f"⚠️ recovery: stale order {order.order_id} on {symbol} had"
-                        f" fills ({final.executed_qty}) — check position vs venue"
-                    )
+                await _book_late_fill(
+                    conn, positions, notifier, "aster", final,
+                    order.client_order_id,
+                )
 
     # 2. reconcile the intent journal against the venue by client-order-id
     #    (not just a blind 'failed'), so an order that DID land after a crash is
     #    found and cancelled/surfaced rather than becoming a silent orphan on a
     #    symbol the sweep above didn't cover (e.g. a position recovery cancels).
     for row in unresolved:
-        await _reconcile_intent(conn, aster, mexc, notifier, row, paper=paper)
+        await _reconcile_intent(
+            conn, aster, mexc, notifier, row, paper=paper, positions=positions
+        )
 
     # 3. state fix-ups
     for pos in active:
@@ -98,8 +100,68 @@ async def reconcile(
         await _compare_with_venues(conn, positions, aster, mexc, notifier)
 
 
+
+
+async def _book_late_fill(
+    conn, positions: pm.PositionManager, notifier: Notifier,
+    venue: str, order, client_id: str,
+) -> bool:
+    """Record what a resting order of ours executed while we were not running.
+
+    A restart during a working entry or exit leaves a maker order on the venue.
+    It may have filled — wholly or partly — in the gap. Cancelling it and
+    merely ALERTING leaves the DB holding a perp leg the venue no longer has,
+    and the hedge guard then reads that gap as an ADL and force-sells the spot
+    in tranches (position 191).
+
+    Only the DELTA is booked: the executor records fills incrementally as it
+    polls, so part of this order may already be in the table under the same
+    venue order id.
+    """
+    parsed = intents.parse_client_order_id(client_id)
+    if parsed is None or order.executed_qty <= 0:
+        return False
+    position_id, phase = parsed
+    try:
+        positions.get(position_id)
+    except KeyError:
+        return False
+    already = positions.recorded_qty_for_order(position_id, order.order_id)
+    delta = order.executed_qty - already
+    if delta <= 0:
+        return False      # the executor had already booked it all
+    price = order.avg_price if order.avg_price > 0 else order.price
+    if price <= 0:
+        await notifier.alert(
+            f"⚠️ recovery: order {client_id} executed {delta} but reported no"
+            f" price — book it manually, the position is out of sync"
+        )
+        return False
+    # These are our GTX maker legs, so the maker rate is the right estimate.
+    # /truefill can replace it with the venue's own figure if it matters.
+    rate = config.ASTER_MAKER_FEE if venue == "aster" else config.MEXC_MAKER_FEE
+    positions.record_fill(
+        position_id, venue, phase, order.side, delta, price,
+        delta * price * rate, order_id=order.order_id,
+    )
+    journal(
+        conn,
+        f"recovery: booked late fill {delta} @ {price} on {order.symbol}"
+        f" ({client_id}) into position {position_id} {phase}",
+        "WARN",
+    )
+    await notifier.alert(
+        f"⚠️ recovery: {client_id} filled {delta} @ {price} while the engine"
+        f" was down — booked into position {position_id} so the DB matches the"
+        f" venue. The other leg of that increment is NOT hedged; the resumed"
+        f" exit (or /exit) will square it."
+    )
+    return True
+
+
 async def _reconcile_intent(
-    conn, aster, mexc, notifier, row, *, paper: bool
+    conn, aster, mexc, notifier, row, *, paper: bool,
+    positions: pm.PositionManager | None = None,
 ) -> None:
     """Query the venue for an unresolved intent's order by client id and act:
     cancel it if it's still resting, alert if it filled, mark reconciled either
@@ -133,11 +195,15 @@ async def _reconcile_intent(
         journal(conn, f"recovery: cancelled orphan order {client_id} on {symbol}"
                 f" (executed={order.executed_qty})", "WARN")
     if order.executed_qty > 0:
-        await notifier.alert(
-            f"⚠️ recovery: intent order {client_id} on {symbol} had fills"
-            f" ({order.executed_qty} @ {order.avg_price}) — verify the position"
-            f" vs venue and /adopt if needed"
+        booked = positions is not None and await _book_late_fill(
+            conn, positions, notifier, row["venue"], order, client_id
         )
+        if not booked:
+            await notifier.alert(
+                f"⚠️ recovery: intent order {client_id} on {symbol} had fills"
+                f" ({order.executed_qty} @ {order.avg_price}) that could not be"
+                f" attributed — verify the position vs venue and /adopt if needed"
+            )
     intents.resolve_intent(conn, row["id"], "reconciled", order.raw)
 
 

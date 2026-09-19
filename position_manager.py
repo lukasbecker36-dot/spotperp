@@ -314,6 +314,18 @@ class PositionManager:
         )
         self._conn.commit()
 
+    def recorded_qty_for_order(self, position_id: int, order_id: str) -> Decimal:
+        """How much of a venue order this position has already booked.
+
+        The executor records a resting order's fills incrementally as it polls,
+        so a crash can leave PART of an order recorded. Recovery needs the
+        delta, not the total, or it double-counts what was already there."""
+        rows = self._conn.execute(
+            "SELECT qty FROM fills WHERE position_id=? AND order_id=?",
+            (position_id, str(order_id)),
+        ).fetchall()
+        return sum((Decimal(r["qty"]) for r in rows), Decimal(0))
+
     def recompute_from_fills(self, position_id: int) -> None:
         """Rebuild qty, averages and fees for both legs from the fills table.
 

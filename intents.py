@@ -65,3 +65,25 @@ def make_client_order_id(position_id: int, leg: str) -> str:
     Aster allows ^[.A-Z:/a-z0-9_-]{1,36}$, MEXC similar; keep it short.
     """
     return f"sp_{leg}_{position_id}_{int(time.time())}"
+
+
+_LEG_PHASE = {"pent": "entry", "pext": "exit", "stop": "exit"}
+
+
+def parse_client_order_id(client_id: str) -> tuple[int, str] | None:
+    """(position_id, phase) encoded in one of our client ids, or None.
+
+    Lets recovery attribute a fill back to its position when the in-memory
+    task that placed the order is gone — after a restart the client id is the
+    only link left between a venue order and the position it belongs to.
+    """
+    parts = (client_id or "").split("_")
+    if len(parts) < 4 or parts[0] != "sp":
+        return None
+    phase = _LEG_PHASE.get(parts[1])
+    if phase is None:
+        return None
+    try:
+        return int(parts[2]), phase
+    except ValueError:
+        return None

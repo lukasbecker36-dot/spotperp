@@ -8,12 +8,16 @@ import recovery
 
 
 class _Order:
-    def __init__(self, oid, cid, executed=Decimal(0), status="NEW"):
+    def __init__(self, oid, cid, executed=Decimal(0), status="NEW",
+                 side="BUY", avg_price=Decimal(0), symbol="BEATUSDT"):
         self.order_id = oid
         self.client_order_id = cid
         self.executed_qty = executed
         self.status = status
-        self.avg_price = Decimal(0)
+        self.side = side
+        self.price = avg_price
+        self.avg_price = avg_price
+        self.symbol = symbol
         self.raw = {}
 
     @property
@@ -32,6 +36,12 @@ class _Aster:
 
     async def cancel_order(self, symbol, order_id):
         self.cancelled.append(order_id)
+        # The venue reports what the order had executed by the time it was
+        # pulled; default to the stub's own figure so a test can set it.
+        orig = next((o for o in self._orders if o.order_id == order_id), None)
+        if orig is not None:
+            return _Order(order_id, orig.client_order_id, orig.executed_qty,
+                          "CANCELED", orig.side, orig.avg_price)
         return _Order(order_id, "", Decimal(0))
 
     async def get_order_by_client_id(self, symbol, client_order_id):
@@ -112,4 +122,77 @@ async def test_recovery_marks_never_landed_intent_failed(tmp_path):
         "SELECT status, result FROM intents WHERE position_id=6"
     ).fetchone()
     assert row["status"] == "failed" and "never landed" in row["result"]
+    conn.close()
+
+
+async def test_recovery_books_a_late_fill_on_a_swept_order(tmp_path):
+    """Position 191: a restart mid-exit left our perp buy-back resting on
+    Aster. It filled in the gap. Recovery cancelled it and only ALERTED, so the
+    DB kept a perp leg the venue no longer had — and the hedge guard later read
+    that gap as an ADL and force-sold the spot in 10% tranches."""
+    conn = database.init_db(tmp_path / "t.db")
+    positions = pm.PositionManager(conn)
+    pos = positions.create("BEATUSDT", Decimal(100), paper=False)
+    positions.record_fill(
+        pos.id, "aster", "entry", "SELL", Decimal(5000), Decimal("0.01"),
+        Decimal(0), order_id="E1",
+    )
+    positions.set_state(pos.id, pm.OPEN)
+    aster = _Aster([
+        _Order("9", f"sp_pext_{pos.id}_1", Decimal(2700), "PARTIALLY_FILLED",
+               side="BUY", avg_price=Decimal("0.011")),
+    ])
+    notifier = _Notifier()
+    await recovery.reconcile(conn, positions, aster, _Mexc(), notifier,
+                             paper=False)
+    after = positions.get(pos.id)
+    assert after.perp_qty == Decimal(2300)          # 5000 - 2700, matches venue
+    assert after.perp_exit_avg == Decimal("0.011")
+    assert any("booked into position" in m for m in notifier.messages)
+    conn.close()
+
+
+async def test_recovery_books_only_the_unrecorded_delta(tmp_path):
+    """The executor records a resting order's fills incrementally as it polls,
+    so a crash can leave PART of an order already in the table. Booking the
+    whole executed quantity again would double-count it."""
+    conn = database.init_db(tmp_path / "t.db")
+    positions = pm.PositionManager(conn)
+    pos = positions.create("BEATUSDT", Decimal(100), paper=False)
+    positions.record_fill(
+        pos.id, "aster", "entry", "SELL", Decimal(5000), Decimal("0.01"),
+        Decimal(0), order_id="E1",
+    )
+    # 1000 of the 2700 was already polled in before the crash, same order id.
+    positions.record_fill(
+        pos.id, "aster", "exit", "BUY", Decimal(1000), Decimal("0.011"),
+        Decimal(0), order_id="9",
+    )
+    positions.set_state(pos.id, pm.OPEN)
+    aster = _Aster([
+        _Order("9", f"sp_pext_{pos.id}_1", Decimal(2700), "PARTIALLY_FILLED",
+               side="BUY", avg_price=Decimal("0.011")),
+    ])
+    await recovery.reconcile(conn, positions, aster, _Mexc(), _Notifier(),
+                             paper=False)
+    assert positions.get(pos.id).perp_qty == Decimal(2300)   # not 1300
+    conn.close()
+
+
+async def test_recovery_ignores_a_fill_it_cannot_attribute(tmp_path):
+    """A manual order carries no position in its client id. It must be reported,
+    never guessed into someone's position."""
+    conn = database.init_db(tmp_path / "t.db")
+    positions = pm.PositionManager(conn)
+    pos = positions.create("BEATUSDT", Decimal(100), paper=False)
+    positions.record_fill(
+        pos.id, "aster", "entry", "SELL", Decimal(5000), Decimal("0.01"),
+        Decimal(0), order_id="E1",
+    )
+    positions.set_state(pos.id, pm.OPEN)
+    aster = _Aster([_Order("9", "someManualOrder", Decimal(2700))])
+    await recovery.reconcile(conn, positions, aster, _Mexc(), _Notifier(),
+                             paper=False)
+    assert positions.get(pos.id).perp_qty == Decimal(5000)   # untouched
+    assert aster.cancelled == []                             # and not cancelled
     conn.close()
