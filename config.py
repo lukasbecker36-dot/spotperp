@@ -38,7 +38,22 @@ EXIT_FEE_AGGRESSIVE = ASTER_TAKER_FEE + MEXC_TAKER_FEE
 # ── Screener ──
 SCREENER_TOP_N = 15                      # rows kept in the snapshot
 SCREENER_MIN_NET_EDGE_BPS = Decimal("0") # show rows above this net edge
-SLIPPAGE_BUFFER_BPS = Decimal("2.0")     # haircut for taker slippage per round trip
+# Slippage allowance per ROUND TRIP, on top of fees, in the cost floor.
+#
+# 15, not the 2 this carried for months. Measured on real fills against the
+# quotes showing while each order rested (scripts/adverse_selection.py, 612
+# entry and 481 exit clips): entry gives up a median 6.0bps versus the board,
+# exit 9.7, so a complete trade pays 15.6.
+#
+# The labelled dataset agrees independently, from prices rather than fills:
+# holding 72h from a candidate whose net edge was 0-10bps returned a median
+# +8.0 against a floor that budgeted 2 — i.e. it was losing money once the
+# real 15.6 is charged. Break-even sits near net 10-15, not near 0.
+#
+# This roughly doubles ENTRY_MIN_EDGE_FLOOR_BPS (12 -> 25) and will visibly
+# thin the screens. That is the intent: the rows it removes were not paying.
+# Overstating costs misses trades, understating them takes losing ones.
+SLIPPAGE_BUFFER_BPS = Decimal(os.environ.get("SLIPPAGE_BUFFER_BPS", "15.0"))
 QUOTE_STALE_SECONDS = 10                 # ignore quotes older than this
 MIN_DEPTH_NOTIONAL_USD = Decimal("200")  # min top-of-book notional on both sides
 # Depth floor for the SCREENS only (nothing in execution reads this). Kept far
@@ -349,18 +364,32 @@ ENTRY_DEPTH_LEVELS = int(os.environ.get("ENTRY_DEPTH_LEVELS", "50"))
 # most one clip, then edge_ok goes false and the remainder never rests. None
 # Cap each resting maker clip so a single taker sweep catches at most this
 # notional before the next tick re-checks the (possibly collapsed) basis and
-# stops resting — bounding the adverse-selection blast radius. Default $100
-# chunks entries into small clips; set to a large value / env-empty behaviour
-# to rest the full size at once. Lower = safer on thin names, more clips.
+# stops resting — bounding the adverse-selection blast radius. Set to a large
+# value to rest the full size at once. Lower = safer on thin names, more clips.
+#
+# $50 rather than $100, measured over 612 real entry clips against the quotes
+# that were showing while the order rested (scripts/adverse_selection.py):
+#
+#   clip <$18   slippage  2.3 bps      clip $50-99   slippage  4.4
+#   clip $18-50 slippage  3.8 bps      clip >=$99    slippage 12.6
+#
+# The jump at the cap is walking the book, not thin books: the executor
+# already caps a clip to the depth that supports it, so the LARGE clips are
+# the ones on deep books and they still slip three times as much. Halving the
+# cap is worth ~8bps an entry against a median quoted edge of 40.
 ENTRY_MAX_CLIP_NOTIONAL_USD: Decimal | None = (
     Decimal(os.environ["ENTRY_MAX_CLIP_NOTIONAL_USD"])
-    if os.environ.get("ENTRY_MAX_CLIP_NOTIONAL_USD") else Decimal("100")
+    if os.environ.get("ENTRY_MAX_CLIP_NOTIONAL_USD") else Decimal("50")
 )
 # Same idea for a PASSIVE exit: cap each resting perp buy-back clip. A resting
 # maker is sized to the spot bid depth AT PLACEMENT, but it fills later — by
 # which time that bid may be gone, so a big resting clip can be swept while the
 # reactive spot sell walks a thinned book (leg desync). Small clips bound how
 # much perp a single sweep can close before the next tick re-reads spot depth.
+#
+# Left at $100 deliberately: unlike entries, measured exit slippage is FLAT
+# across clip size (9.9 / 9.7 / 12.2 / 8.3 bps from the smallest quartile to
+# the largest), so there is nothing to buy by halving it here.
 EXIT_MAX_CLIP_NOTIONAL_USD: Decimal | None = (
     Decimal(os.environ["EXIT_MAX_CLIP_NOTIONAL_USD"])
     if os.environ.get("EXIT_MAX_CLIP_NOTIONAL_USD") else Decimal("100")

@@ -371,6 +371,9 @@ def test_fillability_excludes_one_tick_spikes(monkeypatch):
     maker order."""
     monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 250_000.0)
     monkeypatch.setattr(config, "SCREEN_FILL_MIN_HOURS", 4.0)
+    # Pin the floor: this test is about dwell, not about where the cost floor
+    # happens to sit (it moved from 12 to 25 when slippage was measured).
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
     rows = [
         _fill_row("SPIKE", 300.0, 1, 5_000_000),
         _fill_row("SUSTAINED", 25.0, 12, 500_000),
@@ -485,17 +488,24 @@ def _score_row(symbol, entry, lo, hours_tradeable, trades, jitter=0.0):
     return r
 
 
-def test_fill_score_haircuts_the_quoted_basis_by_its_jitter(monkeypatch):
-    """A resting order is adverse-selected, so the quoted basis overstates what
-    it locks by roughly how far the basis travels between samples. Two rows with
-    identical net edge and identical flow must not score the same when one
-    flickers 18bps between samples and the other 1bps."""
+def test_fill_score_does_not_haircut_by_jitter(monkeypatch):
+    """This used to subtract the full jitter as an adverse-selection cost,
+    inferred from a single position. Measured on 612 entry and 481 exit clips
+    it does not hold: entry slippage is flat in jitter and scales with clip
+    size, and exit slippage inverts (the jitteriest quartile locked 6.3bps
+    BETTER than quoted). The cost is charged once in the floor instead."""
     monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
     monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
     steady = _score_row("STEADY", 60.0, 0.0, 20, 24_000, jitter=1.0)
     flicker = _score_row("FLICKER", 60.0, 0.0, 20, 24_000, jitter=18.0)
-    assert screener.fill_score(steady) == pytest.approx(48.0 - 1.0)
-    assert screener.fill_score(flicker) == pytest.approx(48.0 - 18.0)
+    assert screener.fill_score(steady) == pytest.approx(48.0)
+    assert screener.fill_score(flicker) == pytest.approx(48.0)
+    # ...but the extremes are still DROPPED. That gate is about whether a
+    # position can be worked at all, which is a different claim.
+    monkeypatch.setattr(config, "SCREEN_MAX_BASIS_JITTER_BPS", 25.0)
+    wild = _score_row("WILD", 60.0, 0.0, 20, 24_000, jitter=60.0)
+    wild.samples = 10          # the gate needs 3+ samples to judge at all
+    assert screener._too_jittery(wild)
 
 
 def test_fill_score_scales_down_thin_flow_but_saturates(monkeypatch):
@@ -628,8 +638,8 @@ def test_carry_score_adds_a_one_off_basis_to_a_funding_stream(monkeypatch):
     monkeypatch.setattr(config, "FUNDING_SCORE_HOLD_HOURS", 24.0)
     monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
     r = _carry_row("X", entry=32.6, lo=-47.8, jitter=10.9)
-    # one-off (32.6 + 47.8 - 10.9 - 12) = 57.5, stream 11.3 x 3 = 33.9
-    assert screener.carry_score(r, 11.3, 15.6) == pytest.approx(91.4)
+    # one-off (32.6 + 47.8 - 12) = 68.4, stream 11.3 x 3 = 33.9
+    assert screener.carry_score(r, 11.3, 15.6) == pytest.approx(102.3)
 
 
 def test_carry_score_takes_the_lower_of_average_and_latest_funding(monkeypatch):
@@ -647,19 +657,17 @@ def test_carry_score_takes_the_lower_of_average_and_latest_funding(monkeypatch):
     assert spiking == pytest.approx(10.6 * 3)
 
 
-def test_carry_score_haircuts_the_basis_but_not_the_funding(monkeypatch):
-    """A resting order fills on the bad side of the basis, but funding accrues
-    at the same rate whatever price you got in at. Jitter must not scale the
-    stream, or a steady book would look like it earned more funding."""
+def test_carry_score_does_not_haircut_by_jitter(monkeypatch):
+    """Same finding as fill_score: jitter does not predict slippage, and the
+    execution cost it stood for is charged in the floor now."""
     monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
     monkeypatch.setattr(config, "FUNDING_SCORE_HOLD_HOURS", 24.0)
     monkeypatch.setattr(config, "SCREEN_FILL_TARGET_CHANCES", 500.0)
     steady = _carry_row("STEADY", entry=40.0, lo=0.0, jitter=1.0)
     rough = _carry_row("ROUGH", entry=40.0, lo=0.0, jitter=11.0)
-    assert (
-        screener.carry_score(steady, 10.0, 10.0)
-        - screener.carry_score(rough, 10.0, 10.0)
-    ) == pytest.approx(10.0)
+    assert screener.carry_score(steady, 10.0, 10.0) == pytest.approx(
+        screener.carry_score(rough, 10.0, 10.0)
+    )
 
 
 def test_carry_score_demotes_a_basis_below_its_own_24h_low(monkeypatch):

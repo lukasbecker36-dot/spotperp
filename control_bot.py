@@ -611,6 +611,12 @@ class ControlBot:
             " side."
         )
         lines.append(
+            "score no longer subtracts jit. Measured over 612 entry and 481"
+            " exit clips, slippage is flat in jitter and scales with CLIP SIZE"
+            " instead — and on exits the jitteriest quartile locked BETTER"
+            " than quoted. The cost is charged in the floor now."
+        )
+        lines.append(
             f"jit = mean bps the basis moves BETWEEN 5m samples. A smooth drift"
             f" scores low; flicker scores high. Rows above"
             f" {config.SCREEN_MAX_BASIS_JITTER_BPS:.0f} are dropped as"
@@ -688,19 +694,18 @@ class ControlBot:
         lines.append(
             f"score = bps from entering now and holding"
             f" {config.FUNDING_SCORE_HOLD_HOURS:.0f}h:"
-            f" (entry - lo24 - jit - {floor:.0f}bps cost) + carry/h x"
+            f" (entry - lo24 - {floor:.0f}bps cost) + carry/h x"
             f" {config.FUNDING_SCORE_HOLD_HOURS:.0f}. The basis is a"
             " ONE-OFF you capture once; funding is a STREAM. This is the whole"
             " board in one number — read the columns only to see WHY."
         )
         lines.append(
             "carry is the LOWER of 24h and fund, so a collapsed carry cannot"
-            " flatter a row on its average. jit is taken off the basis half"
-            " only (funding accrues whatever price you got in at). Not weighted"
-            " by depth — that is sizing, read depth$."
-            " '*' = under 3 samples, so no jitter haircut was applied yet"
-            " (normal for a few minutes after a restart) — treat it as an"
-            " upper bound."
+            " flatter a row on its average. The cost figure carries the"
+            " measured slippage, so execution is charged once, in the floor."
+            " Not weighted by depth — that is sizing, read depth$."
+            " '*' = under 3 samples, so jit is not yet measurable (normal for"
+            " a few minutes after a restart)."
         )
         lines.append(
             "all funding in bps per HOUR — comparable across contracts"
@@ -720,8 +725,9 @@ class ControlBot:
             " those two are the live basis, not a range."
         )
         lines.append(
-            "jit = mean bps the basis moves between 5m samples; a resting order"
-            " fills on the bad side of that, so it is the haircut on `entry`."
+            "jit = mean bps the basis moves between 5m samples. Shown because"
+            " an extreme is hard to work, NOT as a cost: measured on real"
+            " fills it does not predict slippage either way."
         )
         hid = snap.get("hidden") or {}
         if hid:

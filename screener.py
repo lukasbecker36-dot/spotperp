@@ -398,17 +398,33 @@ def _fill_chances(row: ScreenerRow) -> float:
 def fill_score(row: ScreenerRow) -> float:
     """One number for "how good is this trade", in bps.
 
-        (net - jitter) x min(1, chances / SCREEN_FILL_TARGET_CHANCES)
+        net x min(1, chances / SCREEN_FILL_TARGET_CHANCES)
 
-    net      what the round trip is worth after round-trip costs.
-    -jitter  the QUOTED basis overstates what you realise by roughly how far
-             the basis travels between samples: a resting order is adverse-
-             selected, so it fills on the bad side of that movement (STONK #186
-             quoted +121bps across its clips and locked +58.8). Subtracting the
-             whole jitter is the conservative reading.
+    net      what the round trip is worth after round-trip costs. Those costs
+             now carry the measured slippage (SLIPPAGE_BUFFER_BPS), so the
+             execution haircut is charged once, in the floor, for every screen.
     xfactor  saturating fill probability. Below the target a resting order may
              never be lifted; above it, extra flow adds nothing to a single
              round trip.
+
+    No jitter term. This used to subtract the full 5m jitter, on the theory
+    that a resting order fills on the bad side of a moving basis — inferred
+    from one position (STONK #186: quoted +121 across its clips, locked
+    +58.8). Measured on 612 entry and 481 exit clips it does not hold:
+
+      * entry slippage is flat in jitter (5.0 / 7.5 / 7.4 / 1.4 bps across the
+        quartiles) and scales with CLIP SIZE instead;
+      * exit slippage inverts — the jitteriest quartile locked 6.3bps BETTER
+        than quoted, because a resting exit catches more dips on a basis that
+        moves;
+      * holding net edge fixed, jitter carries no information about what the
+        basis does next (med hold 17.1 -> 13.3 across the jitter range in the
+        10-20 band, flat in the 20-40 band).
+
+    So the haircut under-charged steady names and docked jittery ones up to
+    25bps for a cost they were not paying. _too_jittery still drops the
+    extremes: that gate is about whether a position can be WORKED, which is a
+    different claim and untested either way.
 
     Deliberately NOT multiplied by depth. Top-of-book depth understates exactly
     the names worth trading here (STONK shows ~$8 at the touch yet fills $42-99
@@ -423,7 +439,7 @@ def fill_score(row: ScreenerRow) -> float:
     factor = min(
         1.0, _fill_chances(row) / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0)
     )
-    return (net - row.entry_bps_jitter) * factor
+    return net * factor
 
 
 def carry_score(
@@ -432,7 +448,7 @@ def carry_score(
     """One number for a /funding row, in bps: what entering NOW and holding for
     FUNDING_SCORE_HOLD_HOURS is worth.
 
-        (entry - lo24 - jit - floor) + carry x hold/8
+        (entry - lo24 - floor) + carry x hold/8
 
     The two halves of a carry trade are in different units and the board made
     you convert between them by eye. The basis is a ONE-OFF — you capture
@@ -446,16 +462,16 @@ def carry_score(
     the two is wrong only when the carry is genuinely recovering, which costs
     you a missed entry rather than a bad one.
 
-    jit is subtracted from the BASIS half only: a resting order fills on the
-    bad side of the basis, but funding accrues at the same rate whatever price
-    you got in at.
+    No jitter term, for the reasons in fill_score: measured against real fills
+    it does not predict slippage, and the execution cost it stood for is now
+    charged in the floor via SLIPPAGE_BUFFER_BPS.
 
     As with fill_score, not weighted by depth — that is a sizing question, read
     depth$ — and scaled by a saturating fill factor, since an edge on a book
     with no takers is not an edge.
     """
     floor = float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
-    one_off = row.entry_bps_avg - row.basis_p10_24h - row.entry_bps_jitter - floor
+    one_off = row.entry_bps_avg - row.basis_p10_24h - floor
     carry = min(avg_8h_bps, current_8h_bps)
     stream = carry * config.FUNDING_SCORE_HOLD_HOURS / 8.0
     factor = min(
