@@ -431,7 +431,7 @@ class Engine:
             if row is not None:
                 self._basis_avg.add(sym, now, row.entry_bps, row.net_edge_bps)
                 self._basis_avg.annotate(row)
-                self._basis_24h.add(sym, now, row.entry_bps)
+                self._basis_24h.add(sym, now, row.entry_bps, row.close_bps)
                 self._basis_24h.annotate(row)
                 vol = self.md.perp_volume.get(pair.aster_symbol) or {}
                 row.perp_volume_24h = float(vol.get("quote_volume", 0) or 0)
@@ -1640,10 +1640,18 @@ class Engine:
                 "interval_hours": stat.interval_hours,
                 "next_funding_h": next_h,
             }
+        # The pair's own 24h range for BOTH sides. Entry and close are tracked
+        # separately rather than one derived from the other: the gap between
+        # them is the live spread of both books, which moves on its own.
+        _, hours_24h = self._basis_24h.stats(symbol)
         return book.format_book(
             symbol, pair.qty_multiplier, aster_depth, mexc_depth,
             funding=funding,
             volume=self.md.perp_volume.get(pair.aster_symbol),
+            entry_range=self._basis_24h.percentiles(symbol),
+            exit_range=self._basis_24h.percentiles(symbol, close=True),
+            range_hours=hours_24h,
+            range_min_hours=config.SCREEN_DIFF_MIN_HOURS,
         )
 
     async def _cmd_adopt(self, args: dict) -> str:

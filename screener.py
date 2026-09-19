@@ -476,15 +476,26 @@ class DailyBasis:
         # symbol -> {hour_epoch: [sum_bps, count]}
         self._buckets: dict[str, dict[int, list]] = defaultdict(dict)
 
-    def add(self, symbol: str, ts_ms: int, entry_bps: float) -> None:
+    def add(
+        self, symbol: str, ts_ms: int, entry_bps: float,
+        close_bps: float | None = None,
+    ) -> None:
+        """Bucket one sample. close_bps is optional so a caller that only has
+        the entry basis still works; those hours simply have no close range.
+        Tracked separately because the two are NOT a fixed offset apart — the
+        gap is the live spread of both books, which moves on its own."""
         hour = int(ts_ms) // 3_600_000
         b = self._buckets[symbol]
         slot = b.get(hour)
+        c = float(close_bps) if close_bps is not None else 0.0
+        n_c = 1 if close_bps is not None else 0
         if slot is None:
-            b[hour] = [float(entry_bps), 1]
+            b[hour] = [float(entry_bps), 1, c, n_c]
         else:
             slot[0] += float(entry_bps)
             slot[1] += 1
+            slot[2] += c
+            slot[3] += n_c
         # Prune relative to the NEWEST hour held, not the one just added: the
         # log seed replays historical rows, so an out-of-order add must never
         # widen the window past `hours`.
@@ -502,7 +513,7 @@ class DailyBasis:
             return None, 0.0
         return sum(v[0] for v in b.values()) / n, float(len(b))
 
-    def hourly_means(self, symbol: str) -> list[float]:
+    def hourly_means(self, symbol: str, close: bool = False) -> list[float]:
         """Mean entry basis for each hour held. Averaging within the hour is
         what makes the range usable: a pair whose quote merely FLICKERS (BULLA
         printed +-160bps inside a minute) collapses to near-identical hourly
@@ -511,6 +522,8 @@ class DailyBasis:
         b = self._buckets.get(symbol)
         if not b:
             return []
+        if close:
+            return [v[2] / v[3] for v in b.values() if v[3] > 0]
         return [v[0] / v[1] for v in b.values() if v[1] > 0]
 
     def hours_above(self, symbol: str, threshold: float) -> float:
@@ -525,11 +538,12 @@ class DailyBasis:
         return float(sum(1 for m in self.hourly_means(symbol) if m >= threshold))
 
     def percentiles(
-        self, symbol: str, lo: float = 10.0, hi: float = 90.0
+        self, symbol: str, lo: float = 10.0, hi: float = 90.0,
+        close: bool = False,
     ) -> tuple[float | None, float | None]:
         """(lo, hi) percentile of the hourly means — a robust 24h range. Uses
         percentiles rather than min/max so one odd hour can't define it."""
-        means = self.hourly_means(symbol)
+        means = self.hourly_means(symbol, close=close)
         if not means:
             return None, None
         return _percentile(means, lo), _percentile(means, hi)
@@ -580,12 +594,16 @@ def seed_daily_from_logs(daily: DailyBasis, now_ms: int, hours: int = 24) -> int
                     )
                 except KeyError:
                     continue
+                close_i = idx.get("close_bps")
                 for row in reader:
                     try:
                         ts = int(row[ts_i])
                         if ts < cutoff:
                             continue
-                        daily.add(row[sym_i], ts, float(row[entry_i]))
+                        close = (
+                            float(row[close_i]) if close_i is not None else None
+                        )
+                        daily.add(row[sym_i], ts, float(row[entry_i]), close)
                         seeded += 1
                     except (IndexError, ValueError):
                         continue   # malformed / partially-written line

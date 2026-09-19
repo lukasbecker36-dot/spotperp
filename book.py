@@ -44,9 +44,39 @@ def _block(title: str, asks, bids, div: Decimal) -> list[str]:
     return lines
 
 
+def _range_line(label: str, live: Decimal, lo, hi, thin: bool) -> str:
+    """One basis line with the pair's own 24h range beside the live figure, and
+    a word on where in that range the live figure sits.
+
+    The live number alone cannot say whether it is a good level: +32 means one
+    thing on a pair that ranged -48 to +1 today and another on one that ranged
+    +30 to +60. Outside the range is the interesting case and reads opposite
+    ways by side — above is a dislocation, below means the range is describing
+    a regime that has ended.
+    """
+    if lo is None or hi is None:
+        return f"{label} {float(live):+7.1f}bps"
+    mark = "?" if thin else ""
+    where = ""
+    if not thin:
+        if live > hi:
+            where = "  ABOVE 24h range"
+        elif live < lo:
+            where = "  BELOW 24h range"
+        elif hi > lo:
+            pct = (float(live) - lo) / (hi - lo) * 100
+            where = f"  {pct:.0f}% of range"
+    return (
+        f"{label} {float(live):+7.1f}bps   24h {lo:+.1f}{mark} to"
+        f" {hi:+.1f}{mark}{where}"
+    )
+
+
 def format_book(
     symbol: str, mult: Decimal, aster_depth: dict, mexc_depth: dict,
     levels: int = 5, funding: dict | None = None, volume: dict | None = None,
+    entry_range: tuple | None = None, exit_range: tuple | None = None,
+    range_hours: float = 0.0, range_min_hours: float = 6.0,
 ) -> str:
     a_asks = _levels(aster_depth.get("asks"), levels)
     a_bids = _levels(aster_depth.get("bids"), levels)
@@ -75,10 +105,30 @@ def format_book(
         exit_passive = (a_bid - m_bid) / m_bid * BPS   # perp maker bid / sell spot bid
         exit_taker = (a_ask - m_bid) / m_bid * BPS     # perp taker ask / sell spot bid
         lines.append("")
-        lines.append(f"entry basis  {float(entry):+7.1f}bps  (short perp ask / buy spot ask)")
-        lines.append(f"exit passive {float(exit_passive):+7.1f}bps  (perp maker bid / sell spot bid)")
-        lines.append(f"exit taker   {float(exit_taker):+7.1f}bps  (perp taker ask / sell spot bid)")
-        lines.append(f"  taker exit crosses the perp spread: {float(exit_taker - exit_passive):.1f}bps worse")
+        e_lo, e_hi = entry_range or (None, None)
+        x_lo, x_hi = exit_range or (None, None)
+        thin = range_hours < range_min_hours
+        lines.append(_range_line("entry basis ", entry, e_lo, e_hi, thin))
+        lines.append("  short perp ask / buy spot ask")
+        lines.append(_range_line("exit passive", exit_passive, x_lo, x_hi, thin))
+        lines.append("  perp maker bid / sell spot bid")
+        lines.append(f"exit taker   {float(exit_taker):+7.1f}bps")
+        lines.append(
+            "  perp taker ask / sell spot bid — crosses the perp spread:"
+            f" {float(exit_taker - exit_passive):.1f}bps worse"
+        )
+        if e_lo is not None and not thin:
+            lines.append(
+                f"  24h = p10/p90 of the HOURLY mean over {range_hours:.0f}h."
+                " The exit range is tracked separately, not the entry range"
+                " shifted — the gap between them is both books' live spread."
+            )
+        elif e_lo is not None:
+            lines.append(
+                f"  ? = only {range_hours:.0f}h of history"
+                f" (need {range_min_hours:.0f}h), so those bounds are the live"
+                " basis, not a range."
+            )
 
     if funding:
         cur = funding.get("current_8h_bps")

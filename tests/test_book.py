@@ -33,7 +33,7 @@ def test_format_book_shows_both_venues_and_basis():
 def test_format_book_taker_exit_worse_than_passive():
     out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC, levels=5)
     # taker exit crosses the perp spread -> strictly worse (higher) close basis
-    assert "taker exit crosses the perp spread" in out
+    assert "crosses the perp spread" in out and "bps worse" in out
 
 
 def test_format_book_shows_funding_when_provided():
@@ -87,3 +87,50 @@ def test_format_book_shows_perp_volume():
 def test_format_book_omits_volume_when_absent():
     out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC)
     assert "24h volume" not in out
+
+
+def test_format_book_shows_24h_range_for_entry_and_exit():
+    """The live basis alone cannot say whether it is a good level. +50 means one
+    thing on a pair that ranged -40 to +60 today and another on one that ranged
+    +48 to +52."""
+    out = book.format_book(
+        "BTCUSDT", Decimal(1), ASTER, MEXC,
+        entry_range=(-40.0, 60.0), exit_range=(-45.0, 55.0), range_hours=24.0,
+    )
+    assert "24h -40.0 to +60.0" in out       # entry side
+    assert "24h -45.0 to +55.0" in out       # exit side, tracked separately
+    assert "90% of range" in out             # entry +50 within -40..+60
+
+
+def test_format_book_flags_a_basis_outside_its_own_range():
+    """Above the range is a dislocation; below means the range describes a
+    regime that has ended. Both are the reason to look."""
+    above = book.format_book(
+        "BTCUSDT", Decimal(1), ASTER, MEXC,
+        entry_range=(-40.0, 10.0), exit_range=(-45.0, 5.0), range_hours=24.0,
+    )
+    below = book.format_book(
+        "BTCUSDT", Decimal(1), ASTER, MEXC,
+        entry_range=(80.0, 200.0), exit_range=(75.0, 195.0), range_hours=24.0,
+    )
+    assert "ABOVE 24h range" in above
+    assert "BELOW 24h range" in below
+
+
+def test_format_book_marks_a_range_with_too_little_history():
+    """DailyBasis falls back to the live basis when it has no history, which
+    would otherwise read as a genuine high and low."""
+    out = book.format_book(
+        "BTCUSDT", Decimal(1), ASTER, MEXC,
+        entry_range=(50.0, 50.0), exit_range=(50.1, 50.1), range_hours=2.0,
+        range_min_hours=6.0,
+    )
+    assert "?" in out and "only 2h of history" in out
+    assert "% of range" not in out           # no range claim on 2h of data
+
+
+def test_format_book_without_ranges_is_unchanged():
+    """/book must still work before the 24h window has been seeded."""
+    out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC)
+    assert "entry basis" in out and "+50.0bps" in out
+    assert "24h" not in out.split("funding")[0]
