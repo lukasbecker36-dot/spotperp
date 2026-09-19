@@ -482,6 +482,7 @@ class Engine:
         average carry, for the bot's /funding command."""
         now = int(time.time() * 1000)
         rows = []
+        hidden: dict[str, int] = {}
         for sym, stat in self.md.funding_stats.items():
             pair = self.md.pair_maps.get(sym)
             if pair is None:
@@ -503,6 +504,11 @@ class Engine:
                 if screen is not None:
                     self._basis_avg.annotate(screen)
                     self._basis_24h.annotate(screen)
+                    # The flow figures are set on the /screen path only; the
+                    # quality gate below needs them here too.
+                    vol = self.md.perp_volume.get(pair.aster_symbol) or {}
+                    screen.perp_volume_24h = float(vol.get("quote_volume", 0) or 0)
+                    screen.perp_trades_24h = float(vol.get("trades", 0) or 0)
             # Recompute the current rate from the 15s-fresh premiumIndex rather
             # than the 15-min stats sweep, so a new funding settlement shows up
             # promptly. (lastFundingRate only changes at each settlement, so
@@ -517,6 +523,15 @@ class Engine:
                 float((next_ms - now) / Decimal(3_600_000))
                 if next_ms and next_ms > 0 else None
             )
+            # Ranked by carry, but a carry you cannot actually enter is not a
+            # candidate — and the thin books this screen reaches produce the
+            # worst quote errors on the whole system. Hide them, and count
+            # them so /funding can say the screen is filtering rather than
+            # leaving the user wondering where a row went.
+            reject = screener.quote_reject_reason(screen) if screen else "book"
+            if reject:
+                hidden[reject] = hidden.get(reject, 0) + 1
+                continue
             rows.append({
                 "symbol": sym,
                 "interval_hours": stat.interval_hours,
@@ -524,18 +539,27 @@ class Engine:
                 "avg_24h_8h_bps": stat.avg_24h_8h_bps,
                 "realized_24h_bps": stat.realized_24h_bps,
                 "next_funding_h": next_funding_h,
-                "entry_bps": screen.entry_bps if screen else None,
-                "close_bps": screen.close_bps if screen else None,
-                "spread_cost_bps": screen.spread_cost_bps if screen else None,
-                "net_edge_bps": screen.net_edge_bps if screen else None,
-                "entry_bps_avg": screen.entry_bps_avg if screen else None,
-                "net_edge_bps_avg": screen.net_edge_bps_avg if screen else None,
-                "samples": screen.samples if screen else 0,
-                "max_notional_usd": screen.max_notional_usd if screen else 0.0,
+                # `screen` is non-None past the gate above, so these no
+                # longer need the None guards they carried when an empty book
+                # still made the board.
+                "entry_bps": screen.entry_bps,
+                "close_bps": screen.close_bps,
+                "spread_cost_bps": screen.spread_cost_bps,
+                "net_edge_bps": screen.net_edge_bps,
+                "entry_bps_avg": screen.entry_bps_avg,
+                "net_edge_bps_avg": screen.net_edge_bps_avg,
+                "samples": screen.samples,
+                "max_notional_usd": screen.max_notional_usd,
+                "entry_bps_jitter": screen.entry_bps_jitter,
+                "perp_trades_24h": screen.perp_trades_24h,
             })
         rows.sort(key=lambda r: r["avg_24h_8h_bps"], reverse=True)
         config.FUNDING_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"ts_ms": now, "rows": rows[: config.SCREENER_TOP_N]}
+        payload = {
+            "ts_ms": now,
+            "rows": rows[: config.SCREENER_TOP_N],
+            "hidden": hidden,
+        }
         tmp = config.FUNDING_SNAPSHOT_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=1))
         tmp.replace(config.FUNDING_SNAPSHOT_FILE)

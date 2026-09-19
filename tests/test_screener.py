@@ -544,3 +544,67 @@ def test_fillability_ranking_prefers_the_rich_steady_name_over_pure_flow(
     assert [r.symbol for r in screener.rank_rows_by_fillability(rows)] == [
         "RICH", "BUSYTHIN",
     ]
+
+
+def _quote_row(symbol, entry, close, depth, volume=1_000_000.0, jitter=0.0,
+               samples=10):
+    r = screener.ScreenerRow(
+        symbol=symbol, entry_bps=entry, close_bps=close,
+        spread_cost_bps=entry - close, fees_bps=0.0, funding_8h_bps=0.0,
+        net_edge_bps=entry, max_notional_usd=depth, aster_ask="1",
+        mexc_ask="1", ts_ms=0,
+    )
+    r.entry_bps_avg = entry
+    r.entry_bps_jitter = jitter
+    r.samples = samples
+    r.perp_volume_24h = volume
+    return r
+
+
+def test_quote_reject_catches_untransactable_books(monkeypatch):
+    """ARGUSUSDT printed a 250bps entry on a $4 book. The tell is not the size
+    of the number — it is that the two books are nowhere near each other, so
+    neither quote is a price anyone could trade."""
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 5.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_SPREAD_COST_BPS", 100.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    wide = _quote_row("ARGUS", 250.0, 60.0, depth=400.0)      # 190bps apart
+    thin = _quote_row("PIEVERSE", -4.2, -10.0, depth=1.0)
+    assert screener.quote_reject_reason(wide) == "spread"
+    assert screener.quote_reject_reason(thin) == "depth"
+
+
+def test_quote_reject_keeps_a_genuinely_rich_basis(monkeypatch):
+    """The gate must not be a magnitude cap: 哈基米 quotes +123 and is real.
+    Capping the number would throw away exactly what the screen is for."""
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 5.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_SPREAD_COST_BPS", 100.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    rich = _quote_row("HACHIMI", 123.5, 115.0, depth=200.0)
+    assert screener.quote_reject_reason(rich) is None
+
+
+def test_quote_reject_catches_flicker_and_dead_flow(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 5.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_SPREAD_COST_BPS", 100.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_BASIS_JITTER_BPS", 25.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    flicker = _quote_row("FLICKER", 40.0, 35.0, depth=200.0, jitter=60.0)
+    quiet = _quote_row("QUIET", 40.0, 35.0, depth=200.0, volume=900.0)
+    assert screener.quote_reject_reason(flicker) == "jitter"
+    assert screener.quote_reject_reason(quiet) == "volume"
+
+
+def test_quote_reject_fails_open_on_missing_data(monkeypatch):
+    """Two fail-open cases that must not blank the board on a slow start: the
+    24h ticker sweep not yet landed (volume 0), and too few samples to judge
+    jitter."""
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 5.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_SPREAD_COST_BPS", 100.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_BASIS_JITTER_BPS", 25.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 50_000.0)
+    no_vol = _quote_row("NEWSWEEP", 40.0, 35.0, depth=200.0, volume=0.0)
+    one_sample = _quote_row("JUSTSEEN", 40.0, 35.0, depth=200.0,
+                            jitter=99.0, samples=1)
+    assert screener.quote_reject_reason(no_vol) is None
+    assert screener.quote_reject_reason(one_sample) is None

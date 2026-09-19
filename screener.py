@@ -224,6 +224,37 @@ def _too_jittery(row: ScreenerRow) -> bool:
     )
 
 
+def quote_reject_reason(row: ScreenerRow) -> str | None:
+    """Why this row's quoted basis should not be believed or worked, or None.
+
+    /screen fill earns its trust by gating hard on flow and steadiness. Any
+    other screen that hangs a live basis off a different ranking — /funding
+    ranks by carry — inherits the same failure modes without those gates, and
+    the errors are spectacular: ARGUSUSDT showing a 250bps entry on a $4 book,
+    AINUSDT -114.6 on $9. Those are not opportunities; they are one stale or
+    one-sided quote.
+
+    Deliberately NOT a magnitude cap on the basis. The richest names are the
+    edge (哈基米 quotes +123 and is real), so capping the number throws away
+    exactly what the screen is for. Gate on the things that make a quote
+    UNREAL instead: an untransactable gap between the books, a book too thin
+    to have a price at all, a basis that flickers, and no flow to fill against.
+    """
+    if row.max_notional_usd < config.SCREEN_MIN_DEPTH_USD:
+        return "depth"
+    # Entry (ask/ask) minus close (bid/bid) is what crossing both books costs
+    # now. 170bps of it means the quotes are nowhere near each other.
+    if row.spread_cost_bps > config.SCREEN_MAX_SPREAD_COST_BPS:
+        return "spread"
+    if _too_jittery(row):
+        return "jitter"
+    # perp_volume_24h is 0 when the ticker sweep has not landed yet; fail OPEN
+    # there rather than blanking the whole screen on a slow start.
+    if row.perp_volume_24h and row.perp_volume_24h < config.SCREEN_FILL_MIN_VOLUME_USD:
+        return "volume"
+    return None
+
+
 def rank_rows_by_dislocation(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     """Rank by how far the 5m entry basis sits ABOVE the pair's own 24h mean.
 

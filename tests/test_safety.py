@@ -278,7 +278,11 @@ async def test_auto_passive_resets_to_open_on_basis_recovery(engine):
 async def test_funding_snapshot_survives_zero_priced_book(engine, monkeypatch, tmp_path):
     """Regression: compute_row returns None on a stale/zero book (thin microcap);
     the funding snapshot must skip it, not crash annotate(None) — which froze the
-    funding file and heartbeat for days."""
+    funding file and heartbeat for days.
+
+    The row is now HIDDEN rather than listed with a blank basis: a carry you
+    have no price for is not a candidate. It still has to be counted, so
+    /funding can say why the board is shorter than the funding universe."""
     import funding as funding_mod
     monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
     engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
@@ -291,7 +295,8 @@ async def test_funding_snapshot_survives_zero_priced_book(engine, monkeypatch, t
     engine._write_funding_snapshot()                       # must not raise
     import json
     snap = json.loads((tmp_path / "fnd.json").read_text())
-    assert snap["rows"][0]["entry_bps"] is None            # row kept, basis absent
+    assert snap["rows"] == []                              # no price -> not a row
+    assert snap["hidden"] == {"book": 1}                   # ...but accounted for
 
 
 async def test_slow_scan_isolates_write_failures(engine, monkeypatch, tmp_path):

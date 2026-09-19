@@ -111,6 +111,15 @@ SCREEN_FILL_TARGET_CHANCES = float(
 # may be structurally rich rather than mean-reverting (BASECAT: 149 entry, 24h
 # low +100.6).
 SCREEN_FILL_FLAG_LO_BPS = float(os.environ.get("SCREEN_FILL_FLAG_LO_BPS", "25"))
+# A quoted basis is only believable if the two books are close enough together
+# to transact against. spread_cost_bps = entry_bps - close_bps is exactly what
+# crossing both books costs right now, so a huge value means the quotes are far
+# apart and NEITHER side is a real price: ARGUSUSDT printed a 250bps entry on a
+# $4 book. This is the "clear error" gate — a magnitude cap on the basis itself
+# would also throw away the genuinely rich names, which is the whole edge.
+SCREEN_MAX_SPREAD_COST_BPS = float(
+    os.environ.get("SCREEN_MAX_SPREAD_COST_BPS", "100")
+)
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

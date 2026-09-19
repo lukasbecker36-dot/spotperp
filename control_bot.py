@@ -586,7 +586,7 @@ class ControlBot:
             return "no funding data yet"
         win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
         hdr = (f"{'symbol':<12}{'iv':>3}{'24h':>6}{'fund':>6}{'next':>6}"
-               f"{'entry':>6}{'net':>6}{'depth$':>8}")
+               f"{'entry':>7}{'jit':>5}{'be':>6}{'depth$':>8}")
         sep = "-" * len(hdr)
         lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
 
@@ -595,20 +595,54 @@ class ControlBot:
             v = r.get(key_avg)
             return v if v is not None else r.get(key_live)
 
+        floor = float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
         for r in rows:
-            ev, nv = avg(r, "entry_bps_avg", "entry_bps"), avg(r, "net_edge_bps_avg", "net_edge_bps")
-            entry = f"{ev:>6.1f}" if ev is not None else f"{'-':>6}"
-            net = f"{nv:>6.1f}" if nv is not None else f"{'-':>6}"
+            ev = avg(r, "entry_bps_avg", "entry_bps")
+            entry = f"{ev:>7.1f}" if ev is not None else f"{'-':>7}"
+            jv = r.get("entry_bps_jitter")
+            jit = (f"{jv:>5.1f}" if jv is not None and r.get("samples", 0) >= 3
+                   else f"{'-':>5}")
             depth = f"{r['max_notional_usd']:>8,.0f}" if r.get("max_notional_usd") else f"{'-':>8}"
             nh = r.get("next_funding_h")
             nxt = f"{nh:>5.1f}h" if nh is not None and nh >= 0 else f"{'-':>6}"
+            # Hours of funding needed to pay for getting in. The entry basis is
+            # a ONE-OFF (a credit when positive, a cost when negative); funding
+            # is the recurring stream. This is the number that decides whether a
+            # fat carry on a deeply negative basis is worth having.
+            carry = r.get("avg_24h_8h_bps") or 0.0
+            cost = floor - (ev if ev is not None else 0.0)
+            if cost <= 0:
+                be = f"{'0':>6}"          # paid to enter
+            elif carry <= 0:
+                be = f"{'never':>6}"      # carry does not pay it back
+            else:
+                be = f"{cost / carry * 8.0:>5.0f}h"
             lines.append(
-                f"{r['symbol'][:11]:<12}{r['interval_hours']:>2}h"
-                f"{r['avg_24h_8h_bps']:>6.1f}{r['current_8h_bps']:>6.1f}{nxt}{entry}{net}{depth}"
+                f"{_pad(r['symbol'], 12)}{r['interval_hours']:>2}h"
+                f"{r['avg_24h_8h_bps']:>6.1f}{r['current_8h_bps']:>6.1f}{nxt}"
+                f"{entry}{jit}{be}{depth}"
             )
         lines.append(sep)
         lines.append("iv=interval; 24h=avg carry/8h; fund=settled/8h; next=to settle")
-        lines.append(f"entry/net = {win_m:.0f}m avg basis; short perp gets +funding")
+        lines.append(
+            f"entry = {win_m:.0f}m avg basis (short perp gets +funding)."
+            f" be = hours of carry to pay off the entry basis + {floor:.0f}bps"
+            " round-trip cost: '0' = the basis already pays you to enter,"
+            " 'never' = negative carry, so the entry cost is never repaid."
+        )
+        lines.append(
+            "jit = mean bps the basis moves between 5m samples; a resting order"
+            " fills on the bad side of that, so it is the haircut on `entry`."
+        )
+        hid = snap.get("hidden") or {}
+        if hid:
+            lines.append(
+                "hidden as unworkable: "
+                + ", ".join(f"{v} {k}" for k, v in sorted(hid.items()))
+                + f" (spread = books >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps"
+                " apart, so the quote is not a real price; depth/volume = too"
+                " thin to fill; jitter = flickers too hard to work)"
+            )
         return "\n".join(lines)
 
     async def _cmd_status(self) -> str:
