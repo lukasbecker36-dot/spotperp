@@ -39,6 +39,7 @@ import bisect
 import csv
 import glob
 import sys
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -207,7 +208,8 @@ def features_at(
     }
 
 
-def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float) -> dict:
+def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float,
+             sustain: int = 5) -> dict:
     """What actually happened after sample i, for EVERY horizon at once.
 
     One forward walk to the longest horizon, snapshotting as it crosses each
@@ -227,6 +229,15 @@ def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float) -
     snaps: dict[int, tuple] = {}
     min_close = max_close = None
     funding_at_min = 0.0
+    # The plain minimum over a window is set by its single worst print, and a
+    # flickering quote routinely prints 100s of bps away for one sample
+    # (RECALLUSDT scored a 7,995bps "best exit" on one). So also track the
+    # lowest level the close basis SUSTAINED for `sustain` consecutive samples:
+    # the smallest L with close <= L across a whole window, which is the min
+    # over sliding windows of each window's max. Outlier-proof by construction.
+    dq: deque[int] = deque()
+    sustained = None
+    funding_at_sustained = 0.0
     hit_zero_ts = hit_target_ts = hit_profit_ts = None
     dwell_after = 0.0
     accrued = 0.0
@@ -234,8 +245,9 @@ def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float) -
     for k in range(i + 1, j_end):
         # Snapshot every boundary this sample has passed, before folding it in.
         while b < len(bounds) and s.ts[k] > ts0 + bounds[b] * HOUR_MS:
-            snaps[bounds[b]] = (min_close, max_close, s.close[k - 1],
-                                accrued, funding_at_min, dwell_after)
+            snaps[bounds[b]] = (min_close, max_close, s.close[k - 1], accrued,
+                                funding_at_min, dwell_after, sustained,
+                                funding_at_sustained)
             b += 1
         c = s.close[k]
         dt_h = min((s.ts[k] - s.ts[k - 1]) / HOUR_MS, FUNDING_STEP_CAP_HOURS)
@@ -244,6 +256,15 @@ def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float) -
             min_close, funding_at_min = c, accrued
         if max_close is None or c > max_close:
             max_close = c
+        while dq and s.close[dq[-1]] <= c:
+            dq.pop()
+        dq.append(k)
+        while dq[0] <= k - sustain:
+            dq.popleft()
+        if k - i >= sustain:            # a full window of samples exists
+            window_max = s.close[dq[0]]
+            if sustained is None or window_max < sustained:
+                sustained, funding_at_sustained = window_max, accrued
         if hit_zero_ts is None and c <= 0:
             hit_zero_ts = s.ts[k]
         if hit_target_ts is None and c <= target_close:
@@ -259,8 +280,9 @@ def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float) -
         if s.entry[k] >= entry_at - 5.0:
             dwell_after += dt_h
     while b < len(bounds):              # horizons the data ran out inside
-        snaps[bounds[b]] = (min_close, max_close, s.close[j_end - 1],
-                            accrued, funding_at_min, dwell_after)
+        snaps[bounds[b]] = (min_close, max_close, s.close[j_end - 1], accrued,
+                            funding_at_min, dwell_after, sustained,
+                            funding_at_sustained)
         b += 1
 
     def _hours(t, limit_h):
@@ -272,7 +294,7 @@ def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float) -
 
     out: dict = {}
     for h in horizons:
-        mn, mx, end_close, fund, fund_at_min, dwell = snaps[h]
+        mn, mx, end_close, fund, fund_at_min, dwell, sus, fund_at_sus = snaps[h]
         if mn is None:
             continue
         to_lo24, to_profit = _hours(hit_target_ts, h), _hours(hit_profit_ts, h)
@@ -289,6 +311,12 @@ def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float) -
             # What the round trip was worth if you had exited at the best
             # moment the horizon offered — an upper bound, nobody times that.
             f"h{h}_best_pnl_bps": round(entry_at - mn + fund_at_min - floor, 2),
+            # The same trip priced at a level that actually held, rather than
+            # at one print. This is the column to reason from.
+            f"h{h}_sustained_pnl_bps": (
+                round(entry_at - sus + fund_at_sus - floor, 2)
+                if sus is not None else ""
+            ),
             # ...and what simply holding the whole horizon would have paid.
             f"h{h}_hold_pnl_bps": round(entry_at - end_close + fund - floor, 2),
             f"h{h}_dwell_after_h": round(dwell, 2),
@@ -305,7 +333,7 @@ def log_span_hours(series: dict[str, Series]) -> float:
 def build(
     series: dict[str, Series], *, stride_h: float, horizons: list[int],
     floor: float, min_depth: float, min_entry: float,
-    window: int, window_max_h: float, drops: dict,
+    window: int, window_max_h: float, sustain: int, drops: dict,
 ) -> list[dict]:
     rows: list[dict] = []
     done = 0
@@ -336,7 +364,7 @@ def build(
             if feat is None:
                 continue
             last_emit = s.ts[i]
-            out = outcomes(s, i, feat, horizons, floor)
+            out = outcomes(s, i, feat, horizons, floor, sustain)
             if out:
                 rows.append({"symbol": symbol, **feat, **out})
             else:
@@ -372,6 +400,10 @@ def main() -> None:
                     help="samples in the short-window mean/jitter (default 5)."
                          " Counted in SAMPLES, not minutes, so it survives"
                          " whatever cadence the log has and any --every")
+    ap.add_argument("--sustain", type=int, default=5,
+                    help="consecutive samples a close level must hold to count"
+                         " as reachable (default 5). Guards the best-exit"
+                         " figure against a single flickering print")
     ap.add_argument("--window-max-hours", type=float, default=1.0,
                     help="skip a row whose window straddles a logging gap"
                          " wider than this (default 1h)")
@@ -400,7 +432,8 @@ def main() -> None:
     rows = build(
         series, stride_h=args.stride_hours, horizons=horizons,
         floor=args.floor, min_depth=args.min_depth, min_entry=args.min_entry,
-        window=args.window, window_max_h=args.window_max_hours, drops=drops,
+        window=args.window, window_max_h=args.window_max_hours,
+        sustain=args.sustain, drops=drops,
     )
     if not rows:
         # Say WHICH constraint bit. "No rows" with a 168h horizon over a 5h log

@@ -59,6 +59,18 @@ def main() -> None:
     ap.add_argument("--min-rows", type=int, default=20,
                     help="hide buckets thinner than this (default 20)")
     ap.add_argument("--symbols", default="", help="comma-separated filter")
+    ap.add_argument("--where", action="append", default=[], metavar="COL=LO:HI",
+                    help="keep only rows where COL is in [LO,HI); repeatable."
+                         " Either bound may be blank. Use this to CONTROL for"
+                         " a confounder — bucketing by jit across the whole"
+                         " set mixes in the fact that jittery names also have"
+                         " bigger edges, so hold net_vs_close_lo fixed and"
+                         " look at jit within the band")
+    ap.add_argument("--metric", choices=("sustained", "best"),
+                    default="sustained",
+                    help="which exit figure to report (default sustained: the"
+                         " lowest level the basis actually HELD, rather than"
+                         " its single lowest print)")
     ap.add_argument("--label", choices=("profit", "lo24"), default="profit",
                     help="what counts as working: the trip became profitable"
                          " after costs (default), or the close basis reached"
@@ -69,11 +81,28 @@ def main() -> None:
     filt = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
     if filt:
         rows = [r for r in rows if r["symbol"] in filt]
+    for clause in args.where:
+        try:
+            col, rng = clause.split("=", 1)
+            lo_s, hi_s = rng.split(":", 1)
+        except ValueError:
+            print(f"bad --where {clause!r}; expected COL=LO:HI", file=sys.stderr)
+            return
+        lo = float(lo_s) if lo_s.strip() else float("-inf")
+        hi = float(hi_s) if hi_s.strip() else float("inf")
+        before = len(rows)
+        rows = [r for r in rows
+                if (_f(r, col) is not None and lo <= _f(r, col) < hi)]
+        print(f"where {col} in [{lo:g},{hi:g}): {before:,} -> {len(rows):,} rows",
+              file=sys.stderr)
+    if not rows:
+        print("no rows left after filtering", file=sys.stderr)
+        return
     h = args.horizon
     reached_k = f"h{h}_reached_{args.label}"
     hours_k = f"h{h}_hours_to_{args.label}"
     best_k, hold_k, fund_k = (
-        f"h{h}_best_pnl_bps", f"h{h}_hold_pnl_bps", f"h{h}_funding_bps",
+        f"h{h}_{args.metric}_pnl_bps", f"h{h}_hold_pnl_bps", f"h{h}_funding_bps",
     )
     if rows and reached_k not in rows[0]:
         print(f"no {h}h outcomes in this file; available horizons: "
@@ -106,8 +135,9 @@ def main() -> None:
             print(f"column {args.by!r} not found", file=sys.stderr)
             return
         order = sorted(groups, key=lambda k: -len(groups[k]))
+    label = "med exit" if args.metric == "sustained" else "med best"
     hdr = (f"{args.by:<18}{'rows':>7}{'reached':>9}{'med hrs':>9}"
-           f"{'med best':>10}{'med hold':>10}{'med fund':>10}")
+           f"{label:>10}{'med hold':>10}{'med fund':>10}")
     print(f"scoring {len(rows):,} rows over a {h}h horizon")
     print(hdr)
     print("-" * len(hdr))
@@ -141,11 +171,22 @@ def main() -> None:
             " as the exit target. med hrs = how long that took, over the rows"
             " that got there."
         )
+    if args.metric == "sustained":
+        print(
+            "med exit = round trip at the lowest level the basis actually HELD"
+            " for several samples — still a well-timed exit, but not one set"
+            " by a single flickering print (--metric best uses the raw"
+            " minimum, which one bad tick can move by thousands of bps)."
+        )
+    else:
+        print(
+            "med best = round trip at the horizon's single lowest print. One"
+            " flickering quote sets it, so it is not a level you could have"
+            " traded — prefer the default --metric sustained."
+        )
     print(
-        "med best = round trip if you exited at the horizon's best moment (an"
-        " UPPER bound — nobody times that). med hold = holding the whole"
-        " horizon and taking whatever the basis was at the end. Both are net"
-        " of the cost floor and include funding."
+        "med hold = holding the whole horizon and taking whatever the basis"
+        " was at the end. Both are net of the cost floor and include funding."
     )
     print(
         "A feature that matters separates the buckets. One that does not shows"
