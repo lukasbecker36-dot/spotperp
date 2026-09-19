@@ -1124,14 +1124,12 @@ class Executor:
                 )
                 return
             if net_perp <= aster_info.step_size:
-                # Fully reverted: restore perp_entry_avg so the position keeps
-                # its true prior basis instead of the polluted phantom.
-                if pre_perp_entry_avg is not None:
-                    self._conn.execute(
-                        "UPDATE positions SET perp_entry_avg=? WHERE id=?",
-                        (str(pre_perp_entry_avg), position.id),
-                    )
-                    self._conn.commit()
+                # Fully reverted. perp_entry_avg needs no repair here any more:
+                # record_fill re-derives the leg on every unwind, matching the
+                # buy-back off against the entry fills it reverses, so the
+                # average is already back to its true prior value. This used to
+                # patch the column by hand, which fixed only the fully-reverted
+                # case and left a PARTIAL unwind showing the phantom basis.
                 self._positions.set_state(position.id, pm.OPEN, "add reverted")
                 journal(self._conn, f"position {position.id}: ADD reverted"
                         f" (basis collapsed to {cb}), position unchanged")

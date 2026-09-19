@@ -865,7 +865,9 @@ class ControlBot:
                 f"  basis  open {ob}  close {cb}  captured {drift} bps",
                 f"  funding ${float(p.funding_usd):+.2f}"
                 f"  commission ${float(p.fees_usd):.2f}"
-                f"  →  P&L {pnl}{imbalance}",
+                + (f"  unwind ${float(p.unwind_pnl_usd):+.2f}"
+                   if p.unwind_pnl_usd else "")
+                + f"  →  P&L {pnl}{imbalance}",
             ]))
         return "last trades:\n\n" + "\n\n".join(blocks)
 

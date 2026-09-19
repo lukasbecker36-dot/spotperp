@@ -102,3 +102,79 @@ def test_entry_avg_correct_after_partial_exit_then_add(manager):
     pnl = manager.finalize_pnl(p.id)
     # Short P&L = 2200 sold - 2125 bought back = +75.
     assert pnl == Decimal(75)
+
+
+def test_unwound_entry_leaves_the_entry_average(manager):
+    """GUSDT showed a -100bps entry basis. An entry clip that filled and was
+    then unwound (its spot hedge never bought) stayed in perp_entry_avg, so the
+    recorded basis blended a leg that is not held and has no spot against it."""
+    mgr = manager
+    pos = mgr.create("GUSDT", Decimal(200), paper=False)
+
+    def basis():
+        p = mgr.get(pos.id)
+        return (p.perp_entry_avg - p.spot_entry_avg) / p.spot_entry_avg * 10000
+
+    # A good clip: short perp at 1.0030 against spot at 1.0000 -> +30bps.
+    mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(1000),
+                    Decimal("1.0030"), Decimal(0), "o1")
+    mgr.record_fill(pos.id, "mexc", "entry", "BUY", Decimal(1000),
+                    Decimal("1.0000"), Decimal(0), "m1")
+    assert basis() == Decimal(30)
+
+    # A second, bigger clip fills where the basis had collapsed...
+    mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(3000),
+                    Decimal("1.0005"), Decimal(0), "o2")
+    assert basis() < Decimal(15)          # blended down while it is unhedged
+    # ...and is unwound, never hedged.
+    mgr.record_fill(pos.id, "aster", "unwind", "BUY", Decimal(3000),
+                    Decimal("1.0012"), Decimal(0), "o3")
+
+    after = mgr.get(pos.id)
+    assert basis() == Decimal(30)          # back to the basis actually held
+    assert after.perp_qty == Decimal(1000)
+    # The buy-back closed nothing, so it must not price the exit either.
+    assert after.perp_exit_avg is None
+    # Sold 3000 at 1.0005, bought back at 1.0012: a real 2.10 loss, kept apart
+    # from both averages and carried into realised P&L.
+    assert after.unwind_pnl_usd == Decimal("-2.1000")
+    assert mgr.finalize_pnl(pos.id) == Decimal("-2.1000")
+
+
+def test_partial_unwind_matches_the_most_recent_entries(manager):
+    """An unwind always reverses the increment that just filled, so entries are
+    matched off LIFO. The fully-reverted case used to be patched by hand in the
+    executor, which left a PARTIAL unwind showing the phantom basis."""
+    mgr = manager
+    pos = mgr.create("GUSDT", Decimal(300), paper=False)
+    mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(1000),
+                    Decimal("1.0030"), Decimal(0), "o1")
+    mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(1000),
+                    Decimal("1.0000"), Decimal(0), "o2")
+    # Reverse only half of the second clip.
+    mgr.record_fill(pos.id, "aster", "unwind", "BUY", Decimal(500),
+                    Decimal("1.0000"), Decimal(0), "o3")
+    after = mgr.get(pos.id)
+    assert after.perp_qty == Decimal(1500)
+    # 1000 @ 1.0030 + 500 @ 1.0000 -> 1.0020, i.e. the newest clip is the one
+    # partly removed, not a pro-rata slice of both.
+    assert after.perp_entry_avg == Decimal("1.0020")
+
+
+def test_unwind_does_not_count_as_an_exit(manager):
+    """An unwind reduces the position but closes nothing. Counting it as an
+    exit would price the close off a trade that never closed a position."""
+    mgr = manager
+    pos = mgr.create("GUSDT", Decimal(200), paper=False)
+    mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(2000),
+                    Decimal("1.0030"), Decimal(0), "o1")
+    mgr.record_fill(pos.id, "mexc", "entry", "BUY", Decimal(2000),
+                    Decimal("1.0000"), Decimal(0), "m1")
+    mgr.record_fill(pos.id, "aster", "unwind", "BUY", Decimal(1000),
+                    Decimal("1.0040"), Decimal(0), "o2")
+    assert mgr.leg_qtys(pos.id)["perp_exit"] == 0
+    mgr.record_fill(pos.id, "aster", "exit", "BUY", Decimal(1000),
+                    Decimal("0.9990"), Decimal(0), "o3")
+    after = mgr.get(pos.id)
+    assert after.perp_exit_avg == Decimal("0.9990")   # the real close only
+    assert mgr.leg_qtys(pos.id)["perp_exit"] == Decimal(1000)

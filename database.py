@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS positions (
     fees_usd TEXT NOT NULL DEFAULT '0',
     funding_usd TEXT NOT NULL DEFAULT '0',
     realized_pnl_usd TEXT,
+    unwind_pnl_usd TEXT NOT NULL DEFAULT '0',  -- P&L of entry clips that were
+                                        -- bought back unhedged (leg-risk
+                                        -- unwinds): real money, but not part
+                                        -- of the entry or exit average
     opened_ms INTEGER, closed_ms INTEGER,
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL,
@@ -118,6 +122,7 @@ _MIGRATIONS = [
     "ALTER TABLE positions ADD COLUMN min_entry_bps TEXT",
     "ALTER TABLE positions ADD COLUMN trade_kind TEXT NOT NULL DEFAULT 'convergence'",
     "ALTER TABLE positions ADD COLUMN exit_target_qty TEXT",
+    "ALTER TABLE positions ADD COLUMN unwind_pnl_usd TEXT NOT NULL DEFAULT '0'",
 ]
 
 

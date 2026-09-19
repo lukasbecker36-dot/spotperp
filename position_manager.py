@@ -55,6 +55,7 @@ class Position:
     fees_usd: Decimal
     funding_usd: Decimal
     realized_pnl_usd: Decimal | None
+    unwind_pnl_usd: Decimal
     opened_ms: int | None
     closed_ms: int | None
     created_ms: int
@@ -88,6 +89,7 @@ class Position:
             fees_usd=_dec(row["fees_usd"]),
             funding_usd=_dec(row["funding_usd"]),
             realized_pnl_usd=opt("realized_pnl_usd"),
+            unwind_pnl_usd=_dec(row["unwind_pnl_usd"]),
             opened_ms=row["opened_ms"],
             closed_ms=row["closed_ms"],
             created_ms=row["created_ms"],
@@ -269,7 +271,19 @@ class PositionManager:
                     update_avg(pos.spot_entry_avg, prior, qty, price)
                 )
                 sets["spot_qty"] = str(pos.spot_qty + qty)
-        else:  # exit / unwind reduce the held quantities
+        elif phase == "unwind":
+            # An unwind cancels an entry increment that was never hedged, so
+            # the whole leg has to be re-derived: the reversed entry leaves the
+            # entry average and the buy-back never enters the exit average.
+            # Incremental folding cannot express that.
+            self._conn.execute(
+                "UPDATE positions SET updated_ms=? WHERE id=?",
+                (_now_ms(), position_id),
+            )
+            self._conn.commit()
+            self.recompute_from_fills(position_id)
+            return
+        else:  # exit reduces the held quantities
             if venue == "aster":
                 prev_exited_qty = self._exited_qty(position_id, "aster", exclude_last=True)
                 sets["perp_exit_avg"] = str(
@@ -293,9 +307,16 @@ class PositionManager:
     def _exited_qty(
         self, position_id: int, venue: str, exclude_last: bool = False
     ) -> Decimal:
+        """Quantity CLOSED out of a real position.
+
+        Deliberately excludes 'unwind'. An unwind buys back a perp increment
+        that was never hedged, so it cancels an ENTRY rather than closing a
+        position — counting it here would price the exit off a trade that
+        closed nothing (see _derive_legs).
+        """
         rows = self._conn.execute(
-            "SELECT qty FROM fills WHERE position_id=? AND venue=? AND phase IN"
-            " ('exit', 'unwind') ORDER BY id",
+            "SELECT qty FROM fills WHERE position_id=? AND venue=? AND phase='exit'"
+            " ORDER BY id",
             (position_id, venue),
         ).fetchall()
         if exclude_last and rows:
@@ -326,40 +347,92 @@ class PositionManager:
         ).fetchall()
         return sum((Decimal(r["qty"]) for r in rows), Decimal(0))
 
+    def _derive_legs(self, position_id: int, venue: str) -> dict:
+        """Aggregate one leg from its fills, with unwinds cancelling entries.
+
+        An unwind buys back a perp increment whose spot hedge was never
+        bought. It is neither an entry nor an exit:
+
+        - leaving its ENTRY fill in the entry average prices a leg that is not
+          held and has no spot partner against it, dragging the recorded entry
+          basis toward a phantom (GUSDT showed -100bps);
+        - putting the buy-back in the EXIT average prices the close of the
+          position off a trade that closed nothing.
+
+        So each unwound quantity is matched off against entry fills LIFO — an
+        unwind always reverses the increment that just filled — and both sides
+        drop out of the averages. The price difference is real money and is
+        returned as unwind_pnl (short: sold at the entry price, bought back at
+        the unwind price).
+
+        Derived from the fills table rather than tracked incrementally, so it
+        is the same answer however many unwinds happen and in what order.
+        """
+        rows = self._conn.execute(
+            "SELECT phase, qty, price, fee_usd FROM fills"
+            " WHERE position_id=? AND venue=? ORDER BY id",
+            (position_id, venue),
+        ).fetchall()
+        entries = [(Decimal(r["qty"]), Decimal(r["price"])) for r in rows
+                   if r["phase"] == "entry"]
+        exits = [(Decimal(r["qty"]), Decimal(r["price"])) for r in rows
+                 if r["phase"] == "exit"]
+        unwinds = [(Decimal(r["qty"]), Decimal(r["price"])) for r in rows
+                   if r["phase"] == "unwind"]
+        fees = sum((Decimal(r["fee_usd"] or "0") for r in rows), Decimal(0))
+
+        # Match unwinds against the most recent entries first.
+        to_reverse = sum((q for q, _ in unwinds), Decimal(0))
+        unwind_cost = sum((q * p for q, p in unwinds), Decimal(0))
+        reversed_qty = Decimal(0)
+        reversed_cost = Decimal(0)
+        kept: list[tuple[Decimal, Decimal]] = []
+        for qty, price in reversed(entries):
+            take = min(qty, to_reverse - reversed_qty)
+            if take > 0:
+                reversed_qty += take
+                reversed_cost += take * price
+            if qty - take > 0:
+                kept.append((qty - take, price))
+        in_qty = sum((q for q, _ in kept), Decimal(0))
+        in_cost = sum((q * p for q, p in kept), Decimal(0))
+        out_qty = sum((q for q, _ in exits), Decimal(0))
+        out_cost = sum((q * p for q, p in exits), Decimal(0))
+        # Short leg: sold at the entry price, bought back at the unwind price.
+        unwind_pnl = reversed_cost - unwind_cost if venue == "aster" else (
+            unwind_cost - reversed_cost
+        )
+        return {
+            "entry_avg": in_cost / in_qty if in_qty > 0 else None,
+            "exit_avg": out_cost / out_qty if out_qty > 0 else None,
+            "qty": in_qty - out_qty,
+            "fees": fees,
+            "unwind_pnl": unwind_pnl,
+        }
+
     def recompute_from_fills(self, position_id: int) -> None:
         """Rebuild qty, averages and fees for both legs from the fills table.
 
         record_fill folds each fill in incrementally, so correcting one after
         the fact would leave the stored averages carrying the old price. This
-        recomputes them from scratch — a plain VWAP per leg per phase, which is
-        what the incremental updates converge to."""
+        recomputes them from scratch."""
         sets: dict[str, str] = {}
         total_fees = Decimal(0)
+        total_unwind_pnl = Decimal(0)
         for venue, avg_in, avg_out, qty_col in (
             ("aster", "perp_entry_avg", "perp_exit_avg", "perp_qty"),
             ("mexc", "spot_entry_avg", "spot_exit_avg", "spot_qty"),
         ):
-            rows = self._conn.execute(
-                "SELECT phase, qty, price, fee_usd FROM fills"
-                " WHERE position_id=? AND venue=? ORDER BY id",
-                (position_id, venue),
-            ).fetchall()
-            in_qty = in_cost = out_qty = out_cost = Decimal(0)
-            for r in rows:
-                q, px = Decimal(r["qty"]), Decimal(r["price"])
-                total_fees += Decimal(r["fee_usd"] or "0")
-                if r["phase"] == "entry":
-                    in_qty += q
-                    in_cost += q * px
-                else:
-                    out_qty += q
-                    out_cost += q * px
-            if in_qty > 0:
-                sets[avg_in] = str(in_cost / in_qty)
-            if out_qty > 0:
-                sets[avg_out] = str(out_cost / out_qty)
-            sets[qty_col] = str(in_qty - out_qty)
+            leg = self._derive_legs(position_id, venue)
+            if leg["entry_avg"] is not None:
+                sets[avg_in] = str(leg["entry_avg"])
+            if leg["exit_avg"] is not None:
+                sets[avg_out] = str(leg["exit_avg"])
+            sets[qty_col] = str(leg["qty"])
+            total_fees += leg["fees"]
+            total_unwind_pnl += leg["unwind_pnl"]
         sets["fees_usd"] = str(total_fees)
+        sets["unwind_pnl_usd"] = str(total_unwind_pnl)
         assignments = ", ".join(f"{k}=?" for k in sets)
         self._conn.execute(
             f"UPDATE positions SET {assignments}, updated_ms=? WHERE id=?",
@@ -398,7 +471,12 @@ class PositionManager:
         if pos.spot_entry_avg is not None and pos.spot_exit_avg is not None:
             qty = min(entry_qty_spot, exit_qty_spot)
             spot_pnl = (pos.spot_exit_avg - pos.spot_entry_avg) * qty
-        pnl = perp_pnl + spot_pnl + pos.funding_usd - pos.fees_usd
+        # Unwound clips closed at a price of their own; that money is real but
+        # belongs to neither average (see _derive_legs).
+        pnl = (
+            perp_pnl + spot_pnl + pos.unwind_pnl_usd
+            + pos.funding_usd - pos.fees_usd
+        )
         self._conn.execute(
             "UPDATE positions SET realized_pnl_usd=?, updated_ms=? WHERE id=?",
             (str(pnl), _now_ms(), position_id),
