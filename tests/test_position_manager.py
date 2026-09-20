@@ -111,9 +111,11 @@ def test_unwound_entry_leaves_the_entry_average(manager):
     mgr = manager
     pos = mgr.create("GUSDT", Decimal(200), paper=False)
 
-    def basis():
+    def basis() -> float:
         p = mgr.get(pos.id)
-        return (p.perp_entry_avg - p.spot_entry_avg) / p.spot_entry_avg * 10000
+        return float(
+            (p.perp_entry_avg - p.spot_entry_avg) / p.spot_entry_avg * 10000
+        )
 
     # A good clip: short perp at 1.0030 against spot at 1.0000 -> +30bps.
     mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(1000),
@@ -293,3 +295,73 @@ def test_finalize_pnl_prices_the_kept_size_not_the_reversed_one(manager):
                         Decimal("0.99"), Decimal(0))
     # perp +10 (short 1.00 -> 0.99), spot -10, unwind 0 -> flat.
     assert manager.finalize_pnl(pos.id) == Decimal(0)
+
+
+def test_entry_after_an_unwind_is_not_diluted_by_the_reversed_fill(manager):
+    """Position 217 reported +4.34bps on an add whose clips all went in above
+    +28. The average was right immediately after the unwind (+37.92 on 1106)
+    and then decayed with every later fill: record_fill took the prior weight
+    from _phase_qty('entry'), which counts reversed entry fills, while
+    perp_entry_avg excludes them. Each new clip was therefore blended against
+    a quantity larger than the one the average described, pulling it toward
+    the older, cheaper prices.
+
+    Replays that position's exact fills.
+    """
+    mgr = manager
+    pos = mgr.create("STONKUSDT", Decimal(300), paper=False)
+    fills = [
+        ("aster", "entry", "SELL", 269, "0.2704"),
+        ("mexc", "entry", "BUY", 269, "0.2695847263940520446096654275"),
+        ("aster", "entry", "SELL", 370, "0.2702"),
+        ("mexc", "entry", "BUY", 370, "0.2695845362162162162162162162"),
+        ("aster", "entry", "SELL", 368, "0.2713"),
+        ("mexc", "entry", "BUY", 368, "0.2698179854076086956521739130"),
+        ("aster", "entry", "SELL", 99, "0.2728"),
+        ("mexc", "entry", "BUY", 99, "0.271395"),
+        ("aster", "entry", "SELL", 360, "0.2774"),     # collapsed...
+        ("aster", "unwind", "BUY", 360, "0.2801"),     # ...and reversed
+        ("aster", "entry", "SELL", 349, "0.2858"),
+        ("mexc", "entry", "BUY", 349, "0.284014"),
+        ("aster", "entry", "SELL", 145, "0.2859"),
+        ("mexc", "entry", "BUY", 145, "0.284014"),
+        ("aster", "entry", "SELL", 349, "0.2858"),
+        ("mexc", "entry", "BUY", 349, "0.285"),
+        ("aster", "entry", "SELL", 208, "0.2895"),
+        ("mexc", "entry", "BUY", 208, "0.288"),
+    ]
+
+    def basis() -> float:
+        p = mgr.get(pos.id)
+        return float(
+            (p.perp_entry_avg - p.spot_entry_avg) / p.spot_entry_avg * 10000
+        )
+
+    for i, (venue, phase, side, qty, price) in enumerate(fills):
+        mgr.record_fill(pos.id, venue, phase, side, Decimal(qty),
+                        Decimal(price), Decimal(0))
+        if i == 9:
+            # The engine got this far right: "position unchanged", 1106 units.
+            assert mgr.get(pos.id).perp_qty == Decimal(1106)
+            assert basis() == pytest.approx(37.92, abs=0.01)
+
+
+    after = mgr.get(pos.id)
+    assert after.perp_qty == Decimal(2157)
+    # Notional-weighted across the four add clips (+62.9/+66.4/+28.1/+52.1)
+    # blended with the prior 1106 @ +37.9. Was reported as +4.34.
+    assert basis() == pytest.approx(43.80, abs=0.05)
+
+
+def test_incremental_path_still_used_without_unwinds(manager):
+    """The re-derive is only for legs that have been unwound; an ordinary
+    position must keep folding fills in as before."""
+    pos = manager.create("BTCUSDT", Decimal(1000), paper=False)
+    manager.record_fill(pos.id, "aster", "entry", "SELL", Decimal(100),
+                        Decimal("100.0"), Decimal("0.5"))
+    manager.record_fill(pos.id, "aster", "entry", "SELL", Decimal(100),
+                        Decimal("102.0"), Decimal("0.5"))
+    after = manager.get(pos.id)
+    assert after.perp_entry_avg == Decimal(101)
+    assert after.fees_usd == Decimal("1.0")
+    assert after.unwind_pnl_usd == Decimal(0)

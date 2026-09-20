@@ -252,6 +252,18 @@ class PositionManager:
                 return fill_px
             return (avg * held + fill_px * fill_qty) / (held + fill_qty)
 
+        # A leg that has ever been unwound cannot be folded in incrementally.
+        # The prior weight below comes from _phase_qty('entry'), which counts
+        # reversed entry fills, while perp_entry_avg excludes them — so every
+        # later entry fill is blended against a quantity larger than the one
+        # the average describes, dragging it toward the older prices. Position
+        # 217 read +4.34bps instead of +43.80 that way, and the error grows
+        # with each clip. Re-derive instead; it is the same answer when there
+        # are no unwinds and the right one when there are.
+        if phase in ("entry", "exit") and self._has_unwind(position_id, venue):
+            self.recompute_from_fills(position_id)
+            return
+
         sets: dict[str, str] = {"fees_usd": str(pos.fees_usd + fee_usd)}
         if phase == "entry":
             # Weight the entry average by the qty of PRIOR entry fills, not the
@@ -303,6 +315,13 @@ class PositionManager:
             (*sets.values(), _now_ms(), position_id),
         )
         self._conn.commit()
+
+    def _has_unwind(self, position_id: int, venue: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM fills WHERE position_id=? AND venue=?"
+            " AND phase='unwind' LIMIT 1",
+            (position_id, venue),
+        ).fetchone() is not None
 
     def _exited_qty(
         self, position_id: int, venue: str, exclude_last: bool = False
