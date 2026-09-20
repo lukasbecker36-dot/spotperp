@@ -44,32 +44,67 @@ def _block(title: str, asks, bids, div: Decimal) -> list[str]:
     return lines
 
 
-def _range_line(label: str, live: Decimal, lo, hi, thin: bool) -> str:
-    """One basis line with the pair's own 24h range beside the live figure, and
-    a word on where in that range the live figure sits.
+def _where_in(live: Decimal, lo: float, hi: float) -> str:
+    """Where a live figure sits in a band, or that it has left it."""
+    if live > hi:
+        return "ABOVE"
+    if live < lo:
+        return "BELOW"
+    if hi <= lo:
+        return ""
+    return f"{(float(live) - lo) / (hi - lo) * 100:.0f}%"
 
-    The live number alone cannot say whether it is a good level: +32 means one
-    thing on a pair that ranged -48 to +1 today and another on one that ranged
-    +30 to +60. Outside the range is the interesting case and reads opposite
-    ways by side — above is a dislocation, below means the range is describing
-    a regime that has ended.
+
+def _side_block(
+    label: str, live: Decimal, r24: tuple | None, rbase: tuple | None, *,
+    thin: bool, base_ok: bool, base_label: int, desc: str, side: str,
+) -> list[str]:
+    """One basis side: the live figure, its 24h and longer bands, and what the
+    two together say.
+
+    Each side gets its own bands because they answer different questions. On
+    the entry side the range says whether the basis is rich enough to sell
+    into. On the exit side it is where an /exit can actually fill — and the
+    longer band's low is the level a patient exit could reach, which the 24h
+    low alone will understate.
     """
-    if lo is None or hi is None:
-        return f"{label} {float(live):+7.1f}bps"
+    out = [f"{label} {float(live):+7.1f}bps"]
+    lo, hi = r24 or (None, None)
+    if lo is None:
+        out.append(f"  {desc}")
+        return out
     mark = "?" if thin else ""
-    where = ""
-    if not thin:
-        if live > hi:
-            where = "  ABOVE 24h range"
-        elif live < lo:
-            where = "  BELOW 24h range"
-        elif hi > lo:
-            pct = (float(live) - lo) / (hi - lo) * 100
-            where = f"  {pct:.0f}% of range"
-    return (
-        f"{label} {float(live):+7.1f}bps   24h {lo:+.1f}{mark} to"
-        f" {hi:+.1f}{mark}{where}"
-    )
+    where = "" if thin else _where_in(live, lo, hi)
+    suffix = ("  ABOVE 24h range" if where == "ABOVE" else
+              "  BELOW 24h range" if where == "BELOW" else
+              f"  {where} of range" if where else "")
+    out.append(f"  24h  {lo:+.1f}{mark} to {hi:+.1f}{mark}{suffix}")
+
+    b_lo, b_hi = rbase or (None, None)
+    if b_lo is None or not base_ok:
+        out.append(f"  {desc}")
+        return out
+    bw = _where_in(live, b_lo, b_hi)
+    btail = ("  ABOVE the period" if bw == "ABOVE" else
+             "  BELOW the period" if bw == "BELOW" else
+             f"  now {bw} up the period" if bw else "")
+    out.append(f"  {base_label}h  {b_lo:+.1f} to {b_hi:+.1f}{btail}")
+
+    if not thin and b_hi > b_lo:
+        if lo > b_hi:
+            out.append(f"  ⚠ today's whole range is ABOVE the {base_label}h"
+                       " band — the pair has repriced, not dislocated")
+        elif hi < b_lo:
+            out.append(f"  ⚠ today's whole range is BELOW the {base_label}h"
+                       f" band — the {base_label}h figures describe a level"
+                       " the pair has left")
+        elif side == "exit" and lo - b_lo >= 5.0:
+            # The one number a passive exit most wants: today's low is not the
+            # floor, the period's is. Waiting is worth this much more.
+            out.append(f"  a patient exit has {lo - b_lo:.0f}bps more room than"
+                       f" today's low — {base_label}h reached {b_lo:+.1f}")
+    out.append(f"  {desc}")
+    return out
 
 
 def format_book(
@@ -106,57 +141,33 @@ def format_book(
         entry = (a_ask - m_ask) / m_ask * BPS          # short perp ask / buy spot ask
         exit_passive = (a_bid - m_bid) / m_bid * BPS   # perp maker bid / sell spot bid
         exit_taker = (a_ask - m_bid) / m_bid * BPS     # perp taker ask / sell spot bid
-        lines.append("")
-        e_lo, e_hi = entry_range or (None, None)
-        x_lo, x_hi = exit_range or (None, None)
         thin = range_hours < range_min_hours
-        lines.append(_range_line("entry basis ", entry, e_lo, e_hi, thin))
-        lines.append("  short perp ask / buy spot ask")
-        lines.append(_range_line("exit passive", exit_passive, x_lo, x_hi, thin))
-        lines.append("  perp maker bid / sell spot bid")
+        base_ok = base_hours >= range_min_hours * 2
+        lines.append("")
+        lines += _side_block(
+            "entry basis ", entry, entry_range, base_entry_range,
+            thin=thin, base_ok=base_ok, base_label=base_label,
+            desc="short perp ask / buy spot ask", side="entry",
+        )
+        lines += _side_block(
+            "exit passive", exit_passive, exit_range, base_exit_range,
+            thin=thin, base_ok=base_ok, base_label=base_label,
+            desc="perp maker bid / sell spot bid", side="exit",
+        )
         lines.append(f"exit taker   {float(exit_taker):+7.1f}bps")
         lines.append(
             "  perp taker ask / sell spot bid — crosses the perp spread:"
             f" {float(exit_taker - exit_passive):.1f}bps worse"
         )
-        b_lo, b_hi = base_entry_range or (None, None)
-        bx_lo, bx_hi = base_exit_range or (None, None)
-        if b_lo is not None and base_hours >= range_min_hours * 2:
+        if (entry_range or (None,))[0] is not None and not thin:
+            shown = (f"24h/{base_label}h" if base_ok
+                     and (base_entry_range or (None,))[0] is not None else "24h")
             lines.append(
-                f"  {base_label}h   entry {b_lo:+.1f} to {b_hi:+.1f}"
-                + (f"   exit {bx_lo:+.1f} to {bx_hi:+.1f}"
-                   if bx_lo is not None else "")
+                f"  {shown} = p10/p90 of the HOURLY mean. Entry and exit"
+                " ranges are tracked separately, not one shifted from the"
+                " other — the gap between them is both books' live spread."
             )
-            # Where today's band sits inside the longer one. The useful case is
-            # the 24h band having left the baseline entirely — that is the pair
-            # moving to a new level, not a dislocation within its usual range,
-            # and the two read completely differently.
-            if e_lo is not None and not thin and b_hi > b_lo:
-                if e_lo > b_hi:
-                    lines.append(
-                        f"  ⚠ today's whole range is ABOVE the {base_label}h"
-                        " band — the pair has repriced, not dislocated"
-                    )
-                elif e_hi < b_lo:
-                    lines.append(
-                        f"  ⚠ today's whole range is BELOW the {base_label}h"
-                        f" band — the {base_label}h figures describe a level"
-                        " the pair has left"
-                    )
-                else:
-                    pos = (e_lo - b_lo) / (b_hi - b_lo) * 100
-                    lines.append(
-                        f"  today sits {pos:.0f}% up the {base_label}h band"
-                        + ("  (the cheap end of the period)" if pos < 25 else
-                           "  (the rich end of the period)" if pos > 75 else "")
-                    )
-        if e_lo is not None and not thin:
-            lines.append(
-                f"  24h = p10/p90 of the HOURLY mean over {range_hours:.0f}h."
-                " The exit range is tracked separately, not the entry range"
-                " shifted — the gap between them is both books' live spread."
-            )
-        elif e_lo is not None:
+        elif (entry_range or (None,))[0] is not None:
             lines.append(
                 f"  ? = only {range_hours:.0f}h of history"
                 f" (need {range_min_hours:.0f}h), so those bounds are the live"

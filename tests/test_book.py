@@ -101,8 +101,8 @@ def test_format_book_shows_24h_range_for_entry_and_exit():
         "BTCUSDT", Decimal(1), ASTER, MEXC,
         entry_range=(-40.0, 60.0), exit_range=(-45.0, 55.0), range_hours=24.0,
     )
-    assert "24h -40.0 to +60.0" in out       # entry side
-    assert "24h -45.0 to +55.0" in out       # exit side, tracked separately
+    assert "24h  -40.0 to +60.0" in out      # entry side
+    assert "24h  -45.0 to +55.0" in out      # exit side, tracked separately
     assert "90% of range" in out             # entry +50 within -40..+60
 
 
@@ -153,10 +153,17 @@ def test_baseline_says_where_today_sits_in_the_longer_range():
     """The 24h band says whether the basis is high for this pair TODAY. The
     longer one says whether today itself is unusual — a different question,
     and the answers can point opposite ways."""
-    out = _with_base((-161.7, -7.6), (-180.2, 40.1))
-    assert "72h   entry -180.2 to +40.1" in out
-    assert "today sits 8% up the 72h band" in out
-    assert "cheap end of the period" in out
+    # The live basis is +50 on this fixture. Inside a -40..+90 band that is
+    # 72% up the period; the 24h band it clears entirely.
+    out = _with_base((-161.7, -7.6), (-40.0, 90.0))
+    # Each side now carries both bands, because they answer different
+    # questions: the entry band is whether the basis is rich enough to sell
+    # into, the exit band is where an /exit can actually fill.
+    assert out.count("72h  -40.0 to +90.0") == 2
+    assert "ABOVE 24h range" in out
+    assert "up the period" in out
+    # ...and a figure outside the longer band says so rather than clamping.
+    assert "ABOVE the period" in _with_base((-161.7, -7.6), (-180.2, 40.1))
 
 
 def test_baseline_flags_a_band_that_has_left_the_period():
@@ -173,7 +180,7 @@ def test_baseline_hidden_without_enough_history():
     """Too little history and the percentiles fall back to the live basis, so
     a 'range' would be the same number twice dressed up as a period."""
     out = _with_base((-161.7, -7.6), (-180.2, 40.1), base_hours=8.0)
-    assert "72h" not in out
+    assert "72h " not in out
 
 
 def test_book_without_a_baseline_is_unchanged():
@@ -181,4 +188,30 @@ def test_book_without_a_baseline_is_unchanged():
         "BTCUSDT", Decimal(1), ASTER, MEXC,
         entry_range=(-40.0, 60.0), exit_range=(-45.0, 55.0), range_hours=24.0,
     )
-    assert "24h -40.0 to +60.0" in out and "72h" not in out
+    assert "24h  -40.0 to +60.0" in out and "72h " not in out
+
+
+def test_baseline_tells_a_passive_exit_how_much_room_is_left():
+    """The number a passive exit most wants: today's low is not the floor, the
+    period's is. Only on the exit side — on the entry side a lower low is not
+    an opportunity, it is the level you are trying not to sell at."""
+    out = book.format_book(
+        "BTCUSDT", Decimal(1), ASTER, MEXC,
+        entry_range=(-40.0, 60.0), exit_range=(-45.0, 55.0), range_hours=24.0,
+        base_entry_range=(-200.0, 70.0), base_exit_range=(-190.0, 65.0),
+        base_hours=72.0,
+    )
+    assert "a patient exit has 145bps more room" in out
+    assert out.count("more room") == 1        # exit side only
+
+
+def test_no_room_line_when_the_period_low_matches_today():
+    """Nothing to say when the longer window found no better level — the line
+    is there to change a decision, not to fill space."""
+    out = book.format_book(
+        "BTCUSDT", Decimal(1), ASTER, MEXC,
+        entry_range=(-40.0, 60.0), exit_range=(-45.0, 55.0), range_hours=24.0,
+        base_entry_range=(-42.0, 61.0), base_exit_range=(-47.0, 56.0),
+        base_hours=72.0,
+    )
+    assert "more room" not in out
