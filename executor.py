@@ -904,6 +904,8 @@ class Executor:
         _pre = self._positions.get(position.id)
         pre_perp_qty = _pre.perp_qty
         pre_perp_entry_avg = _pre.perp_entry_avg
+        pre_spot_qty = _pre.spot_qty
+        pre_spot_entry_avg = _pre.spot_entry_avg
 
         async def absorb_fills(result: OrderResult) -> None:
             nonlocal remaining, unhedged, order_seen_executed, run_filled
@@ -1142,6 +1144,30 @@ class Executor:
             # else: some clips hedged fine before a later one collapsed — a real
             # partial add; fall through and report the net that stuck.
 
+        def _run_leg_vwap(avg_now, qty_now, avg_pre, qty_pre):
+            """VWAP of just THIS run, backed out of the position's averages."""
+            added = qty_now - qty_pre
+            if added <= 0 or avg_now is None:
+                return None
+            prior = (avg_pre or Decimal(0)) * qty_pre
+            return (avg_now * qty_now - prior) / added
+
+        # The basis THIS run went in at, separate from the position's blended
+        # one. An add to an older, cheaper position blends down correctly and
+        # then reads as though the new clips went in badly — the two numbers
+        # answer different questions and both are worth saying.
+        run_basis = None
+        run_perp = _run_leg_vwap(
+            final.perp_entry_avg, final.perp_qty, pre_perp_entry_avg, pre_perp_qty
+        )
+        run_spot = _run_leg_vwap(
+            final.spot_entry_avg, final.spot_qty, pre_spot_entry_avg, pre_spot_qty
+        )
+        if run_perp and run_spot and run_spot > 0:
+            run_basis = (
+                (run_perp / pair.qty_multiplier - run_spot) / run_spot * BPS
+            )
+
         if final.spot_qty > 0 or final.perp_qty > 0:
             entry_basis = None
             if final.perp_entry_avg and final.spot_entry_avg:
@@ -1170,11 +1196,14 @@ class Executor:
             if is_add and net_added > 0:
                 journal(self._conn, f"position {position.id}: ADD +{net_added} ->"
                         f" perp={final.perp_qty} spot={final.spot_qty}"
-                        f" blended_basis={entry_basis}")
+                        f" run_basis={run_basis} blended_basis={entry_basis}")
+                run_str = (f"{float(run_basis):+.1f}" if run_basis is not None
+                           else "n/a")
                 await self._notifier.alert(
                     f"➕ position {position.id} {symbol}: added {net_added} perp"
-                    f" units (total qty={final.perp_qty}), blended entry"
-                    f" basis={basis_str} ({'paper' if self._paper else 'LIVE'})"
+                    f" units at basis {run_str}bps (total qty={final.perp_qty},"
+                    f" blended {basis_str}bps)"
+                    f" ({'paper' if self._paper else 'LIVE'})"
                 )
             elif is_add:
                 # Add worked but nothing filled (floor never met / timed out):

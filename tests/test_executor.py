@@ -970,3 +970,33 @@ async def test_oversold_sale_is_throttled_and_backs_off(env, monkeypatch):
     sale_alerts = [m for m in notifier.messages if "sale incomplete" in m]
     assert len(sale_alerts) == 1                      # throttled, not per-poll
     assert "reconcile it shortly" in sale_alerts[0]   # explains the cause
+
+
+async def test_add_reports_this_run_basis_separately_from_the_blend(env, monkeypatch):
+    """An add to an older, cheaper position blends DOWN correctly and then
+    reads as though the new clips went in badly. The two numbers answer
+    different questions — how this add executed, and what the whole position
+    now averages — so the alert says both."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_MAX_CLIP_NOTIONAL_USD", Decimal("100000"))
+    monkeypatch.setattr(config, "ENTRY_MIN_EDGE_FLOOR_BPS", Decimal("12"))
+
+    # A pre-existing position entered at a thin +10bps.
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True)
+    positions.record_fill(pos.id, "aster", "entry", "SELL", Decimal(100),
+                          Decimal("100.10"), Decimal(0))
+    positions.record_fill(pos.id, "mexc", "entry", "BUY", Decimal(100),
+                          Decimal("100.00"), Decimal(0))
+    positions.set_state(pos.id, pm.OPEN)
+
+    # Add at a much richer +50bps.
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+    positions.set_min_entry_bps(pos.id, Decimal(30))
+    executor.start_add(positions.get(pos.id), Decimal(1000))
+    # The position is already OPEN, so wait on the alert rather than the state.
+    await wait_for_message(notifier, "added")
+    msg = next(m for m in notifier.messages if "added" in m)
+    # This run went in at ~+50; the position now averages somewhere between.
+    assert "at basis +50" in msg
+    blended = float(positions.get(pos.id).entry_basis_bps)
+    assert 10 < blended < 50
