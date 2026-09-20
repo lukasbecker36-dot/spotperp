@@ -1816,3 +1816,49 @@ def test_basis_log_keeps_an_existing_file_at_its_own_width(engine, tmp_path, mon
     new = next((tmp_path / "next").glob("basis_log_*.csv"))
     rows = list(_csv.reader(new.open()))
     assert "perp_trades_24h" in rows[0] and len(rows[1]) == 7
+
+
+async def test_funding_hides_discount_rows(engine, monkeypatch, tmp_path):
+    """/funding lists premium candidates — short the perp, buy the spot. A
+    negative entry basis means the perp is CHEAPER than spot, so the trade
+    starts underwater. BANKUSDT scored +147 at an entry of -82 purely because
+    its 24h low was -312 and the score read that as convergence to come."""
+    import funding as funding_mod
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    monkeypatch.setattr(config, "FUNDING_MIN_ENTRY_BPS", 0.0)
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._basis_24h = screener.DailyBasis()
+    engine.md.funding_stats["BTCUSDT"] = funding_mod.summarize(
+        "BTCUSDT", [], None, now_ms=0
+    )
+    # Perp below spot on both sides -> a discount.
+    set_books(engine.md, "99.4", "99.5", "99.9", "100.0")
+    engine._write_funding_snapshot()
+    import json
+    snap = json.loads((tmp_path / "fnd.json").read_text())
+    assert snap["rows"] == []
+    assert snap["hidden"] == {"discount": 1}
+
+    # The same pair at a premium is listed.
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    engine._write_funding_snapshot()
+    snap = json.loads((tmp_path / "fnd.json").read_text())
+    assert [r["symbol"] for r in snap["rows"]] == ["BTCUSDT"]
+
+
+async def test_funding_discount_gate_is_tunable(engine, monkeypatch, tmp_path):
+    """The knob is about what gets SURFACED. /enter still takes a negative
+    target by hand, so the gate must not be hard-wired to zero."""
+    import funding as funding_mod
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    monkeypatch.setattr(config, "FUNDING_MIN_ENTRY_BPS", -200.0)
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._basis_24h = screener.DailyBasis()
+    engine.md.funding_stats["BTCUSDT"] = funding_mod.summarize(
+        "BTCUSDT", [], None, now_ms=0
+    )
+    set_books(engine.md, "99.4", "99.5", "99.9", "100.0")
+    engine._write_funding_snapshot()
+    import json
+    snap = json.loads((tmp_path / "fnd.json").read_text())
+    assert [r["symbol"] for r in snap["rows"]] == ["BTCUSDT"]

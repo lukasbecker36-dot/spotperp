@@ -602,6 +602,15 @@ class Engine:
             # them so /funding can say the screen is filtering rather than
             # leaving the user wondering where a row went.
             reject = screener.quote_reject_reason(screen) if screen else "book"
+            if not reject:
+                entry_now = (
+                    screen.entry_bps_avg if screen.samples
+                    else screen.entry_bps
+                )
+                # Gate on the figure the board SHOWS, so a row cannot be
+                # hidden for a number the reader cannot see.
+                if entry_now < config.FUNDING_MIN_ENTRY_BPS:
+                    reject = "discount"
             if reject:
                 hidden[reject] = hidden.get(reject, 0) + 1
                 continue

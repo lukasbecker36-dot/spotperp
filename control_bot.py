@@ -734,7 +734,12 @@ class ControlBot:
             lines.append(
                 "hidden as unworkable: "
                 + ", ".join(f"{v} {k}" for k, v in sorted(hid.items()))
-                + f" (index = Aster's own index disagrees with MEXC spot by"
+                + (f" (discount = entry basis below"
+                   f" {config.FUNDING_MIN_ENTRY_BPS:+.0f}, i.e. the perp is"
+                   " cheaper than spot, so shorting it starts the trade"
+                   " underwater;"
+                   if hid.get("discount") else " (")
+                + f"index = Aster's own index disagrees with MEXC spot by"
                 f" >{config.SCREEN_MAX_INDEX_DIVERGENCE_BPS / 100:.0f}%, so the"
                 " two symbols are not the same asset at the same scale and the"
                 " basis is fiction; spread = books"

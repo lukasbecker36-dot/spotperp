@@ -169,6 +169,15 @@ SCREEN_MAX_INDEX_DIVERGENCE_BPS = float(
 # against a 24h low of +120, because the 24h band had gone stale and was
 # describing a regime that had already ended.
 BASELINE_HOURS = int(os.environ.get("BASELINE_HOURS", "72"))
+# /funding lists premium candidates: short the perp, buy the spot. A negative
+# entry basis means the perp trades at a DISCOUNT, so shorting it starts the
+# trade underwater and the carry has to pay that back before anything else.
+# BANKUSDT scored +147 at an entry of -82 purely because its 24h low was -312
+# and the score read that as convergence to come.
+#
+# 0 keeps discount rows off the board. /enter still accepts a negative target
+# by hand — this is about what gets SURFACED, not what is permitted.
+FUNDING_MIN_ENTRY_BPS = float(os.environ.get("FUNDING_MIN_ENTRY_BPS", "0"))
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis
