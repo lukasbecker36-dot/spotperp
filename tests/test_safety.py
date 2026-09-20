@@ -1733,7 +1733,10 @@ class _EquityClient:
         self._aster = aster
 
     async def balances(self):
-        return [{"asset": "USDT", "balance": "1000", "crossUnPnl": "0"}]
+        return [{"asset": "USDT", "balance": "1000"}]
+
+    async def position_risk(self):
+        return []
 
     async def account(self):
         return {"balances": [{"asset": "USDT", "free": "500", "locked": "0"}]}
@@ -1767,6 +1770,9 @@ async def test_equity_sampler_does_not_store_a_partial_snapshot(engine):
     class _Broken:
         async def balances(self):
             raise ExchangeError("aster", "down")
+
+        async def position_risk(self):
+            return []
 
         async def account(self):
             return {"balances": []}

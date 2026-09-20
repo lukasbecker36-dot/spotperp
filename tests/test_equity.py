@@ -13,16 +13,26 @@ def _book(sym, bid, ask):
 
 
 class _Aster:
-    def __init__(self, balances=None, fail=False):
-        self._balances = balances or [
-            {"asset": "USDT", "balance": "1000", "crossUnPnl": "-25"},
+    def __init__(self, balances=None, fail=False, risk=None, risk_fail=False):
+        self._balances = balances or [{"asset": "USDT", "balance": "1000"}]
+        # Default: one short marked 25 in the red, matching the old fixture's
+        # crossUnPnl of -25 but sourced the way the code now reads it.
+        self._risk = risk if risk is not None else [
+            {"symbol": "GUSDT", "positionAmt": "-1000",
+             "unRealizedProfit": "-25"},
         ]
         self._fail = fail
+        self._risk_fail = risk_fail
 
     async def balances(self):
         if self._fail:
             raise ExchangeError("aster", "down")
         return self._balances
+
+    async def position_risk(self):
+        if self._risk_fail:
+            raise ExchangeError("aster", "down")
+        return self._risk
 
 
 class _Mexc:
@@ -43,8 +53,8 @@ async def test_total_is_perp_equity_plus_spot_plus_usdt():
                {"asset": "G", "free": "10000", "locked": "0"}]),
         {"GUSDT": _book("GUSDT", "0.03", "0.031")},
     )
-    # Perp equity is margin plus the open positions' mark-to-market, not the
-    # wallet alone — an unrealised loss is money you no longer have.
+    # Perp equity is the wallet plus the open positions' mark-to-market, not
+    # the wallet alone — an unrealised loss is money you no longer have.
     assert eq.aster_usd == Decimal(975)
     assert eq.spot_coins_usd == Decimal(300)      # marked at the BID
     assert eq.spot_usdt_usd == Decimal(400)
@@ -73,19 +83,66 @@ async def test_unpriced_coin_is_reported_not_counted():
 async def test_a_failed_venue_is_an_error_not_a_zero():
     """A venue that fails contributes 0, which would read as a crash in account
     value. The caller needs to know the snapshot is partial."""
-    eq = await equity.snapshot(_Aster(fail=True), _Mexc(), {})
+    eq = await equity.snapshot(_Aster(fail=True, risk=[]), _Mexc(), {})
     assert eq.aster_usd == 0 and eq.errors
+    eq = await equity.snapshot(_Aster(risk_fail=True), _Mexc(), {})
+    assert eq.errors and "positionRisk" in eq.errors[0]
     eq = await equity.snapshot(_Aster(), _Mexc(fail=True), {})
     assert eq.errors
 
 
-async def test_margin_balance_is_preferred_when_the_venue_gives_it():
+async def test_perp_is_marked_from_position_risk_not_the_balance_endpoint():
+    """crossUnPnl/marginBalance are Binance field names read nowhere else in
+    this codebase. If Aster omits them the perp leg silently stops marking and
+    account value swings by the full spot move with no hedge against it — the
+    balance endpoint is ignored for P&L now."""
     eq = await equity.snapshot(
-        _Aster([{"asset": "USDT", "balance": "1000", "crossUnPnl": "-25",
-                 "marginBalance": "980"}]),
+        _Aster(
+            balances=[{"asset": "USDT", "balance": "1000",
+                       "crossUnPnl": "-999", "marginBalance": "-999"}],
+            risk=[{"symbol": "GUSDT", "positionAmt": "-1000",
+                   "unRealizedProfit": "-25"}],
+        ),
         _Mexc(), {},
     )
-    assert eq.aster_usd == Decimal(980)
+    assert eq.aster_upnl_usd == Decimal(-25)      # from positionRisk
+    assert eq.aster_usd == Decimal(975)
+
+
+async def test_perp_upnl_computed_when_the_venue_omits_it():
+    """Without unRealizedProfit, (mark - entry) x signed size gets there: for
+    a SHORT (negative size) a mark below entry is a gain."""
+    eq = await equity.snapshot(
+        _Aster(risk=[{"symbol": "GUSDT", "positionAmt": "-1000",
+                      "entryPrice": "1.00", "markPrice": "0.98"}]),
+        _Mexc(), {},
+    )
+    assert eq.aster_upnl_usd == Decimal(20)
+    eq = await equity.snapshot(
+        _Aster(risk=[{"symbol": "GUSDT", "positionAmt": "-1000",
+                      "entryPrice": "1.00", "markPrice": "1.03"}]),
+        _Mexc(), {},
+    )
+    assert eq.aster_upnl_usd == Decimal(-30)
+
+
+async def test_unmarkable_position_is_reported():
+    """A position we cannot mark must be said out loud, not counted as flat —
+    that is how the perp leg went missing in the first place."""
+    eq = await equity.snapshot(
+        _Aster(risk=[{"symbol": "GUSDT", "positionAmt": "-1000"}]),
+        _Mexc(), {},
+    )
+    assert eq.errors and "unmarked" in eq.errors[0]
+
+
+async def test_flat_positions_are_skipped():
+    eq = await equity.snapshot(
+        _Aster(risk=[{"symbol": "X", "positionAmt": "0",
+                      "unRealizedProfit": "-999"}]),
+        _Mexc(), {},
+    )
+    assert eq.aster_upnl_usd == 0 and eq.aster_usd == Decimal(1000)
 
 
 def test_daily_series_takes_the_last_mark_of_each_day(tmp_path):

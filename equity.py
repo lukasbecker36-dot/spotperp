@@ -6,7 +6,7 @@ outside the strategy, or margin sitting idle. Account value can: it is what
 the two venues say you are worth right now, so its change over time is the
 only number that captures everything.
 
-    total = Aster perp account equity (margin + unrealised P&L)
+    total = Aster perp account equity (wallet + unrealised P&L)
           + MEXC spot coins marked to market
           + MEXC USDT
 
@@ -32,7 +32,7 @@ def _dec(value, default: str = "0") -> Decimal:
 
 @dataclass
 class Equity:
-    aster_usd: Decimal = Decimal(0)        # margin balance + unrealised P&L
+    aster_usd: Decimal = Decimal(0)        # wallet + unrealised P&L
     aster_margin_usd: Decimal = Decimal(0)  # the wallet part alone
     aster_upnl_usd: Decimal = Decimal(0)   # ...and the mark-to-market part
     spot_coins_usd: Decimal = Decimal(0)   # MEXC holdings ex-USDT, at the bid
@@ -55,16 +55,38 @@ async def snapshot(aster, mexc, mexc_books: dict) -> Equity:
         for b in await aster.balances():
             if b.get("asset") != "USDT":
                 continue
-            wallet = _dec(b.get("balance"))
-            # Aster mirrors Binance: crossUnPnl is the open positions' mark-to
-            # -market. marginBalance already includes it where present.
-            upnl = _dec(b.get("crossUnPnl"))
-            margin = _dec(b.get("marginBalance")) if b.get("marginBalance") else None
-            eq.aster_margin_usd = wallet
-            eq.aster_upnl_usd = upnl
-            eq.aster_usd = margin if margin is not None else wallet + upnl
+            eq.aster_margin_usd = _dec(b.get("balance"))
     except ExchangeError as exc:
         eq.errors.append(f"Aster balance: {exc}")
+
+    # Mark the perp leg from positionRisk, not from the balance endpoint.
+    # crossUnPnl/marginBalance are Binance field names and are read nowhere
+    # else in this codebase; if Aster omits them _dec() returns 0 and the perp
+    # leg silently stops marking, leaving account value swinging by the full
+    # spot move while the hedge against it never appears.
+    try:
+        for r in await aster.position_risk():
+            amt = _dec(r.get("positionAmt"))
+            if amt == 0:
+                continue
+            reported = r.get("unRealizedProfit")
+            if reported not in (None, ""):
+                eq.aster_upnl_usd += _dec(reported)
+                continue
+            # (mark - entry) x signed size: correct for either direction, and
+            # for a short (amt < 0) a mark below entry is a gain.
+            mark, entry = _dec(r.get("markPrice")), _dec(r.get("entryPrice"))
+            if mark > 0 and entry > 0:
+                eq.aster_upnl_usd += (mark - entry) * amt
+            else:
+                eq.errors.append(
+                    f"Aster {r.get('symbol')}: position open but neither"
+                    " unRealizedProfit nor a usable mark/entry — perp leg"
+                    " unmarked"
+                )
+    except ExchangeError as exc:
+        eq.errors.append(f"Aster positionRisk: {exc}")
+    eq.aster_usd = eq.aster_margin_usd + eq.aster_upnl_usd
 
     try:
         acct = await mexc.account()
