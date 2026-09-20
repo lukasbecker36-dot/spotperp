@@ -163,6 +163,12 @@ EQUITY_SNAPSHOT_MINUTES = float(os.environ.get("EQUITY_SNAPSHOT_MINUTES", "30"))
 SCREEN_MAX_INDEX_DIVERGENCE_BPS = float(
     os.environ.get("SCREEN_MAX_INDEX_DIVERGENCE_BPS", "500")
 )
+# A second, longer basis window shown beside the 24h one in /book. The 24h
+# range says whether the basis is high FOR THIS PAIR TODAY; this says whether
+# today itself is unusual. The distinction is the CATE trap: it quoted +104
+# against a 24h low of +120, because the 24h band had gone stale and was
+# describing a regime that had already ended.
+BASELINE_HOURS = int(os.environ.get("BASELINE_HOURS", "72"))
 
 # ── Strategy parameters (safety stops apply even to manual positions) ──
 EXIT_BASIS_BPS = Decimal("5.0")          # default passive-exit target basis

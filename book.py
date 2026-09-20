@@ -77,6 +77,8 @@ def format_book(
     levels: int = 5, funding: dict | None = None, volume: dict | None = None,
     entry_range: tuple | None = None, exit_range: tuple | None = None,
     range_hours: float = 0.0, range_min_hours: float = 6.0,
+    base_entry_range: tuple | None = None, base_exit_range: tuple | None = None,
+    base_hours: float = 0.0, base_label: int = 72,
 ) -> str:
     a_asks = _levels(aster_depth.get("asks"), levels)
     a_bids = _levels(aster_depth.get("bids"), levels)
@@ -117,6 +119,37 @@ def format_book(
             "  perp taker ask / sell spot bid — crosses the perp spread:"
             f" {float(exit_taker - exit_passive):.1f}bps worse"
         )
+        b_lo, b_hi = base_entry_range or (None, None)
+        bx_lo, bx_hi = base_exit_range or (None, None)
+        if b_lo is not None and base_hours >= range_min_hours * 2:
+            lines.append(
+                f"  {base_label}h   entry {b_lo:+.1f} to {b_hi:+.1f}"
+                + (f"   exit {bx_lo:+.1f} to {bx_hi:+.1f}"
+                   if bx_lo is not None else "")
+            )
+            # Where today's band sits inside the longer one. The useful case is
+            # the 24h band having left the baseline entirely — that is the pair
+            # moving to a new level, not a dislocation within its usual range,
+            # and the two read completely differently.
+            if e_lo is not None and not thin and b_hi > b_lo:
+                if e_lo > b_hi:
+                    lines.append(
+                        f"  ⚠ today's whole range is ABOVE the {base_label}h"
+                        " band — the pair has repriced, not dislocated"
+                    )
+                elif e_hi < b_lo:
+                    lines.append(
+                        f"  ⚠ today's whole range is BELOW the {base_label}h"
+                        f" band — the {base_label}h figures describe a level"
+                        " the pair has left"
+                    )
+                else:
+                    pos = (e_lo - b_lo) / (b_hi - b_lo) * 100
+                    lines.append(
+                        f"  today sits {pos:.0f}% up the {base_label}h band"
+                        + ("  (the cheap end of the period)" if pos < 25 else
+                           "  (the rich end of the period)" if pos > 75 else "")
+                    )
         if e_lo is not None and not thin:
             lines.append(
                 f"  24h = p10/p90 of the HOURLY mean over {range_hours:.0f}h."

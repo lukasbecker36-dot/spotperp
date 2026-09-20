@@ -98,6 +98,10 @@ class Engine:
         # 24h mean entry basis per symbol, so /screen can show whether the
         # current level is elevated or just this pair's normal richness.
         self._basis_24h = screener.DailyBasis()
+        # A second, longer window. Hourly aggregates only, so a few hundred
+        # floats per symbol — the cost is nil and it answers a question the
+        # 24h band cannot: whether TODAY is the anomaly.
+        self._basis_base = screener.DailyBasis(hours=config.BASELINE_HOURS)
         # Aster positionRisk cached by symbol (mark + liquidation price) for the
         # /positions liq readout. Refreshed each slow scan in live mode.
         self._position_risk: dict[str, dict] = {}
@@ -149,11 +153,16 @@ class Engine:
         # Warm the 24h basis window from our own logs: the engine restarts on
         # every /update, and a reset window would make the figure useless.
         try:
+            now_ms = int(time.time() * 1000)
             seeded = await asyncio.to_thread(
-                screener.seed_daily_from_logs, self._basis_24h,
-                int(time.time() * 1000),
+                screener.seed_daily_from_logs, self._basis_24h, now_ms,
             )
-            log.info("seeded 24h basis window with %d samples", seeded)
+            base_seeded = await asyncio.to_thread(
+                screener.seed_daily_from_logs, self._basis_base, now_ms,
+                config.BASELINE_HOURS,
+            )
+            log.info("seeded basis windows: 24h=%d samples, %dh=%d samples",
+                     seeded, config.BASELINE_HOURS, base_seeded)
         except Exception:
             log.exception("24h basis seed failed (continuing without history)")
         # Stops outlive the process: without their ids the hedge guard cannot
@@ -476,6 +485,7 @@ class Engine:
                 self._basis_avg.add(sym, now, row.entry_bps, row.net_edge_bps)
                 self._basis_avg.annotate(row)
                 self._basis_24h.add(sym, now, row.entry_bps, row.close_bps)
+                self._basis_base.add(sym, now, row.entry_bps, row.close_bps)
                 self._basis_24h.annotate(row)
                 vol = self.md.perp_volume.get(pair.aster_symbol) or {}
                 row.perp_volume_24h = float(vol.get("quote_volume", 0) or 0)
@@ -2149,6 +2159,10 @@ class Engine:
             exit_range=self._basis_24h.percentiles(symbol, close=True),
             range_hours=hours_24h,
             range_min_hours=config.SCREEN_DIFF_MIN_HOURS,
+            base_entry_range=self._basis_base.percentiles(symbol),
+            base_exit_range=self._basis_base.percentiles(symbol, close=True),
+            base_hours=self._basis_base.stats(symbol)[1],
+            base_label=config.BASELINE_HOURS,
         )
 
     async def _cmd_adopt(self, args: dict) -> str:

@@ -138,3 +138,47 @@ def test_format_book_without_ranges_is_unchanged():
     out = book.format_book("BTCUSDT", Decimal(1), ASTER, MEXC)
     assert "entry basis" in out and "+50.0bps" in out
     assert "24h" not in out.split("funding")[0]
+
+
+def _with_base(entry_range, base_range, base_hours=72.0):
+    return book.format_book(
+        "BTCUSDT", Decimal(1), ASTER, MEXC,
+        entry_range=entry_range, exit_range=entry_range, range_hours=24.0,
+        base_entry_range=base_range, base_exit_range=base_range,
+        base_hours=base_hours,
+    )
+
+
+def test_baseline_says_where_today_sits_in_the_longer_range():
+    """The 24h band says whether the basis is high for this pair TODAY. The
+    longer one says whether today itself is unusual — a different question,
+    and the answers can point opposite ways."""
+    out = _with_base((-161.7, -7.6), (-180.2, 40.1))
+    assert "72h   entry -180.2 to +40.1" in out
+    assert "today sits 8% up the 72h band" in out
+    assert "cheap end of the period" in out
+
+
+def test_baseline_flags_a_band_that_has_left_the_period():
+    """CATE quoted +104 against a 24h low of +120: the 24h band had gone stale
+    and described a regime that already ended. A 24h band lying wholly outside
+    the longer one is that, and it reads nothing like a dislocation."""
+    below = _with_base((-161.7, -7.6), (100.0, 290.0))
+    assert "BELOW the 72h band" in below and "a level the pair has left" in below
+    above = _with_base((300.0, 400.0), (10.0, 90.0))
+    assert "ABOVE the 72h band" in above and "repriced, not dislocated" in above
+
+
+def test_baseline_hidden_without_enough_history():
+    """Too little history and the percentiles fall back to the live basis, so
+    a 'range' would be the same number twice dressed up as a period."""
+    out = _with_base((-161.7, -7.6), (-180.2, 40.1), base_hours=8.0)
+    assert "72h" not in out
+
+
+def test_book_without_a_baseline_is_unchanged():
+    out = book.format_book(
+        "BTCUSDT", Decimal(1), ASTER, MEXC,
+        entry_range=(-40.0, 60.0), exit_range=(-45.0, 55.0), range_hours=24.0,
+    )
+    assert "24h -40.0 to +60.0" in out and "72h" not in out

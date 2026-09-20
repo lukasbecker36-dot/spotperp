@@ -149,7 +149,7 @@ def _accrue_funding(s: Series, i: int, j: int) -> float:
 
 def features_at(
     s: Series, hourly: Hourly, i: int, floor: float, *,
-    window: int, window_max_h: float, drops: dict,
+    window: int, window_max_h: float, baseline_h: int, drops: dict,
 ) -> dict | None:
     """What the screens would have shown at sample i, using only data <= ts[i].
 
@@ -179,6 +179,14 @@ def features_at(
     close_avg = _mean(s.close[lo_i:i + 1])
     lo_entry, hi_entry = pctile(list(ent24), 10), pctile(list(ent24), 90)
     lo_close, hi_close = pctile(list(cls24), 10), pctile(list(cls24), 90)
+    # A longer baseline answers a different question: not "is the basis high
+    # for this pair today" but "is TODAY unusual". CATE quoted +104 against a
+    # 24h low of +120 — the 24h band had gone stale and was describing a
+    # regime that already ended. Whether it ranks better than the 24h band is
+    # what the report is for; both are emitted so they can be compared.
+    entB, clsB = hourly.window(ts, baseline_h)
+    lo_entry_b, hi_entry_b = pctile(list(entB), 10), pctile(list(entB), 90)
+    lo_close_b, hi_close_b = pctile(list(clsB), 10), pctile(list(clsB), 90)
     return {
         "ts_ms": ts,
         "entry_bps": round(entry_avg, 2),
@@ -192,6 +200,21 @@ def features_at(
         # fills against the close series. Emitting both is the point.
         "net_vs_entry_lo": round(entry_avg - lo_entry - floor, 2),
         "net_vs_close_lo": round(entry_avg - lo_close - floor, 2),
+        f"lo{baseline_h}_entry": round(lo_entry_b, 2),
+        f"hi{baseline_h}_entry": round(hi_entry_b, 2),
+        f"lo{baseline_h}_close": round(lo_close_b, 2),
+        f"hi{baseline_h}_close": round(hi_close_b, 2),
+        f"net_vs_close_lo{baseline_h}": round(entry_avg - lo_close_b - floor, 2),
+        f"net_vs_entry_lo{baseline_h}": round(entry_avg - lo_entry_b - floor, 2),
+        # Where the 24h band sits inside the longer one. Near 0 means the pair
+        # has spent today at the cheap end of its recent range; near 100 the
+        # rich end; outside [0,100] means the 24h band has left the baseline
+        # altogether, which is a regime change rather than a dislocation.
+        "band_pos_pct": (
+            round((lo_entry - lo_entry_b) / (hi_entry_b - lo_entry_b) * 100, 1)
+            if hi_entry_b > lo_entry_b else ""
+        ),
+        f"hours_history_{baseline_h}": len(entB),
         "dwell_h": sum(1 for m in ent24 if m >= floor),
         "hours_history": len(ent24),
         "funding_8h_bps": round(s.funding[i], 3),
@@ -333,7 +356,8 @@ def log_span_hours(series: dict[str, Series]) -> float:
 def build(
     series: dict[str, Series], *, stride_h: float, horizons: list[int],
     floor: float, min_depth: float, min_entry: float,
-    window: int, window_max_h: float, sustain: int, drops: dict,
+    window: int, window_max_h: float, sustain: int, baseline_h: int,
+    drops: dict,
 ) -> list[dict]:
     rows: list[dict] = []
     done = 0
@@ -360,7 +384,8 @@ def build(
                 drops["min_entry"] = drops.get("min_entry", 0) + 1
                 continue
             feat = features_at(s, hourly, i, floor, window=window,
-                               window_max_h=window_max_h, drops=drops)
+                               window_max_h=window_max_h,
+                               baseline_h=baseline_h, drops=drops)
             if feat is None:
                 continue
             last_emit = s.ts[i]
@@ -400,6 +425,11 @@ def main() -> None:
                     help="samples in the short-window mean/jitter (default 5)."
                          " Counted in SAMPLES, not minutes, so it survives"
                          " whatever cadence the log has and any --every")
+    ap.add_argument("--baseline-hours", type=int, default=72,
+                    help="longer baseline window alongside the 24h one"
+                         " (default 72). Emits lo/hi on both series and"
+                         " net_vs_close_lo<N>, so the report can compare"
+                         " whether it ranks outcomes better than 24h")
     ap.add_argument("--sustain", type=int, default=5,
                     help="consecutive samples a close level must hold to count"
                          " as reachable (default 5). Guards the best-exit"
@@ -433,7 +463,7 @@ def main() -> None:
         series, stride_h=args.stride_hours, horizons=horizons,
         floor=args.floor, min_depth=args.min_depth, min_entry=args.min_entry,
         window=args.window, window_max_h=args.window_max_hours,
-        sustain=args.sustain, drops=drops,
+        sustain=args.sustain, baseline_h=args.baseline_hours, drops=drops,
     )
     if not rows:
         # Say WHICH constraint bit. "No rows" with a 168h horizon over a 5h log
