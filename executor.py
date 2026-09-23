@@ -778,8 +778,16 @@ class Executor:
             await asyncio.sleep(0.5)
         return remaining, last_error
 
-    async def _unwind_perp(self, position: pm.Position, qty: Decimal) -> None:
-        """Buy back a naked perp fill (leg risk). qty in Aster contract units."""
+    async def _unwind_perp(
+        self, position: pm.Position, qty: Decimal,
+        basis_bps: Decimal | None = None,
+    ) -> None:
+        """Buy back a naked perp fill (leg risk). qty in Aster contract units.
+
+        basis_bps is the hedge-time basis that triggered the abort, stored on
+        the fill so the cost of unwinding can later be weighed against what it
+        avoided — scripts/unwind_cost.py.
+        """
         pair = self._pair(position.symbol)
         info = self._md.aster_info[pair.aster_symbol]
         qty = info.round_qty(qty)
@@ -812,6 +820,7 @@ class Executor:
                     fill.qty,
                     fill.avg_price,
                     self._fee_usd("aster", False, fill.qty, fill.avg_price),
+                    basis_bps=basis_bps,
                 )
                 remaining = info.round_qty(remaining - fill.qty)
         if remaining > 0:
@@ -963,7 +972,7 @@ class Executor:
                     f" {float(hedge_min):.0f}bps) by hedge time"
                     f" — unwinding {naked} perp units instead of locking a loss"
                 )
-                await self._unwind_perp(position, naked)
+                await self._unwind_perp(position, naked, basis_bps=live_basis)
                 return
             if live_basis is not None and live_basis < entry_floor:
                 # Salvage: collapsed below the floor you wanted but still worth
@@ -997,7 +1006,9 @@ class Executor:
                     f"⚠️ position {position.id} {symbol}: spot hedge failed for"
                     f" {shortfall} base units{reason}, unwinding perp leg"
                 )
-                await self._unwind_perp(position, naked)
+                # A different cause — the spot leg would not fill at all —
+                # but the basis at the time is just as worth recording.
+                await self._unwind_perp(position, naked, basis_bps=live_basis)
 
         try:
             while True:

@@ -46,7 +46,7 @@ def unwind_events(conn, paper: bool = False) -> list[dict]:
     """Every unwind, priced against the entry fills it actually reversed."""
     rows = conn.execute(
         "SELECT f.position_id, f.venue, f.phase, f.qty, f.price, f.ts_ms,"
-        " p.symbol FROM fills f JOIN positions p ON p.id=f.position_id"
+        " f.basis_bps, p.symbol FROM fills f JOIN positions p ON p.id=f.position_id"
         " WHERE p.paper=? AND f.venue='aster' ORDER BY f.position_id, f.id",
         (int(paper),),
     ).fetchall()
@@ -90,6 +90,15 @@ def unwind_events(conn, paper: bool = False) -> list[dict]:
                 "unwind_price": price,
                 "cost_usd": round((price - entry_vwap) * took, 4),
                 "cost_bps": round((price - entry_vwap) / entry_vwap * 10_000, 2),
+                # The executable hedge basis that triggered the abort, when
+                # the engine was new enough to record it. This is the number
+                # the decision was actually made on; the log proxy below is
+                # what the board happened to be showing, which on a thin book
+                # is a different thing entirely.
+                "hedge_basis_bps": (
+                    round(float(f["basis_bps"]), 2)
+                    if f["basis_bps"] not in (None, "") else ""
+                ),
             })
     return out
 
@@ -146,13 +155,27 @@ def main() -> None:
     print(f"  median clip "
           f"${pctile(sorted(e['notional_usd'] for e in events), 50):,.0f}")
 
-    known = [e for e in events if e["abort_basis_bps"] != ""]
+    # Prefer the basis the DECISION was made on. Falling back to the board
+    # proxy is not equivalent: on a thin book the executable hedge basis sits
+    # far below the top-of-book quote, which is why aborts fire while the
+    # board still reads positive.
+    key = ("hedge_basis_bps"
+           if any(e["hedge_basis_bps"] != "" for e in events)
+           else "abort_basis_bps")
+    known = [e for e in events if e[key] != ""]
     if not known:
-        print("\nNo basis logs supplied, so the abort basis is unknown — pass"
-              " output/basis_log_*.csv* to get the comparison.", file=sys.stderr)
+        print("\nNo basis logs supplied and no recorded hedge basis — pass"
+              " output/basis_log_*.csv* for the proxy, or wait for unwinds"
+              " recorded by an engine new enough to store the real one.",
+              file=sys.stderr)
         return
+    if key == "abort_basis_bps":
+        print("\n⚠ using the board's quoted basis as a proxy: these unwinds"
+              " predate the engine recording the hedge basis it actually"
+              " decided on. A positive column here means the abort was driven"
+              " by hedge DEPTH, not by the market moving.")
 
-    edges = [round(pctile(sorted(e["abort_basis_bps"] for e in known), p), 1)
+    edges = [round(pctile(sorted(e[key] for e in known), p), 1)
              for p in (25, 50, 75)]
     hdr = (f"\n{'abort basis':<16}{'n':>5}{'med basis':>11}{'med cost':>10}"
            f"{'med $':>9}{'cheaper':>10}")
@@ -161,18 +184,23 @@ def main() -> None:
     for i in range(len(edges) + 1):
         lo = edges[i - 1] if i else float("-inf")
         hi = edges[i] if i < len(edges) else float("inf")
-        g = [e for e in known if lo <= e["abort_basis_bps"] < hi]
+        g = [e for e in known if lo <= e[key] < hi]
         if not g:
             continue
         name = (f"<{edges[0]:g}" if i == 0 else
                 f">={edges[-1]:g}" if i == len(edges) else
                 f"{lo:g}..{hi:g}")
-        med_b = pctile(sorted(e["abort_basis_bps"] for e in g), 50)
+        med_b = pctile(sorted(e[key] for e in g), 50)
         med_c = pctile(sorted(e["cost_bps"] for e in g), 50)
         # Salvaging opens a position at med_b; unwinding realises med_c. The
         # comparison is only meaningful when the abort basis is NEGATIVE — a
         # positive one was never a loss to avoid in the first place.
-        cheaper = "salvage" if med_c > max(-med_b, 0) else "unwind"
+        # Only meaningful when the abort basis is NEGATIVE: a positive one
+        # was never a loss to avoid, so there is nothing to trade off and
+        # calling it "salvage" would dress a degenerate comparison as a
+        # finding.
+        cheaper = ("n/a" if med_b >= 0 else
+                   "salvage" if med_c > -med_b else "unwind")
         print(f"{name:<16}{len(g):>5}{med_b:>11.1f}{med_c:>10.1f}"
               f"{pctile(sorted(e['cost_usd'] for e in g), 50):>9.2f}"
               f"{cheaper:>10}")
@@ -188,7 +216,14 @@ def main() -> None:
         " position entered there, which funding and convergence can repay."
     )
     print(
-        f"'cheaper' compares a certain cost against opening at that basis."
+        "'cheaper' is n/a where the abort basis is POSITIVE: there was no loss"
+        " to avoid, so the unwind bought nothing. Those rows are aborts driven"
+        " by hedge depth — the executable basis for the size being hedged fell"
+        " below the floor while the quote did not."
+    )
+    print(
+        f"Where it is negative, 'cheaper' compares a certain cost against"
+        f" opening at that basis."
         f" ENTRY_HEDGE_MIN_BPS is currently"
         f" {float(config.ENTRY_HEDGE_MIN_BPS):+g} with a slack of"
         f" {float(config.ENTRY_HEDGE_SLIP_BPS):g} below the entry target:"

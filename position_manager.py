@@ -226,11 +226,19 @@ class PositionManager:
         price: Decimal,
         fee_usd: Decimal,
         order_id: str | None = None,
+        basis_bps: Decimal | None = None,
     ) -> None:
-        """Insert the fill and fold it into the position's qty/avg/fee columns."""
+        """Insert the fill and fold it into the position's qty/avg/fee columns.
+
+        basis_bps records the executable basis behind the decision, where the
+        fill was the result of one. It is set on unwinds: the hedge-time basis
+        that triggered an abort lives only in an alert string otherwise, so the
+        cost of aborting can be measured but never compared with what it
+        avoided.
+        """
         self._conn.execute(
             "INSERT INTO fills (position_id, venue, phase, side, qty, price, fee_usd,"
-            " order_id, ts_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " order_id, basis_bps, ts_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 position_id,
                 venue,
@@ -240,6 +248,7 @@ class PositionManager:
                 str(price),
                 str(fee_usd),
                 order_id,
+                str(basis_bps) if basis_bps is not None else None,
                 _now_ms(),
             ),
         )

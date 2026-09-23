@@ -135,6 +135,11 @@ _MIGRATIONS = [
     "ALTER TABLE positions ADD COLUMN trade_kind TEXT NOT NULL DEFAULT 'convergence'",
     "ALTER TABLE positions ADD COLUMN exit_target_qty TEXT",
     "ALTER TABLE positions ADD COLUMN unwind_pnl_usd TEXT NOT NULL DEFAULT '0'",
+    # The executable basis behind a decision, where the fill was the result of
+    # one. Set on unwinds: the hedge-time basis that triggered the abort is
+    # otherwise nowhere on disk, so the cost of aborting can be measured but
+    # never compared with what it avoided.
+    "ALTER TABLE fills ADD COLUMN basis_bps TEXT",
 ]
 
 

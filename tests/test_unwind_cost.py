@@ -104,3 +104,29 @@ def test_no_unwinds_is_not_an_error(conn):
     pid = _position(conn)
     _fill(conn, pid, "entry", 100, "1.00", 100)
     assert uw.unwind_events(conn) == []
+
+
+def test_prefers_the_recorded_hedge_basis_over_the_board_proxy(conn):
+    """The engine decides on the EXECUTABLE hedge basis for the size being
+    hedged. On a thin book that sits far below the top-of-book quote, which is
+    why aborts fire while the board still reads positive — so the recorded
+    number and the log proxy are not interchangeable."""
+    pid = _position(conn)
+    _fill(conn, pid, "entry", 100, "1.00", 100)
+    conn.execute(
+        "INSERT INTO fills (position_id,venue,phase,side,qty,price,fee_usd,"
+        "basis_bps,ts_ms) VALUES (?,'aster','unwind','BUY','100','1.02','0',"
+        "'-40.5',101)", (pid,))
+    conn.commit()
+    ev, = uw.unwind_events(conn)
+    assert ev["hedge_basis_bps"] == -40.5
+
+
+def test_hedge_basis_absent_on_older_fills(conn):
+    """Unwinds recorded before the column existed have to be distinguishable
+    from ones that genuinely aborted at zero."""
+    pid = _position(conn)
+    _fill(conn, pid, "entry", 100, "1.00", 100)
+    _fill(conn, pid, "unwind", 100, "1.02", 101)
+    ev, = uw.unwind_events(conn)
+    assert ev["hedge_basis_bps"] == ""
