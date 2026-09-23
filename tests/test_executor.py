@@ -1000,3 +1000,70 @@ async def test_add_reports_this_run_basis_separately_from_the_blend(env, monkeyp
     assert "at basis +50" in msg
     blended = float(positions.get(pos.id).entry_basis_bps)
     assert 10 < blended < 50
+
+
+async def test_partial_salvage_hedges_what_the_ladder_supports(env, monkeypatch):
+    """94 recorded unwinds aborted at a quoted basis of +11 to +88 while the
+    executable basis for the FULL clip sat under the floor — the hedge was
+    walking the book, not chasing a moved market. So take the part the ladder
+    supports at the floor and unwind only the excess, instead of buying back
+    the lot at a median 38bps."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_HEDGE_SLIP_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_MAX_CLIP_NOTIONAL_USD", Decimal("100000"))
+    monkeypatch.setattr(config, "MIN_HEDGE_NOTIONAL_USD", Decimal(1))
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    calls = {"n": 0}
+
+    async def flip_depth(symbol, side, limit=20):
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return [(Decimal("100.0"), Decimal(100))]
+        # Part of the size is available at a basis that still clears 0; past
+        # that the ladder jumps and the VWAP for the WHOLE clip goes negative,
+        # which is what the all-or-nothing abort used to react to.
+        return [(Decimal("100.0"), Decimal(5)), (Decimal("110.0"), Decimal(100))]
+    executor._trader.spot_depth = flip_depth
+
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True,
+                           min_entry_bps=Decimal(30))
+    executor.start_entry(pos)
+    await wait_for_message(notifier, "collapsed")
+    msg = next(m for m in notifier.messages if "collapsed" in m)
+    assert "hedging" in msg and "unwinding" in msg
+    await wait_for_state(positions, pos.id, pm.OPEN)
+    final = positions.get(pos.id)
+    # Part of the clip survived, hedged, rather than the whole thing unwinding.
+    assert final.perp_qty > 0
+    assert final.spot_qty == final.perp_qty
+
+
+async def test_unwinds_everything_when_nothing_is_hedgeable(env, monkeypatch):
+    """A ladder that supports nothing at the floor is the old case, and must
+    still unwind the lot rather than hedge a dust clip into a bad basis."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_HEDGE_SLIP_BPS", Decimal(0))
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    calls = {"n": 0}
+
+    async def flip_depth(symbol, side, limit=20):
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return [(Decimal("100.0"), Decimal(100))]
+        return [(Decimal("101.0"), Decimal(100))]   # nothing clears the floor
+    executor._trader.spot_depth = flip_depth
+
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True,
+                           min_entry_bps=Decimal(30))
+    executor.start_entry(pos)
+    await wait_for_message(notifier, "collapsed")
+    assert "instead of locking a loss" in next(
+        m for m in notifier.messages if "collapsed" in m
+    )
+    await wait_for_state(positions, pos.id, pm.CANCELLED)
+    final = positions.get(pos.id)
+    assert final.perp_qty == 0 and final.spot_qty == 0

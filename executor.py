@@ -575,6 +575,32 @@ class Executor:
         mult = self._pair(symbol).qty_multiplier
         return (aster.ask / mult - mexc.ask) / mexc.ask * BPS
 
+    async def _hedgeable_at(
+        self, perp_price: Decimal, pair, floor_bps: Decimal,
+        cap_contracts: Decimal, aster_info,
+    ) -> Decimal:
+        """Perp contracts whose spot hedge still clears floor_bps against the
+        book RIGHT NOW, capped at what is actually unhedged.
+
+        The same sizing the placement gate uses, re-run at hedge time. A clip
+        sized against the ladder when the order was placed is the wrong size
+        when it fills, and the gap is what makes an all-or-nothing abort throw
+        away the part that was always hedgeable.
+        """
+        try:
+            asks = await self._trader.spot_depth(pair.mexc_symbol, "BUY")
+        except ExchangeError:
+            return Decimal(0)
+        if not asks:
+            return Decimal(0)
+        base = max_hedgeable_qty(
+            perp_price / pair.qty_multiplier, asks, floor_bps
+        )
+        if base <= 0:
+            return Decimal(0)
+        contracts = aster_info.round_qty(base / pair.qty_multiplier)
+        return min(contracts, cap_contracts)
+
     async def _live_hedge_basis_bps(
         self, perp_price: Decimal, mexc_symbol: str, base_qty: Decimal,
         mult: Decimal,
@@ -960,20 +986,39 @@ class Executor:
                 Decimal(str(entry_floor)) - config.ENTRY_HEDGE_SLIP_BPS,
             )
             if live_basis is not None and live_basis < hedge_min:
-                # Below the salvage floor: holding would lock a loss, so unwind
-                # rather than hedge into it.
-                naked = unhedged
-                unhedged = Decimal(0)
+                # The basis for the WHOLE clip is below the floor — but that is
+                # usually because the hedge walks the book, not because the
+                # market moved: 94 recorded unwinds aborted at a median quoted
+                # basis of +11 to +88 while the executable basis for the full
+                # size sat under the floor. A smaller hedge does not walk as
+                # far, so take the part the ladder supports at the floor and
+                # unwind only the excess. Unwinding the lot cost a median 38bps
+                # of the clip; the part that could have been hedged was free.
+                salvage = await self._hedgeable_at(
+                    perp_ref, pair, hedge_min, unhedged, aster_info
+                )
+                ref_now = book.ask if book else ref_price
+                if salvage * pair.qty_multiplier * ref_now < config.MIN_HEDGE_NOTIONAL_USD:
+                    salvage = Decimal(0)     # too small to be worth a clip
+                naked = unhedged - salvage
+                unhedged = salvage
                 aborted = True
                 abort_basis = live_basis
-                await self._notifier.alert(
-                    f"🛑 position {position.id} {symbol}: entry basis collapsed to"
-                    f" {live_basis:.1f}bps (below hedge-min"
-                    f" {float(hedge_min):.0f}bps) by hedge time"
-                    f" — unwinding {naked} perp units instead of locking a loss"
-                )
-                await self._unwind_perp(position, naked, basis_bps=live_basis)
-                return
+                if naked > 0:
+                    part = (f" — hedging {salvage} at the floor and unwinding"
+                            f" {naked}" if salvage > 0
+                            else f" — unwinding {naked} perp units instead of"
+                                 " locking a loss")
+                    await self._notifier.alert(
+                        f"🛑 position {position.id} {symbol}: entry basis for the"
+                        f" full clip collapsed to {live_basis:.1f}bps (below"
+                        f" hedge-min {float(hedge_min):.0f}bps) by hedge time"
+                        f"{part}"
+                    )
+                    await self._unwind_perp(position, naked, basis_bps=live_basis)
+                if salvage <= 0:
+                    return
+                # Fall through and hedge the salvageable part.
             if live_basis is not None and live_basis < entry_floor:
                 # Salvage: collapsed below the floor you wanted but still worth
                 # holding — hedge and keep it rather than pay to unwind.
