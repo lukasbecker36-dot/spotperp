@@ -90,6 +90,9 @@ def engine(tmp_path, monkeypatch):
     eng._position_risk_ts = 0.0
     eng._position_risk_wall_ms = 0
     eng._basis_24h = screener.DailyBasis()
+    eng._basis_base = screener.DailyBasis(hours=72)
+    eng._opp_since = {}
+    eng._opp_alerted = set()
 
     class _NoOrders:
         """Venue stub for command handlers that list resting orders."""
@@ -2009,3 +2012,164 @@ async def test_manual_stops_refused_while_an_exit_works(engine, monkeypatch):
     engine.positions.set_exit_request(pid, "passive", Decimal(10))
     out = await engine._cmd_stops({"symbol": str(pid)})
     assert "exit working" in out and placed == []
+
+
+# ── exit-opportunity alerts ──────────────────────────────────────────────────
+
+def test_opportunity_needs_an_unusual_level():
+    """Gate 1: the close basis must be below this pair's own 72h low. A big
+    gain at an ordinary level for the name is not an event."""
+    assert live_monitor.exit_opportunity(
+        entry_bps=50, close_bps=12, lo_close_bps=10, carry_8h_bps=1,
+        exit_cost_bps=15, days_required=3,
+    ) is None
+
+
+def test_opportunity_needs_to_beat_the_carry_it_gives_up():
+    """Gate 2: an unusual level is not worth leaving a fat carry for if the
+    gain is only a couple of days of it."""
+    # gain 50 - (-30) - 15 = 65bps; carry 10/8h = 30/day -> 2.2 days < 3
+    assert live_monitor.exit_opportunity(
+        entry_bps=50, close_bps=-30, lo_close_bps=10, carry_8h_bps=10,
+        exit_cost_bps=15, days_required=3,
+    ) is None
+    opp = live_monitor.exit_opportunity(
+        entry_bps=50, close_bps=-30, lo_close_bps=10, carry_8h_bps=5,
+        exit_cost_bps=15, days_required=3,
+    )
+    assert opp and opp["carry_days"] == pytest.approx(65 / 15)
+
+
+def test_opportunity_never_fires_on_a_loss():
+    """Below the 72h low is not a gain if the position was entered even lower
+    — that is the range gate firing alone, which is why there are two."""
+    assert live_monitor.exit_opportunity(
+        entry_bps=-40, close_bps=-30, lo_close_bps=10, carry_8h_bps=0.1,
+        exit_cost_bps=15, days_required=3,
+    ) is None
+
+
+def test_opportunity_when_paying_to_hold():
+    """Negative carry means holding costs money, so any profitable exit at an
+    unusual level beats staying."""
+    opp = live_monitor.exit_opportunity(
+        entry_bps=50, close_bps=-30, lo_close_bps=10, carry_8h_bps=-5,
+        exit_cost_bps=15, days_required=3,
+    )
+    assert opp and opp["carry_days"] == float("inf")
+
+
+async def _plunge_setup(engine, monkeypatch, carry_8h=1.0):
+    """A live position entered at ~+50bps, a pair whose close basis has sat at
+    +10 for two days, and funding of carry_8h bps per 8h."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(config, "EXIT_OPP_ALERTS", True)
+    monkeypatch.setattr(config, "EXIT_OPP_CARRY_DAYS", 3.0)
+    monkeypatch.setattr(config, "EXIT_OPP_SUSTAIN_SECONDS", 120.0)
+    monkeypatch.setattr(config, "EXIT_OPP_REARM_BPS", 10.0)
+    monkeypatch.setattr(config, "EXIT_OPP_MIN_HOURS", 24.0)
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    now = int(_time.time() * 1000)
+    for h in range(48):
+        engine._basis_base.add("BTCUSDT", now - h * 3_600_000, 20.0, 10.0)
+    engine.md.funding_stats["BTCUSDT"] = SimpleNamespace(
+        avg_24h_8h_bps=carry_8h, interval_hours=8,
+    )
+    engine.md.funding["BTCUSDT"] = {
+        "funding_rate": Decimal(str(carry_8h)) / Decimal(10000)
+    }
+    return pid
+
+
+def _plunge(engine):
+    # close = (99.7 - 100.0) / 100.0 = -30bps, well under the +10 low
+    set_books(engine.md, "99.7", "99.8", "100.0", "100.1")
+
+
+async def test_plunge_alerts_once_it_has_held(engine, monkeypatch):
+    """A single tick below the low is a flicker. The alert waits until the
+    level has held for the whole window."""
+    pid = await _plunge_setup(engine, monkeypatch)
+    _plunge(engine)
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert not any("close basis" in m for m in engine.notifier.messages)
+    engine._opp_since[pid] = _time.monotonic() - 121     # window has elapsed
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    msg = next(m for m in engine.notifier.messages if "close basis" in m)
+    assert "below its 72h low" in msg
+    assert f"/exit {pid} now" in msg
+    assert "Advisory only" in msg
+
+
+async def test_a_tick_back_above_resets_the_clock(engine, monkeypatch):
+    """Sustained means every sweep agrees. One sweep back above the low
+    restarts the window rather than counting towards it."""
+    pid = await _plunge_setup(engine, monkeypatch)
+    _plunge(engine)
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    engine._opp_since[pid] = _time.monotonic() - 100
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")  # back to +50
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert pid not in engine._opp_since
+
+
+async def test_one_alert_per_event_then_rearms(engine, monkeypatch):
+    """No alert every five seconds while the basis stays down, and none when
+    it hovers on the boundary — but a fresh plunge after a proper recovery
+    alerts again."""
+    pid = await _plunge_setup(engine, monkeypatch)
+    _plunge(engine)
+    for _ in range(3):
+        engine._opp_since[pid] = _time.monotonic() - 121
+        await engine._check_exit_opportunity(engine.positions.get(pid))
+    alerts = [m for m in engine.notifier.messages if "close basis" in m]
+    assert len(alerts) == 1
+    # Back just above the low: inside the re-arm margin, still quiet.
+    set_books(engine.md, "100.14", "100.2", "100.0", "100.1")   # +14 < 10+10
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert pid in engine._opp_alerted
+    # Clear recovery re-arms; a new plunge alerts again.
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert pid not in engine._opp_alerted
+    _plunge(engine)
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    engine._opp_since[pid] = _time.monotonic() - 121
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert len([m for m in engine.notifier.messages if "close basis" in m]) == 2
+
+
+async def test_opportunity_alert_is_advisory_only(engine, monkeypatch):
+    """It must never act: no exit requested, state unchanged, no orders."""
+    pid = await _plunge_setup(engine, monkeypatch)
+    _plunge(engine)
+    engine._opp_since[pid] = _time.monotonic() - 121
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    pos = engine.positions.get(pid)
+    assert pos.state == pm.OPEN and pos.exit_mode is None
+    assert not engine.executor.has_task(pid)
+
+
+async def test_no_opportunity_alert_once_an_exit_is_requested(engine, monkeypatch):
+    """Telling you to exit a position you are already exiting is noise."""
+    pid = await _plunge_setup(engine, monkeypatch)
+    engine.positions.set_exit_request(pid, "passive", Decimal(0))
+    _plunge(engine)
+    engine._opp_since[pid] = _time.monotonic() - 121
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert not any("close basis" in m for m in engine.notifier.messages)
+
+
+async def test_opportunity_waits_for_enough_history(engine, monkeypatch):
+    """A 72h low built from a few hours is the live basis echoed back, not a
+    range — nothing is unusual against it."""
+    pid = await _plunge_setup(engine, monkeypatch)
+    engine._basis_base = screener.DailyBasis(hours=72)
+    now = int(_time.time() * 1000)
+    for h in range(6):
+        engine._basis_base.add("BTCUSDT", now - h * 3_600_000, 20.0, 10.0)
+    _plunge(engine)
+    engine._opp_since[pid] = _time.monotonic() - 121
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert not any("close basis" in m for m in engine.notifier.messages)

@@ -23,6 +23,7 @@ import book
 import recon
 import recovery
 import screener
+from screener import BPS
 from auth import (
     load_aster_credentials,
     load_env,
@@ -47,6 +48,39 @@ def _dec_or_zero(value) -> Decimal:
     if value is None or value == "":
         return Decimal(0)
     return Decimal(str(value))
+
+
+
+def exit_opportunity(
+    *, entry_bps: float, close_bps: float, lo_close_bps: float,
+    carry_8h_bps: float, exit_cost_bps: float, days_required: float,
+    below_lo_bps: float = 0.0,
+) -> dict | None:
+    """Whether closing a position NOW is an opportunity worth flagging.
+
+    Two gates, and each alone fires wrongly:
+
+      * UNUSUAL: the close basis is below this pair's own 72h low (the p10 of
+        hourly means on the close series). Alone, it ignores whether exiting
+        pays — it fires even on a position entered below that level.
+      * WORTH IT: the gain from closing now, after exit costs, beats
+        days_required days of the carry you would give up by leaving. Alone,
+        it fires on slow drift — anything entered rich clears it constantly.
+
+    Together: an unusual level that is also worth leaving the carry for.
+    Returns the figures for the alert, or None.
+    """
+    if close_bps >= lo_close_bps - below_lo_bps:
+        return None
+    gain = entry_bps - close_bps - exit_cost_bps
+    if gain <= 0:
+        return None
+    per_day = carry_8h_bps * 3.0
+    # Paying to hold (carry <= 0) means any profitable exit beats staying.
+    days = gain / per_day if per_day > 0 else float("inf")
+    if days < days_required:
+        return None
+    return {"gain_bps": gain, "carry_days": days, "per_day_bps": per_day}
 
 
 class Engine:
@@ -102,6 +136,10 @@ class Engine:
         # floats per symbol — the cost is nil and it answers a question the
         # 24h band cannot: whether TODAY is the anomaly.
         self._basis_base = screener.DailyBasis(hours=config.BASELINE_HOURS)
+        # Exit-opportunity alerts: when each position's condition first held,
+        # and which have alerted and are waiting to re-arm.
+        self._opp_since: dict[int, float] = {}
+        self._opp_alerted: set[int] = set()
         # Aster positionRisk cached by symbol (mark + liquidation price) for the
         # /positions liq readout. Refreshed each slow scan in live mode.
         self._position_risk: dict[str, dict] = {}
@@ -2512,6 +2550,100 @@ class Engine:
             funding_avg_8h_bps=funding_avg,
         )
 
+    async def _check_exit_opportunity(self, pos: pm.Position) -> None:
+        """Flag a sharp, sustained drop in a position's closeable basis.
+
+        ADVISORY ONLY — this never places, cancels or requests anything. It
+        exists because a plunge that would have been worth days of carry can
+        come and go while nobody is looking.
+        """
+        if self.paper or not config.EXIT_OPP_ALERTS:
+            return
+        pos = self.positions.get(pos.id)          # _check_safety may have acted
+        if pos.state != pm.OPEN or pos.exit_mode is not None:
+            self._opp_since.pop(pos.id, None)
+            return
+        if pos.perp_qty <= 0 or pos.spot_qty <= 0:
+            return
+        if not (pos.perp_entry_avg and pos.spot_entry_avg):
+            return
+        pair = self.md.pair_maps.get(pos.symbol)
+        if pair is None:
+            return
+        abook = self.md.aster_books.get(pair.aster_symbol)
+        mbook = self.md.mexc_books.get(pair.mexc_symbol)
+        if not abook or not mbook or mbook.bid <= 0 or abook.bid <= 0:
+            return
+        mult = pair.qty_multiplier
+        # The closeable basis — what an exit actually realises — rather than
+        # uPnL, which marks the perp at Aster's mark and the spot at the MEXC
+        # bid; those drift apart, so a uPnL "jump" need not be takeable.
+        close_bps = float((abook.bid / mult - mbook.bid) / mbook.bid * BPS)
+        taker_bps = float((abook.ask / mult - mbook.bid) / mbook.bid * BPS)
+        entry_bps = float(
+            (pos.perp_entry_avg / mult - pos.spot_entry_avg)
+            / pos.spot_entry_avg * BPS
+        )
+        lo, _hi = self._basis_base.percentiles(pos.symbol, close=True)
+        _mean, hours = self._basis_base.stats(pos.symbol)
+        if lo is None or hours < config.EXIT_OPP_MIN_HOURS:
+            return
+
+        # Hysteresis: once alerted, stay quiet until the basis is back clear of
+        # the low, so a level sitting on the boundary cannot alert repeatedly.
+        if pos.id in self._opp_alerted:
+            if close_bps > lo + config.EXIT_OPP_REARM_BPS:
+                self._opp_alerted.discard(pos.id)
+            return
+
+        stat = self.md.funding_stats.get(pair.aster_symbol)
+        live = (self.md.funding.get(pair.aster_symbol) or {}).get("funding_rate")
+        avg_8h = stat.avg_24h_8h_bps if stat else 0.0
+        cur_8h = avg_8h
+        if live is not None and stat and stat.interval_hours:
+            cur_8h = float(live * Decimal(10000) * 8 / Decimal(stat.interval_hours))
+        # The lower of the two, as in carry_score: a collapsed carry must not
+        # make leaving look expensive on the strength of its average.
+        carry_8h = min(avg_8h, cur_8h)
+        exit_cost = float(config.EXIT_FEE_PASSIVE * BPS + config.EXIT_SLIPPAGE_BPS)
+        opp = exit_opportunity(
+            entry_bps=entry_bps, close_bps=close_bps, lo_close_bps=lo,
+            carry_8h_bps=carry_8h, exit_cost_bps=exit_cost,
+            days_required=config.EXIT_OPP_CARRY_DAYS,
+            below_lo_bps=config.EXIT_OPP_BELOW_LO_BPS,
+        )
+        now = time.monotonic()
+        if opp is None:
+            self._opp_since.pop(pos.id, None)
+            return
+        # Sustained, not a tick: every sweep across the window has to agree.
+        since = self._opp_since.setdefault(pos.id, now)
+        if now - since < config.EXIT_OPP_SUSTAIN_SECONDS:
+            return
+        self._opp_since.pop(pos.id, None)
+        self._opp_alerted.add(pos.id)
+
+        notional = float(pos.spot_qty * mbook.bid)
+        usd = opp["gain_bps"] / 10_000 * notional
+        taker_cost = float(config.EXIT_FEE_AGGRESSIVE * BPS + config.EXIT_SLIPPAGE_BPS)
+        taker_gain = entry_bps - taker_bps - taker_cost
+        days = opp["carry_days"]
+        days_s = "more than any carry (you are paying to hold)" if days == float(
+            "inf") else f"{days:.1f} days of carry"
+        journal(self.conn, f"position {pos.id}: EXIT OPPORTUNITY close={close_bps:.1f}"
+                f" lo72={lo:.1f} gain={opp['gain_bps']:.1f}bps days={days}")
+        await self.notifier.alert(
+            f"📉 #{pos.id} {pos.symbol}: close basis {close_bps:+.1f}bps, below"
+            f" its {config.BASELINE_HOURS}h low ({lo:+.1f}) for"
+            f" {config.EXIT_OPP_SUSTAIN_SECONDS / 60:.0f}min\n"
+            f"   closing now: {opp['gain_bps']:+.1f}bps after costs ≈ ${usd:,.2f}"
+            f" = {days_s}\n"
+            f"   taker exit: {taker_gain:+.1f}bps ≈"
+            f" ${taker_gain / 10_000 * notional:,.2f}  (crosses the perp spread)\n"
+            f"   entered at {entry_bps:+.1f}bps. Advisory only — nothing placed.\n"
+            f"   /exit {pos.id} now   ·   /exit {pos.id} passive {close_bps:.0f}"
+        )
+
     async def _safety_loop(self) -> None:
         while True:
             try:
@@ -2536,6 +2668,7 @@ class Engine:
                                 continue   # guard took over; skip basis checks
                             await self._check_safety(pos)
                             await self._ensure_stops(pos)
+                            await self._check_exit_opportunity(pos)
                         elif pos.state == pm.EXITING and pos.id in self._auto_passive:
                             await self._check_auto_passive(pos)
                     except Exception:
@@ -2549,6 +2682,9 @@ class Engine:
                 for gone in set(self._tp_confirm) - active_ids:
                     self._tp_confirm.pop(gone, None)
                 self._liq_protect &= active_ids
+                self._opp_alerted &= active_ids
+                for gone in set(self._opp_since) - active_ids:
+                    self._opp_since.pop(gone, None)
                 for gone in set(self._spot_check_at) - active_ids:
                     self._spot_check_at.pop(gone, None)
                     self._spot_deficit_since.pop(gone, None)

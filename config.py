@@ -229,6 +229,32 @@ CONVERGENCE_MIN_HOLD_MINUTES = float(
 # this % of its liquidation price. Re-alerts at most every throttle window
 # while still in danger; re-arms once it recovers back above the threshold.
 LIQ_ALERT_PCT = Decimal(os.environ.get("LIQ_ALERT_PCT", "30"))
+
+# ── Exit-opportunity alerts (advisory only — never closes anything) ──
+# A carry position's closeable basis can plunge while nobody is watching, and
+# the chance to bank it is gone by the time it is noticed. Alert when BOTH hold,
+# sustained:
+#   - the close basis is below this pair's own 72h low (the p10 of hourly means
+#     on the CLOSE series) — an unusual level for this name, not its normal one;
+#   - closing now, after exit costs, beats EXIT_OPP_CARRY_DAYS days of the
+#     carry you would give up — worth acting on, not merely unusual.
+# Each gate alone fires wrongly: the range alone ignores whether exiting pays,
+# the carry multiple alone fires on slow drift on anything entered rich.
+EXIT_OPP_ALERTS = os.environ.get("EXIT_OPP_ALERTS", "1") not in ("0", "false", "")
+EXIT_OPP_CARRY_DAYS = float(os.environ.get("EXIT_OPP_CARRY_DAYS", "3"))
+# Must hold this long on every sweep: thin books print one-tick spikes all the
+# time, and a level that holds is one that can actually be exited into.
+EXIT_OPP_SUSTAIN_SECONDS = float(os.environ.get("EXIT_OPP_SUSTAIN_SECONDS", "120"))
+# How far under the 72h low the close basis has to be (0 = anywhere below it).
+EXIT_OPP_BELOW_LO_BPS = float(os.environ.get("EXIT_OPP_BELOW_LO_BPS", "0"))
+# One alert per event; it re-arms only once the basis is back this far ABOVE
+# the 72h low, so a level sitting on the boundary cannot alert repeatedly.
+EXIT_OPP_REARM_BPS = float(os.environ.get("EXIT_OPP_REARM_BPS", "10"))
+# The 72h low is meaningless on a pair with a day's history or less.
+EXIT_OPP_MIN_HOURS = float(os.environ.get("EXIT_OPP_MIN_HOURS", "24"))
+# Exit-side slippage, measured over 481 exit clips against the quotes showing
+# while each rested (scripts/adverse_selection.py): median 9.7bps.
+EXIT_SLIPPAGE_BPS = Decimal(os.environ.get("EXIT_SLIPPAGE_BPS", "10"))
 LIQ_ALERT_THROTTLE_SECONDS = float(os.environ.get("LIQ_ALERT_THROTTLE_SECONDS", "1800"))
 # /stops places protective orders this % below the perp liquidation price: a
 # reduce-only buy STOP_MARKET on Aster (triggers on the mark, closing the short
