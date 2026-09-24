@@ -1067,3 +1067,84 @@ async def test_unwinds_everything_when_nothing_is_hedgeable(env, monkeypatch):
     await wait_for_state(positions, pos.id, pm.CANCELLED)
     final = positions.get(pos.id)
     assert final.perp_qty == 0 and final.spot_qty == 0
+
+
+async def test_a_fully_salvaged_clip_does_not_end_the_entry(env, monkeypatch):
+    """Position 226: /enter us 609 filled one $50 clip, then stopped.
+
+    The hedge-time estimate for that clip read below the floor, so the salvage
+    branch ran — and found the whole clip hedgeable after all. Nothing was
+    unwound and nothing was alerted, but the branch set `aborted`
+    unconditionally, so the loop broke on its next pass and the other $559 of
+    the order was never worked."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_HEDGE_SLIP_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_MAX_CLIP_NOTIONAL_USD", Decimal("300"))
+    monkeypatch.setattr(config, "MIN_HEDGE_NOTIONAL_USD", Decimal(1))
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    real = executor._live_hedge_basis_bps
+    calls = {"n": 0}
+
+    async def estimate_low_once(*a, **kw):
+        # A depth snapshot that looks worse than the book really is — the
+        # sizing re-read a moment later finds the whole clip hedgeable.
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Decimal(-50)
+        return await real(*a, **kw)
+    monkeypatch.setattr(executor, "_live_hedge_basis_bps", estimate_low_once)
+
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True,
+                           min_entry_bps=Decimal(30))
+    executor.start_entry(pos)
+    await wait_for_state(positions, pos.id, pm.OPEN)
+    final = positions.get(pos.id)
+    # The whole ~$1000 order, not the first ~$300 clip.
+    assert final.perp_qty > Decimal("9")
+    assert final.spot_qty == final.perp_qty
+    assert calls["n"] > 1                     # more than one clip was hedged
+    assert not any("collapsed" in m for m in notifier.messages)
+
+
+async def test_a_partial_salvage_keeps_working_the_order(env, monkeypatch):
+    """Part hedgeable, part unwound: the failure was that clip walking the
+    book, not the market, and the next clip is re-sized against the ladder
+    anyway. Ending the whole entry there would throw away the rest of the
+    order for a problem the next clip does not have."""
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "ENTRY_HEDGE_MIN_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_HEDGE_SLIP_BPS", Decimal(0))
+    monkeypatch.setattr(config, "ENTRY_MAX_CLIP_NOTIONAL_USD", Decimal("300"))
+    monkeypatch.setattr(config, "MIN_HEDGE_NOTIONAL_USD", Decimal(1))
+    set_books(md, "100.4", "100.5", "99.9", "100.0")
+
+    real_est = executor._live_hedge_basis_bps
+    real_size = executor._hedgeable_at
+    first = {"est": True, "size": True}
+
+    async def estimate(*a, **kw):
+        if first["est"]:
+            first["est"] = False
+            return Decimal(-50)
+        return await real_est(*a, **kw)
+
+    async def size(perp, pair, floor, cap, info):
+        if first["size"]:
+            first["size"] = False
+            return info.round_qty(cap / 2)      # only half the first clip
+        return await real_size(perp, pair, floor, cap, info)
+
+    monkeypatch.setattr(executor, "_live_hedge_basis_bps", estimate)
+    monkeypatch.setattr(executor, "_hedgeable_at", size)
+
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=True,
+                           min_entry_bps=Decimal(30))
+    executor.start_entry(pos)
+    await wait_for_state(positions, pos.id, pm.OPEN)
+    final = positions.get(pos.id)
+    assert any("hedging" in m and "unwinding" in m for m in notifier.messages)
+    # Kept working past the partly-unwound first clip.
+    assert final.perp_qty > Decimal("5")
+    assert final.spot_qty == final.perp_qty

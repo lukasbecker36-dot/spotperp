@@ -1002,8 +1002,20 @@ class Executor:
                     salvage = Decimal(0)     # too small to be worth a clip
                 naked = unhedged - salvage
                 unhedged = salvage
-                aborted = True
-                abort_basis = live_basis
+                # Stop the whole entry only when NOTHING was hedgeable — that
+                # is a basis that genuinely collapsed. When some or all of the
+                # clip clears the floor, the failure was this clip walking the
+                # book, and the next clip is re-sized against the ladder anyway;
+                # the edge_ok gate at the top of the loop already stops resting
+                # if the quoted basis itself has fallen below the floor.
+                #
+                # Setting this unconditionally ended position 226 after one $50
+                # clip of a $609 order: the full clip turned out hedgeable, so
+                # nothing was unwound and nothing was alerted — the entry just
+                # silently stopped.
+                if salvage <= 0:
+                    aborted = True
+                    abort_basis = live_basis
                 if naked > 0:
                     part = (f" — hedging {salvage} at the floor and unwinding"
                             f" {naked}" if salvage > 0
