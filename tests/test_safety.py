@@ -93,6 +93,7 @@ def engine(tmp_path, monkeypatch):
     eng._basis_base = screener.DailyBasis(hours=72)
     eng._opp_since = {}
     eng._opp_alerted = set()
+    eng._standdown_since = {}
 
     class _NoOrders:
         """Venue stub for command handlers that list resting orders."""
@@ -2287,3 +2288,101 @@ async def test_auto_refused_when_the_alerts_are_off(engine, monkeypatch):
     monkeypatch.setattr(config, "EXIT_OPP_ALERTS", False)
     pid = await _make_live_open(engine)
     assert "never fire" in await engine._cmd_auto({"position_id": str(pid)})
+
+
+async def _auto_exit_working(engine, monkeypatch):
+    """An /auto exit that has fired and is working at its target (+10.0)."""
+    pid, started = await _armed(engine, monkeypatch)
+    placed = []
+
+    async def fake_place(pos):
+        placed.append(pos.id)
+        return "placed"
+    monkeypatch.setattr(engine, "_place_stops", fake_place)
+    _plunge(engine)
+    engine._opp_since[pid] = _time.monotonic() - 121
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    # The real exit task sets EXITING; the stub does not, so do it here.
+    engine.positions.set_state(pid, pm.EXITING)
+    return pid, placed
+
+
+def _recovered(engine):
+    # close = (100.4 - 99.9) / 99.9 = +50bps, far clear of target+10
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+
+
+async def test_auto_exit_stands_down_and_restores_stops_when_the_plunge_reverses(
+    engine, monkeypatch
+):
+    """A passive exit has no timeout, and auto-stops leaves any position with
+    an exit requested alone. So an /auto exit whose plunge reversed used to sit
+    in EXITING indefinitely with NO stops. Once the recovery has held, hand it
+    back: exit cancelled, stops on, /auto re-armed for the next plunge."""
+    pid, placed = await _auto_exit_working(engine, monkeypatch)
+    pos = engine.positions.get(pid)
+    assert pos.exit_auto and pos.exit_target_bps == Decimal("10.0")
+    _recovered(engine)
+    await engine._check_auto_standdown(engine.positions.get(pid))
+    assert engine.positions.get(pid).state == pm.EXITING   # not held long yet
+    engine._standdown_since[pid] = _time.monotonic() - 121
+    await engine._check_auto_standdown(engine.positions.get(pid))
+    pos = engine.positions.get(pid)
+    assert pos.state == pm.OPEN and pos.exit_mode is None
+    assert pos.exit_auto is False and pos.auto_exit is True   # re-armed
+    assert placed == [pid]                                    # stops back on
+    assert any("stood down" in m for m in engine.notifier.messages)
+
+
+async def test_a_brief_recovery_does_not_stand_it_down(engine, monkeypatch):
+    """Same anti-flicker rule as the trigger: one sweep back inside the
+    margin restarts the clock."""
+    pid, placed = await _auto_exit_working(engine, monkeypatch)
+    _recovered(engine)
+    await engine._check_auto_standdown(engine.positions.get(pid))
+    engine._standdown_since[pid] = _time.monotonic() - 100
+    _plunge(engine)                                    # dips back into range
+    await engine._check_auto_standdown(engine.positions.get(pid))
+    assert pid not in engine._standdown_since
+    assert engine.positions.get(pid).state == pm.EXITING and placed == []
+
+
+async def test_recovery_inside_the_margin_keeps_working(engine, monkeypatch):
+    """Just above the target is still a live exit — the gate pauses the maker
+    there, but standing down needs the basis properly clear."""
+    pid, placed = await _auto_exit_working(engine, monkeypatch)
+    # close = (100.15 - 100.0) / 100.0 = +15bps: above target 10, below 10+10
+    set_books(engine.md, "100.15", "100.2", "100.0", "100.1")
+    engine._standdown_since[pid] = _time.monotonic() - 999
+    await engine._check_auto_standdown(engine.positions.get(pid))
+    assert engine.positions.get(pid).state == pm.EXITING
+
+
+async def test_an_operator_exit_is_never_stood_down(engine, monkeypatch):
+    """Your own passive exit waits at the level you chose. Only exits /auto
+    started are managed; /exit clears the mark on anything it starts."""
+    pid = await _plunge_setup(engine, monkeypatch)
+
+    async def fake_start(pos):
+        return None
+    monkeypatch.setattr(engine.executor, "start_exit", fake_start)
+    await engine._cmd_exit(
+        {"position_id": str(pid), "mode": "passive", "target_bps": "10"}
+    )
+    assert engine.positions.get(pid).exit_auto is False
+
+
+async def test_taking_over_an_auto_exit_by_hand_releases_it(engine, monkeypatch):
+    """/exit ID now on an auto exit makes it yours: no stand-down afterwards."""
+    pid, placed = await _auto_exit_working(engine, monkeypatch)
+    await engine._cmd_exit({"position_id": str(pid), "mode": "now"})
+    assert engine.positions.get(pid).exit_auto is False
+
+
+async def test_the_auto_mark_survives_a_restart(engine, monkeypatch):
+    """Resumed exits come back as plain EXITING positions. If the mark were
+    in memory only, a restart would turn an /auto exit into one that can never
+    stand down — stops off, indefinitely."""
+    pid, placed = await _auto_exit_working(engine, monkeypatch)
+    fresh = pm.PositionManager(engine.conn).get(pid)
+    assert fresh.exit_auto is True

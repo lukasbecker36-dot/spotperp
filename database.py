@@ -143,6 +143,10 @@ _MIGRATIONS = [
     # Opt-in: start a passive exit automatically when the exit-opportunity
     # alert fires for this position. Persisted so an /update cannot disarm it.
     "ALTER TABLE positions ADD COLUMN auto_exit INTEGER NOT NULL DEFAULT 0",
+    # Set while the working exit is one /auto started. It is what lets that
+    # exit stand itself down if the plunge reverses — and it has to survive a
+    # restart, or a resumed exit would sit forever with its stops off.
+    "ALTER TABLE positions ADD COLUMN exit_auto INTEGER NOT NULL DEFAULT 0",
 ]
 
 

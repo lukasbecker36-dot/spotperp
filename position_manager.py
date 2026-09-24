@@ -63,6 +63,7 @@ class Position:
     trade_kind: str          # 'convergence' (may auto-close) | 'carry' (manual only)
     note: str | None
     auto_exit: bool = False  # /auto: passive exit when the opportunity alert fires
+    exit_auto: bool = False  # the working exit was started by /auto
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Position":
@@ -98,6 +99,7 @@ class Position:
             trade_kind=(row["trade_kind"] or "convergence"),
             note=row["note"],
             auto_exit=bool(row["auto_exit"]) if "auto_exit" in row.keys() else False,
+            exit_auto=bool(row["exit_auto"]) if "exit_auto" in row.keys() else False,
         )
 
 
@@ -191,6 +193,13 @@ class PositionManager:
         self._conn.execute(
             "UPDATE positions SET target_notional=?, updated_ms=? WHERE id=?",
             (str(pos.target_notional + amount_usd), _now_ms(), position_id),
+        )
+        self._conn.commit()
+
+    def set_exit_auto(self, position_id: int, on: bool) -> None:
+        self._conn.execute(
+            "UPDATE positions SET exit_auto=?, updated_ms=? WHERE id=?",
+            (int(on), _now_ms(), position_id),
         )
         self._conn.commit()
 

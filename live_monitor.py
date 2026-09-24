@@ -153,6 +153,8 @@ class Engine:
         # and which have alerted and are waiting to re-arm.
         self._opp_since: dict[int, float] = {}
         self._opp_alerted: set[int] = set()
+        # When each /auto exit's recovery condition first held.
+        self._standdown_since: dict[int, float] = {}
         # Aster positionRisk cached by symbol (mark + liquidation price) for the
         # /positions liq readout. Refreshed each slow scan in live mode.
         self._position_risk: dict[str, dict] = {}
@@ -1583,8 +1585,10 @@ class Engine:
             f" holds below its {config.BASELINE_HOURS}h low for"
             f" {config.EXIT_OPP_SUSTAIN_SECONDS / 60:.0f}min AND closing beats"
             f" {config.EXIT_OPP_CARRY_DAYS:g} days of carry, a passive exit"
-            " starts at the loosest level still meeting both. One shot: it"
-            f" disarms as it fires. /auto {pos.id} off to disarm."
+            " starts at the loosest level still meeting both. It disarms as it"
+            " fires; if the plunge reverses before the exit completes, the exit"
+            " stands down, stops go back on and it re-arms."
+            f" /auto {pos.id} off to disarm."
         )
 
     async def _cmd_exit(self, args: dict) -> str:
@@ -1645,6 +1649,10 @@ class Engine:
         # entire exit. That is what left position 226 naked long for 35
         # minutes. _ensure_stops now refuses any position with an exit
         # requested, so recording it first closes the window.
+        # An exit started here is the operator's unless /auto marks it after:
+        # a manual /exit replacing an auto one takes it over, and an operator
+        # exit is never stood down on its own.
+        self.positions.set_exit_auto(pos.id, False)
         self.positions.set_exit_request(pos.id, mode, target_dec, target_qty)
         await self._cancel_stops_for(pos)
         await self.executor.start_exit(self.positions.get(pos.id))
@@ -1662,6 +1670,7 @@ class Engine:
             return f"position {pos.id} has no working exit"
         await self.executor._cancel_task(pos.id)
         self.positions.set_exit_request(pos.id, None, None)
+        self.positions.set_exit_auto(pos.id, False)
         self.positions.set_state(pos.id, pm.OPEN, "exit cancelled by operator")
         return f"position {pos.id}: exit cancelled, back to OPEN"
 
@@ -2704,6 +2713,9 @@ class Engine:
                 "target_bps": str(target),
             })
             started = "exit started" in result
+            if started:
+                # After /exit, which clears the mark for any exit it starts.
+                self.positions.set_exit_auto(pos.id, True)
             await self.notifier.alert(
                 f"🤖 #{pos.id} {pos.symbol}: AUTO-EXIT "
                 + ("started" if started else "FAILED to start")
@@ -2712,12 +2724,14 @@ class Engine:
                 f" {config.EXIT_OPP_SUSTAIN_SECONDS / 60:.0f}min\n"
                 f"   working a passive maker close at <= {target:+.1f}bps —"
                 " it keeps working while the exit is still below the low and"
-                " still worth the carry, and pauses if the basis recovers past"
-                " that\n"
+                " still worth the carry. If the basis recovers past"
+                f" {target + config.EXIT_OPP_REARM_BPS:+.1f} for"
+                f" {config.EXIT_OPP_SUSTAIN_SECONDS / 60:.0f}min it stands"
+                " down, stops go back on and /auto re-arms\n"
                 f"   now: {opp['gain_bps']:+.1f}bps after costs ≈ ${usd:,.2f}"
                 f" = {days_s}\n"
-                + (f"   auto-exit is now disarmed. /exit {pos.id} cancel to stop"
-                   f" it, /exit {pos.id} now to cross instead."
+                + (f"   /exit {pos.id} cancel to stop it, /exit {pos.id} now to"
+                   " cross instead."
                    if started else f"   {result} — auto-exit disarmed; act by"
                    " hand.")
             )
@@ -2734,6 +2748,61 @@ class Engine:
             f"   entered at {entry_bps:+.1f}bps. Advisory only — nothing placed.\n"
             f"   /exit {pos.id} now   ·   /exit {pos.id} passive {target:.1f}"
             f"   ·   /auto {pos.id} to act on the next one"
+        )
+
+    async def _check_auto_standdown(self, pos: pm.Position) -> None:
+        """Stand an /auto exit down if the plunge that started it reverses.
+
+        A passive exit has no timeout, and while an exit is requested the
+        auto-stops sweep deliberately leaves the position alone. So an /auto
+        exit whose plunge reverses would otherwise sit in EXITING indefinitely
+        with NO stops, guarded only by the liquidation alert. When the close
+        basis has held clear of the exit's target for the same sustain window
+        that started it, hand it back to OPEN: the exit is cancelled, stops go
+        back on, and /auto re-arms — the job it was armed for did not happen.
+
+        Only /auto exits. An operator's own passive exit keeps waiting at the
+        level they chose; that is the no-auto-management guarantee.
+        """
+        if pos.state != pm.EXITING or pos.exit_mode != "passive":
+            # Replaced (/exit now) or finished: no longer ours to manage.
+            self.positions.set_exit_auto(pos.id, False)
+            self._standdown_since.pop(pos.id, None)
+            return
+        if pos.exit_target_bps is None:
+            return
+        if not self.executor._books_fresh(pos.symbol):
+            return                         # never act on a frozen book
+        close = self.executor._close_basis_bps(pos.symbol)
+        if close is None:
+            return
+        target = float(pos.exit_target_bps)
+        if float(close) <= target + config.EXIT_OPP_REARM_BPS:
+            self._standdown_since.pop(pos.id, None)
+            return
+        now = time.monotonic()
+        since = self._standdown_since.setdefault(pos.id, now)
+        if now - since < config.EXIT_OPP_SUSTAIN_SECONDS:
+            return
+        self._standdown_since.pop(pos.id, None)
+        await self._cancel_exit(pos)       # -> OPEN, exit request and mark cleared
+        self.positions.set_auto_exit(pos.id, True)
+        # The stops throttle guards against retrying a FAILED placement every
+        # sweep. It must not delay putting stops back on a position that has
+        # just lost them — clear it and place them now rather than next sweep.
+        self._auto_stops_attempt.pop(pos.id, None)
+        fresh = self.positions.get(pos.id)
+        await self._ensure_stops(fresh)
+        journal(self.conn, f"position {pos.id}: /auto exit stood down, close"
+                f" {float(close):.1f}bps > target {target:.1f}"
+                f" +{config.EXIT_OPP_REARM_BPS}")
+        await self.notifier.alert(
+            f"↩️ #{pos.id} {pos.symbol}: basis recovered to {float(close):+.1f}bps"
+            f" — the /auto exit (target {target:+.1f}) has stood down. Back to"
+            f" OPEN, stops back on, /auto re-armed for the next plunge"
+            + (f" (holding {fresh.perp_qty} after a partial fill)"
+               if fresh.perp_qty < pos.perp_qty else "")
+            + f". /auto {pos.id} off to disarm."
         )
 
     async def _safety_loop(self) -> None:
@@ -2763,6 +2832,8 @@ class Engine:
                             await self._check_exit_opportunity(pos)
                         elif pos.state == pm.EXITING and pos.id in self._auto_passive:
                             await self._check_auto_passive(pos)
+                        elif pos.state == pm.EXITING and pos.exit_auto:
+                            await self._check_auto_standdown(pos)
                     except Exception:
                         log.exception("safety check failed for position %s", pos.id)
                 # Drop auto-passive ids whose position is no longer active (closed,
@@ -2775,6 +2846,8 @@ class Engine:
                     self._tp_confirm.pop(gone, None)
                 self._liq_protect &= active_ids
                 self._opp_alerted &= active_ids
+                for gone in set(self._standdown_since) - active_ids:
+                    self._standdown_since.pop(gone, None)
                 for gone in set(self._opp_since) - active_ids:
                     self._opp_since.pop(gone, None)
                 for gone in set(self._spot_check_at) - active_ids:
