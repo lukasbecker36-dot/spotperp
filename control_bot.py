@@ -55,6 +55,7 @@ HELP = """Commands:
 /exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins or $500, omit=full
 /exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins or $500, omit=full
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
+/auto [ID|SYMBOL] [off] — arm a one-shot passive exit that starts when the exit-opportunity alert fires (no args: list armed)
 /stops SYMBOL — place liq-protection stop (perp) + sell limit (spot) ~1% below liq price (auto-placed on new positions and re-armed after a size change / part-reduce; AUTO_STOPS=0 to disable)
 /remove ID|SYMBOL YES — stop tracking a position closed manually on the exchange (DB only)
 /truefill ID|SYMBOL — re-price a mark-booked exit (ADL / lost stop) from Aster's real trades and recompute P&L
@@ -311,6 +312,14 @@ class ControlBot:
             return await self._queue_and_wait("cancel", {"position_id": args[0]})
         if command == "exit":
             return await self._cmd_exit(args)
+        if command == "auto":
+            payload: dict = {}
+            if args:
+                payload["position_id"] = args[0]
+                payload["off"] = len(args) > 1 and args[1].lower() in (
+                    "off", "disarm", "cancel", "stop"
+                )
+            return await self._queue_and_wait("auto", payload)
         if command == "flatten":
             if not confirmed:
                 return "this closes ALL positions — repeat as: /flatten YES"
@@ -787,6 +796,8 @@ class ControlBot:
                 if p.opened_ms else "-"
             )
             kind_tag = " ⚓carry" if p.trade_kind == "carry" else ""
+            if p.auto_exit:
+                kind_tag += " 🤖auto"
             base = p.symbol[:-4] if p.symbol.endswith("USDT") else p.symbol
             head = (f"#{p.id} {p.symbol} [{p.state}]{kind_tag}  held {held}"
                     f"{' · exit ' + p.exit_mode if p.exit_mode else ''}"

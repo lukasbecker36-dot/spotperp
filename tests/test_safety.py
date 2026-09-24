@@ -2173,3 +2173,117 @@ async def test_opportunity_waits_for_enough_history(engine, monkeypatch):
     engine._opp_since[pid] = _time.monotonic() - 121
     await engine._check_exit_opportunity(engine.positions.get(pid))
     assert not any("close basis" in m for m in engine.notifier.messages)
+
+
+# ── /auto: one-shot passive exit on the opportunity alert ────────────────────
+
+def test_auto_target_is_the_loosest_level_meeting_both_gates():
+    """A passive exit only works while close <= target, so the current tick
+    stalls on a 1bp bounce. Target the loosest level that is still below the
+    72h low AND still worth the carry — and the current close must already be
+    inside it, or the exit would start paused."""
+    opp = live_monitor.exit_opportunity(
+        entry_bps=50, close_bps=-30, lo_close_bps=10, carry_8h_bps=1,
+        exit_cost_bps=15, days_required=3,
+    )
+    # range bound 10; carry bound 50 - 15 - 3*3 = 26 -> the range binds
+    assert opp["target_bps"] == pytest.approx(10.0)
+    assert -30 <= opp["target_bps"]
+    opp = live_monitor.exit_opportunity(
+        entry_bps=50, close_bps=-30, lo_close_bps=10, carry_8h_bps=5,
+        exit_cost_bps=15, days_required=3,
+    )
+    # carry bound 50 - 15 - 3*15 = -10 now binds, tighter than the range
+    assert opp["target_bps"] == pytest.approx(-10.0)
+
+
+async def _armed(engine, monkeypatch):
+    pid = await _plunge_setup(engine, monkeypatch)
+    started = []
+
+    async def fake_start(pos):
+        started.append(pos.id)
+    monkeypatch.setattr(engine.executor, "start_exit", fake_start)
+    engine.positions.set_auto_exit(pid, True)
+    return pid, started
+
+
+async def test_armed_position_starts_a_passive_exit_when_the_alert_fires(
+    engine, monkeypatch
+):
+    pid, started = await _armed(engine, monkeypatch)
+    _plunge(engine)
+    engine._opp_since[pid] = _time.monotonic() - 121
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    pos = engine.positions.get(pid)
+    assert started == [pid]
+    assert pos.exit_mode == "passive"
+    assert pos.exit_target_bps == Decimal("10.0")
+    msg = next(m for m in engine.notifier.messages if "AUTO-EXIT" in m)
+    assert "started" in msg and "<= +10.0bps" in msg
+
+
+async def test_auto_exit_is_one_shot(engine, monkeypatch):
+    """Disarmed as it fires, so however the exit then goes — fills, stalls,
+    is cancelled by hand — it cannot start again on its own."""
+    pid, started = await _armed(engine, monkeypatch)
+    _plunge(engine)
+    engine._opp_since[pid] = _time.monotonic() - 121
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert engine.positions.get(pid).auto_exit is False
+    # Cancel the exit by hand and let it plunge again: no second auto start.
+    await engine._cancel_exit(engine.positions.get(pid))
+    engine._opp_alerted.clear()
+    engine._opp_since[pid] = _time.monotonic() - 121
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert started == [pid]
+
+
+async def test_auto_exit_waits_for_the_same_sustain_as_the_alert(
+    engine, monkeypatch
+):
+    """Armed changes what happens when it fires, not when — a tick below the
+    low must not start an exit."""
+    pid, started = await _armed(engine, monkeypatch)
+    _plunge(engine)
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert started == [] and engine.positions.get(pid).auto_exit is True
+
+
+async def test_unarmed_position_stays_advisory(engine, monkeypatch):
+    pid, started = await _armed(engine, monkeypatch)
+    engine.positions.set_auto_exit(pid, False)
+    _plunge(engine)
+    engine._opp_since[pid] = _time.monotonic() - 121
+    await engine._check_exit_opportunity(engine.positions.get(pid))
+    assert started == []
+    assert engine.positions.get(pid).exit_mode is None
+    assert any("Advisory only" in m for m in engine.notifier.messages)
+
+
+async def test_auto_command_arms_lists_and_disarms(engine, monkeypatch):
+    monkeypatch.setattr(config, "EXIT_OPP_ALERTS", True)
+    pid = await _make_live_open(engine)
+    assert "no positions armed" in await engine._cmd_auto({})
+    assert "ARMED" in await engine._cmd_auto({"position_id": str(pid)})
+    assert f"#{pid}" in await engine._cmd_auto({})
+    assert "disarmed" in await engine._cmd_auto(
+        {"position_id": str(pid), "off": True}
+    )
+    assert engine.positions.get(pid).auto_exit is False
+
+
+async def test_auto_refused_on_a_position_already_exiting(engine, monkeypatch):
+    monkeypatch.setattr(config, "EXIT_OPP_ALERTS", True)
+    pid = await _make_live_open(engine)
+    engine.positions.set_exit_request(pid, "passive", Decimal(0))
+    out = await engine._cmd_auto({"position_id": str(pid)})
+    assert "only applies to an OPEN position" in out
+    assert engine.positions.get(pid).auto_exit is False
+
+
+async def test_auto_refused_when_the_alerts_are_off(engine, monkeypatch):
+    """Arming something that can never fire would be a silent trap."""
+    monkeypatch.setattr(config, "EXIT_OPP_ALERTS", False)
+    pid = await _make_live_open(engine)
+    assert "never fire" in await engine._cmd_auto({"position_id": str(pid)})

@@ -62,6 +62,7 @@ class Position:
     min_entry_bps: Decimal | None
     trade_kind: str          # 'convergence' (may auto-close) | 'carry' (manual only)
     note: str | None
+    auto_exit: bool = False  # /auto: passive exit when the opportunity alert fires
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Position":
@@ -96,6 +97,7 @@ class Position:
             min_entry_bps=opt("min_entry_bps"),
             trade_kind=(row["trade_kind"] or "convergence"),
             note=row["note"],
+            auto_exit=bool(row["auto_exit"]) if "auto_exit" in row.keys() else False,
         )
 
 
@@ -189,6 +191,13 @@ class PositionManager:
         self._conn.execute(
             "UPDATE positions SET target_notional=?, updated_ms=? WHERE id=?",
             (str(pos.target_notional + amount_usd), _now_ms(), position_id),
+        )
+        self._conn.commit()
+
+    def set_auto_exit(self, position_id: int, armed: bool) -> None:
+        self._conn.execute(
+            "UPDATE positions SET auto_exit=?, updated_ms=? WHERE id=?",
+            (int(armed), _now_ms(), position_id),
         )
         self._conn.commit()
 

@@ -8,6 +8,7 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import time
 from decimal import Decimal, InvalidOperation
 
@@ -80,7 +81,19 @@ def exit_opportunity(
     days = gain / per_day if per_day > 0 else float("inf")
     if days < days_required:
         return None
-    return {"gain_bps": gain, "carry_days": days, "per_day_bps": per_day}
+    # The LOOSEST close basis at which an exit still passes both gates — the
+    # target for a passive exit. A passive exit only works while close <=
+    # target, so targeting the current tick stalls on a 1bp bounce; this keeps
+    # working for exactly as long as the exit is still unusual AND still worth
+    # the carry. It does not make the exit fill worse now: the maker is lifted
+    # at whatever the live basis is, which is already at or under this.
+    range_bound = lo_close_bps - below_lo_bps
+    carry_bound = entry_bps - exit_cost_bps - (
+        days_required * per_day if per_day > 0 else 0.0
+    )
+    target = min(range_bound, carry_bound)
+    return {"gain_bps": gain, "carry_days": days, "per_day_bps": per_day,
+            "target_bps": target}
 
 
 class Engine:
@@ -1333,6 +1346,8 @@ class Engine:
                 return self._cmd_enter(args)
             if command == "exit":
                 return await self._cmd_exit(args)
+            if command == "auto":
+                return await self._cmd_auto(args)
             if command == "cancel":
                 return await self._cmd_cancel(args)
             if command == "flatten":
@@ -1530,6 +1545,47 @@ class Engine:
             journal(self.conn, f"position {pos.id}: stop cancel incomplete — "
                     + "; ".join(failed), "WARN")
         return cancelled + swept
+
+    async def _cmd_auto(self, args: dict) -> str:
+        """/auto — arm, disarm or list automatic passive exits.
+
+        An armed position starts a passive exit the moment the exit-opportunity
+        alert would fire for it: close basis below its 72h low AND worth
+        EXIT_OPP_CARRY_DAYS of carry, held for EXIT_OPP_SUSTAIN_SECONDS. One
+        shot — it disarms as it fires.
+        """
+        target = str(args.get("position_id") or "").strip()
+        if not target:
+            armed = [p for p in self.positions.active() if p.auto_exit]
+            if not armed:
+                return "no positions armed for auto-exit — /auto SYMBOL to arm"
+            return "armed for auto-exit:\n" + "\n".join(
+                f"  #{p.id} {p.symbol} [{p.state}]" for p in armed
+            )
+        pos = self._resolve_position(target)
+        if isinstance(pos, str):
+            return pos
+        if args.get("off"):
+            if not pos.auto_exit:
+                return f"#{pos.id} {pos.symbol} was not armed"
+            self.positions.set_auto_exit(pos.id, False)
+            return f"#{pos.id} {pos.symbol}: auto-exit disarmed"
+        if pos.state != pm.OPEN or pos.exit_mode is not None:
+            return (f"#{pos.id} {pos.symbol} is {pos.state}"
+                    + (" with an exit working" if pos.exit_mode else "")
+                    + " — auto-exit only applies to an OPEN position")
+        if not config.EXIT_OPP_ALERTS:
+            return ("exit-opportunity alerts are switched off"
+                    " (EXIT_OPP_ALERTS=0), so auto-exit would never fire")
+        self.positions.set_auto_exit(pos.id, True)
+        return (
+            f"#{pos.id} {pos.symbol}: auto-exit ARMED. When its close basis"
+            f" holds below its {config.BASELINE_HOURS}h low for"
+            f" {config.EXIT_OPP_SUSTAIN_SECONDS / 60:.0f}min AND closing beats"
+            f" {config.EXIT_OPP_CARRY_DAYS:g} days of carry, a passive exit"
+            " starts at the loosest level still meeting both. One shot: it"
+            f" disarms as it fires. /auto {pos.id} off to disarm."
+        )
 
     async def _cmd_exit(self, args: dict) -> str:
         pos = self._resolve_position(args["position_id"])
@@ -2630,8 +2686,43 @@ class Engine:
         days = opp["carry_days"]
         days_s = "more than any carry (you are paying to hold)" if days == float(
             "inf") else f"{days:.1f} days of carry"
+        # Floor to 0.1bp: rounding a gate DOWN keeps it strictly inside the band.
+        target = math.floor(opp["target_bps"] * 10) / 10
         journal(self.conn, f"position {pos.id}: EXIT OPPORTUNITY close={close_bps:.1f}"
-                f" lo72={lo:.1f} gain={opp['gain_bps']:.1f}bps days={days}")
+                f" lo72={lo:.1f} gain={opp['gain_bps']:.1f}bps days={days}"
+                f" target={target} auto={pos.auto_exit}")
+
+        if pos.auto_exit:
+            # One shot: disarm first, so however the exit then goes — fills,
+            # stalls, is cancelled by hand — it can never re-fire on its own.
+            self.positions.set_auto_exit(pos.id, False)
+            # Through /exit itself, so the exit request is recorded before the
+            # stops are cancelled — the ordering that stops auto-stops
+            # re-locking the spot straight after the exit begins.
+            result = await self._cmd_exit({
+                "position_id": str(pos.id), "mode": "passive",
+                "target_bps": str(target),
+            })
+            started = "exit started" in result
+            await self.notifier.alert(
+                f"🤖 #{pos.id} {pos.symbol}: AUTO-EXIT "
+                + ("started" if started else "FAILED to start")
+                + f" — close basis {close_bps:+.1f}bps, below its"
+                f" {config.BASELINE_HOURS}h low ({lo:+.1f}) for"
+                f" {config.EXIT_OPP_SUSTAIN_SECONDS / 60:.0f}min\n"
+                f"   working a passive maker close at <= {target:+.1f}bps —"
+                " it keeps working while the exit is still below the low and"
+                " still worth the carry, and pauses if the basis recovers past"
+                " that\n"
+                f"   now: {opp['gain_bps']:+.1f}bps after costs ≈ ${usd:,.2f}"
+                f" = {days_s}\n"
+                + (f"   auto-exit is now disarmed. /exit {pos.id} cancel to stop"
+                   f" it, /exit {pos.id} now to cross instead."
+                   if started else f"   {result} — auto-exit disarmed; act by"
+                   " hand.")
+            )
+            return
+
         await self.notifier.alert(
             f"📉 #{pos.id} {pos.symbol}: close basis {close_bps:+.1f}bps, below"
             f" its {config.BASELINE_HOURS}h low ({lo:+.1f}) for"
@@ -2641,7 +2732,8 @@ class Engine:
             f"   taker exit: {taker_gain:+.1f}bps ≈"
             f" ${taker_gain / 10_000 * notional:,.2f}  (crosses the perp spread)\n"
             f"   entered at {entry_bps:+.1f}bps. Advisory only — nothing placed.\n"
-            f"   /exit {pos.id} now   ·   /exit {pos.id} passive {close_bps:.0f}"
+            f"   /exit {pos.id} now   ·   /exit {pos.id} passive {target:.1f}"
+            f"   ·   /auto {pos.id} to act on the next one"
         )
 
     async def _safety_loop(self) -> None:

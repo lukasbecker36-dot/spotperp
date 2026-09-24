@@ -140,6 +140,9 @@ _MIGRATIONS = [
     # otherwise nowhere on disk, so the cost of aborting can be measured but
     # never compared with what it avoided.
     "ALTER TABLE fills ADD COLUMN basis_bps TEXT",
+    # Opt-in: start a passive exit automatically when the exit-opportunity
+    # alert fires for this position. Persisted so an /update cannot disarm it.
+    "ALTER TABLE positions ADD COLUMN auto_exit INTEGER NOT NULL DEFAULT 0",
 ]
 
 
