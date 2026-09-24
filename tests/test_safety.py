@@ -1897,3 +1897,115 @@ async def test_cancel_stops_survives_an_engine_restart(engine):
     engine.mexc = _StopClient(open_orders=[])
     await engine._cancel_stops_for(engine.positions.get(pid))
     assert engine.mexc.cancelled == ["mexc-8"]
+
+
+def _race_setup(engine, monkeypatch):
+    """A live OPEN position with stops on record, a venue whose cancel blocks
+    until released, and a _place_stops that just records being called."""
+    gate = asyncio.Event()
+
+    class _SlowCancel(_StopClient):
+        async def cancel_order(self, symbol, order_id):
+            await gate.wait()                  # the network round trip
+            self.cancelled.append(order_id)
+
+    placed: list[int] = []
+
+    async def fake_place(pos):
+        placed.append(pos.id)
+        return "placed"
+
+    async def no_exit(pos):                    # keep the executor out of it
+        return None
+
+    engine.aster = _SlowCancel(open_orders=[])
+    engine.mexc = _SlowCancel(open_orders=[])
+    monkeypatch.setattr(engine, "_place_stops", fake_place)
+    monkeypatch.setattr(engine.executor, "start_exit", no_exit)
+    monkeypatch.setattr(config, "AUTO_STOPS", True)
+    return gate, placed
+
+
+async def test_auto_stops_cannot_relock_the_spot_while_an_exit_starts(
+    engine, monkeypatch
+):
+    """Position 226: /exit -> 'exit started' -> 'stops auto-placed', a fresh
+    spot SELL LIMIT for the full 5709 that locked every coin the exit then
+    tried to sell. /exit's stop cancel waited on the venue, and during that
+    wait the safety sweep saw an OPEN position with no exit task and no stops
+    on record, and placed new ones."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    qty = engine.positions.get(pid).perp_qty
+    database.save_stop_orders(engine.conn, pid, "aster-1", "mexc-1", qty)
+    engine._stops_orders[pid] = {"aster_id": "aster-1", "mexc_id": "mexc-1"}
+    engine._stops_qty[pid] = qty
+    gate, placed = _race_setup(engine, monkeypatch)
+
+    exit_cmd = asyncio.create_task(engine._cmd_exit(
+        {"position_id": str(pid), "mode": "passive", "target_bps": "10"}
+    ))
+    await asyncio.sleep(0.05)              # /exit is now stuck in the cancel
+    sweep = asyncio.create_task(
+        engine._ensure_stops(engine.positions.get(pid))
+    )
+    await asyncio.sleep(0.05)
+    gate.set()
+    await exit_cmd
+    await sweep
+    assert placed == []                    # no stop re-placed mid-exit
+    assert engine.mexc.cancelled == ["mexc-1"]   # the old one really went
+
+
+async def test_a_stale_sweep_snapshot_is_rechecked_under_the_lock(
+    engine, monkeypatch
+):
+    """The sweep is handed a position snapshot at the start of its pass. By
+    the time the lock is free, /exit may have recorded its request — so the
+    decision to place has to be made against the CURRENT position."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    qty = engine.positions.get(pid).perp_qty
+    database.save_stop_orders(engine.conn, pid, "aster-1", "mexc-1", qty)
+    engine._stops_orders[pid] = {"aster_id": "aster-1", "mexc_id": "mexc-1"}
+    gate, placed = _race_setup(engine, monkeypatch)
+
+    stale = engine.positions.get(pid)      # taken BEFORE the exit request
+    exit_cmd = asyncio.create_task(engine._cmd_exit(
+        {"position_id": str(pid), "mode": "passive", "target_bps": "10"}
+    ))
+    await asyncio.sleep(0.05)
+    sweep = asyncio.create_task(engine._ensure_stops(stale))
+    await asyncio.sleep(0.05)
+    gate.set()
+    await exit_cmd
+    await sweep
+    assert placed == []
+
+
+async def test_stops_still_rearm_once_an_exit_is_cancelled(engine, monkeypatch):
+    """The new rule is 'no auto-stops while an exit is requested'. Cancelling
+    the exit clears the request, and the position must get its protection
+    back rather than sit unprotected."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    gate, placed = _race_setup(engine, monkeypatch)
+    gate.set()
+    engine.positions.set_exit_request(pid, "passive", Decimal(10))
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert placed == []                    # exit requested: hands off
+    await engine._cancel_exit(engine.positions.get(pid))
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert placed == [pid]                 # protection restored
+
+
+async def test_manual_stops_refused_while_an_exit_works(engine, monkeypatch):
+    """A stop's spot half is a full-size resting sell, which locks the very
+    coins the exit needs. The liquidation guard protects a working exit; a
+    manual /stops mid-exit would just stall it."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    gate, placed = _race_setup(engine, monkeypatch)
+    engine.positions.set_exit_request(pid, "passive", Decimal(10))
+    out = await engine._cmd_stops({"symbol": str(pid)})
+    assert "exit working" in out and placed == []

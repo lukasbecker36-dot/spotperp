@@ -1027,17 +1027,40 @@ class Engine:
             -> re-place at the current size;
           - already correct -> no-op.
 
-        Skipped while an entry/exit task is working (size still in flux) and
-        while the stop-fire / ADL handlers own the position, so it never places
-        a spot sell LIMIT that would lock balance those paths need."""
+        Skipped while an entry/exit task is working (size still in flux), while
+        an exit has been REQUESTED but not yet started, and while the stop-fire
+        / ADL handlers own the position — so it never places a spot sell LIMIT
+        that would lock balance those paths need."""
         if self.paper or not config.AUTO_STOPS:
             return
+        if not self._stops_wanted(pos):
+            return
+        async with self._stop_lock(pos.id):
+            # Re-read under the lock. The snapshot this sweep was handed can be
+            # stale by the time the lock is free: /exit records its request and
+            # cancels the stops while we wait, and placing from the old snapshot
+            # is exactly the race that re-locked position 226's spot balance
+            # straight after its exit began.
+            pos = self.positions.get(pos.id)
+            if not self._stops_wanted(pos):
+                return
+            await self._ensure_stops_locked(pos)
+
+    def _stops_wanted(self, pos: pm.Position) -> bool:
         if pos.state != pm.OPEN or pos.perp_qty <= 0 or pos.spot_qty <= 0:
-            return
+            return False
+        # An exit that has been asked for but whose task has not started yet
+        # is still an exit: the stops are about to be cancelled to free the
+        # spot, and re-placing them would lock it for the whole close.
+        if pos.exit_mode is not None:
+            return False
         if self.executor.has_task(pos.id):
-            return
+            return False
         if pos.id in self._stop_grace or pos.id in self._hedge_break:
-            return
+            return False
+        return True
+
+    async def _ensure_stops_locked(self, pos: pm.Position) -> None:
         pair = self.md.pair_maps.get(pos.symbol)
         info = self.md.aster_info.get(pair.aster_symbol) if pair else None
         if info is None:
@@ -1401,7 +1424,22 @@ class Engine:
             return f"multiple active positions in {symbol} (ids {ids}) — use the ID"
         return matches[0]
 
+    def _stop_lock(self, position_id: int) -> asyncio.Lock:
+        """One lock per position around placing and cancelling its stops, so
+        the two can never interleave. Placing and cancelling both wait on the
+        venue; without this, a cancel could run while a placement was mid-
+        flight and miss the order it was about to create."""
+        locks = self.__dict__.setdefault("_stop_locks", {})
+        lock = locks.get(position_id)
+        if lock is None:
+            lock = locks[position_id] = asyncio.Lock()
+        return lock
+
     async def _cancel_stops_for(self, pos: pm.Position) -> int:
+        async with self._stop_lock(pos.id):
+            return await self._cancel_stops_locked(pos)
+
+    async def _cancel_stops_locked(self, pos: pm.Position) -> int:
         """Cancel a position's resting protective /stops on both venues. Called
         when a close begins so the spot LIMIT stops locking the balance (which
         makes the exit's spot sell fail 'insufficient balance') and the perp
@@ -1464,7 +1502,6 @@ class Engine:
         mode = args.get("mode", "now")
         if mode == "cancel":
             return await self._cancel_exit(pos)
-        await self._cancel_stops_for(pos)
         target = args.get("target_bps")
         target_dec = Decimal(str(target)) if target is not None else (
             config.EXIT_BASIS_BPS if mode == "passive" else None
@@ -1507,7 +1544,15 @@ class Engine:
                     f"~${usd:,.0f} ({q}) of {pos.perp_qty}" if usd_mode
                     else f"{q} of {pos.perp_qty}"
                 )
+        # Record the exit request BEFORE cancelling the stops. The cancel waits
+        # on the venue, and while it did, the safety sweep saw an OPEN position
+        # with no exit task and no stops on record — and placed fresh ones,
+        # including a spot sell LIMIT that locked the whole balance for the
+        # entire exit. That is what left position 226 naked long for 35
+        # minutes. _ensure_stops now refuses any position with an exit
+        # requested, so recording it first closes the window.
         self.positions.set_exit_request(pos.id, mode, target_dec, target_qty)
+        await self._cancel_stops_for(pos)
         await self.executor.start_exit(self.positions.get(pos.id))
         desc = "aggressive (taker both legs)" if mode == "now" else (
             f"passive maker, target {target_dec}bps"
@@ -1583,8 +1628,11 @@ class Engine:
                 self.executor.request_cancel(pos.id)
                 count += 1
             elif pos.state == pm.OPEN:
-                await self._cancel_stops_for(pos)
+                # Request the exit FIRST: _ensure_stops skips a position with
+                # an exit requested, so stops cannot be re-placed while the
+                # cancel below is waiting on the venue.
                 self.positions.set_exit_request(pos.id, "now", None)
+                await self._cancel_stops_for(pos)
                 await self.executor.start_exit(self.positions.get(pos.id))
                 count += 1
         return f"flatten: {count} positions being closed/cancelled"
@@ -2056,7 +2104,22 @@ class Engine:
             return pos
         if pos.state not in (pm.OPEN, pm.EXITING):
             return f"position {pos.id} is {pos.state}, no stops placed"
-        return await self._place_stops(pos)
+        if pos.state == pm.EXITING or pos.exit_mode is not None:
+            # A stop's spot half is a resting sell LIMIT for the full size, and
+            # a resting sell LOCKS the coins it is selling — the same coins the
+            # exit needs. Placing it mid-exit is how an exit stalls on
+            # 'Oversold' with the perp already closed. The liquidation guard is
+            # what protects a working exit: at LIQ_ALERT_PCT it cancels the
+            # exit and arms stops itself.
+            return (
+                f"position {pos.id} {pos.symbol} has an exit working — stops"
+                " would lock the spot the exit is trying to sell. It is still"
+                f" protected: at {config.LIQ_ALERT_PCT}% to liquidation the"
+                " exit is cancelled and stops are armed automatically. To"
+                f" place them now, /exit {pos.id} cancel first."
+            )
+        async with self._stop_lock(pos.id):
+            return await self._place_stops(pos)
 
     async def _place_stops(self, pos: pm.Position) -> str:
         """(Re)place the protective orders at the position's CURRENT size and
@@ -2515,8 +2578,11 @@ class Engine:
                     f" ({float(pos.entry_basis_bps):.1f} ->"
                     f" {float(close):.1f}bps) — force closing"
                 )
-                await self._cancel_stops_for(pos)
+                # Request the exit FIRST: _ensure_stops skips a position with
+                # an exit requested, so stops cannot be re-placed while the
+                # cancel below is waiting on the venue.
                 self.positions.set_exit_request(pos.id, "now", None)
+                await self._cancel_stops_for(pos)
                 await self.executor.start_exit(self.positions.get(pos.id))
                 return
         # Carry trades are held for funding and only the operator closes them:
@@ -2563,8 +2629,11 @@ class Engine:
                     f"🎯 position {pos.id} {pos.symbol}: basis {float(close):.1f}bps,"
                     f" taker close nets ${float(pnl):+.2f} — taking profit"
                 )
-                await self._cancel_stops_for(pos)
+                # Request the exit FIRST: _ensure_stops skips a position with
+                # an exit requested, so stops cannot be re-placed while the
+                # cancel below is waiting on the venue.
                 self.positions.set_exit_request(pos.id, "now", None)
+                await self._cancel_stops_for(pos)
                 await self.executor.start_exit(self.positions.get(pos.id))
                 return
             # Converged but a taker close isn't worth it yet: work it passively
@@ -2581,11 +2650,12 @@ class Engine:
                 f" {float(config.CONVERGED_PASSIVE_BPS):.0f}bps (will cross if a"
                 f" taker close turns profitable)"
             )
-            await self._cancel_stops_for(pos)
             self._auto_passive.add(pos.id)
+            # Exit requested before the cancel — see _ensure_stops.
             self.positions.set_exit_request(
                 pos.id, "passive", config.CONVERGED_PASSIVE_BPS
             )
+            await self._cancel_stops_for(pos)
             await self.executor.start_exit(self.positions.get(pos.id))
             return
         self._tp_confirm.pop(pos.id, None)   # still in premium: streak broken
@@ -2639,8 +2709,11 @@ class Engine:
                 f"🎯 position {pos.id} {pos.symbol}: basis {float(close):.1f}bps,"
                 f" taker close now nets ${float(pnl):+.2f} — crossing to lock it"
             )
-            await self._cancel_stops_for(pos)
+            # Request the exit FIRST: _ensure_stops skips a position with
+            # an exit requested, so stops cannot be re-placed while the
+            # cancel below is waiting on the venue.
             self.positions.set_exit_request(pos.id, "now", None)
+            await self._cancel_stops_for(pos)
             await self.executor.start_exit(self.positions.get(pos.id))
 
     def _tp_confirmed(self, pos_id: int) -> bool:
@@ -2678,8 +2751,11 @@ class Engine:
             f"⏰ position {pos.id} {pos.symbol}: max hold"
             f" ({config.MAX_HOLD_HOURS}h) reached — force closing"
         )
-        await self._cancel_stops_for(pos)
+        # Request the exit FIRST: _ensure_stops skips a position with
+        # an exit requested, so stops cannot be re-placed while the
+        # cancel below is waiting on the venue.
         self.positions.set_exit_request(pos.id, "now", None)
+        await self._cancel_stops_for(pos)
         await self.executor.start_exit(self.positions.get(pos.id))
 
 
