@@ -1405,17 +1405,55 @@ class Engine:
         """Cancel a position's resting protective /stops on both venues. Called
         when a close begins so the spot LIMIT stops locking the balance (which
         makes the exit's spot sell fail 'insufficient balance') and the perp
-        STOP doesn't fire mid-close. No-op in paper / when no pair."""
+        STOP doesn't fire mid-close. No-op in paper / when no pair.
+
+        Cancels by the venue order ids recorded when the stops were placed
+        FIRST, and only then sweeps by client-id prefix for any it did not
+        know about. This used to delete those recorded ids and then rely on
+        the prefix sweep alone, so a sweep that missed — a venue that does not
+        echo client ids, an open-orders call that failed — left the MEXC
+        stop-limit resting, locking the whole spot balance, with nothing
+        reporting it. That is how position 226's exit sat unable to sell for
+        35 minutes while its perp was already closed.
+        """
+        known = dict(self._stops_orders.get(pos.id) or {})
+        stored = database.load_stop_orders(self.conn).get(pos.id) or {}
+        for k in ("aster_id", "mexc_id"):
+            known.setdefault(k, stored.get(k))
         self._stops_qty.pop(pos.id, None)   # no longer managing stops for it
-        self._stops_orders.pop(pos.id, None)
-        database.clear_stop_orders(self.conn, pos.id)
         self._stop_grace.pop(pos.id, None)
         if self.paper:
+            self._stops_orders.pop(pos.id, None)
+            database.clear_stop_orders(self.conn, pos.id)
             return 0
         pair = self.md.pair_maps.get(pos.symbol)
         if pair is None:
             return 0
-        return await self._cancel_stop_orders(pair)
+        cancelled = 0
+        failed: list[str] = []
+        for client, symbol, key in (
+            (self.aster, pair.aster_symbol, "aster_id"),
+            (self.mexc, pair.mexc_symbol, "mexc_id"),
+        ):
+            oid = known.get(key)
+            if not oid:
+                continue
+            try:
+                await client.cancel_order(symbol, str(oid))
+                cancelled += 1
+            except ExchangeError as exc:
+                # Filled or already cancelled is the usual reason, and fine.
+                # Anything else is recorded so the sweep below gets a second go.
+                failed.append(f"{key} {oid}: {exc}")
+        swept = await self._cancel_stop_orders(pair)
+        # The record goes only once the orders it points at have been dealt
+        # with — clearing it first is what lost them.
+        self._stops_orders.pop(pos.id, None)
+        database.clear_stop_orders(self.conn, pos.id)
+        if failed and not swept:
+            journal(self.conn, f"position {pos.id}: stop cancel incomplete — "
+                    + "; ".join(failed), "WARN")
+        return cancelled + swept
 
     async def _cmd_exit(self, args: dict) -> str:
         pos = self._resolve_position(args["position_id"])

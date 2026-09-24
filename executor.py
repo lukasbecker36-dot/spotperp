@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 import config
+import database
 import intents
 import position_manager as pm
 from database import journal
@@ -99,6 +100,15 @@ class Trader:
     ) -> list[tuple[Decimal, Decimal]]:
         """Resting (price, qty) levels on the side a taker would hit:
         BUY hits asks (ascending), SELL hits bids (descending)."""
+        raise NotImplementedError
+
+    async def spot_open_orders(self, symbol: str) -> list[OrderResult]:
+        """Resting MEXC spot orders on a symbol. A resting sell LOCKS the coins
+        it is selling, so these are what can make an exit sale fail
+        'insufficient balance' while the balance is plainly there."""
+        raise NotImplementedError
+
+    async def cancel_spot_order(self, symbol: str, order_id: str) -> None:
         raise NotImplementedError
 
     async def ensure_perp_margin(
@@ -310,6 +320,12 @@ class LiveTrader(Trader):
             (Decimal(str(p)), Decimal(str(q))) for p, q in data.get(key, [])
         ]
 
+    async def spot_open_orders(self, symbol):
+        return await self._mexc.open_orders(symbol)
+
+    async def cancel_spot_order(self, symbol, order_id):
+        await self._mexc.cancel_order(symbol, order_id)
+
     async def ensure_perp_margin(self, symbol, leverage, margin_type):
         try:
             await self._aster.set_margin_type(symbol, margin_type)
@@ -395,6 +411,12 @@ class PaperTrader(Trader):
         return [(book.ask, book.ask_qty)] if side == "BUY" else [
             (book.bid, book.bid_qty)
         ]
+
+    async def spot_open_orders(self, symbol):
+        return []  # paper places no resting spot orders
+
+    async def cancel_spot_order(self, symbol, order_id):
+        return None
 
     async def ensure_perp_margin(self, symbol, leverage, margin_type):
         return None  # no real account in paper mode
@@ -496,6 +518,45 @@ class Executor:
                 log.warning("sell-down tranche short %s: %s", shortfall, err)
             await asyncio.sleep(config.ADL_SELL_INTERVAL_SECONDS)
         await self._complete_exit(position.id, floor_perp)
+
+    async def _release_spot_locks(self, position: pm.Position, symbol: str) -> int:
+        """Cancel this position's own resting spot SELL orders so an exit sale
+        can use the balance they are locking. Returns how many were cancelled.
+
+        Identifies them two ways, because relying on one already failed:
+        by the venue order id recorded when /stops placed them, and by our
+        client-id prefix. The stored id is cancelled directly even if the
+        open-orders listing does not show it — a listing that fails, or a venue
+        that does not echo client ids, must not leave the lock in place.
+        Orders that are not ours are never touched.
+        """
+        known: set[str] = set()
+        rec = database.load_stop_orders(self._conn).get(position.id)
+        if rec and rec.get("mexc_id"):
+            known.add(str(rec["mexc_id"]))
+        try:
+            orders = await self._trader.spot_open_orders(symbol)
+        except ExchangeError:
+            log.exception("open-orders lookup failed releasing %s", symbol)
+            orders = []
+        targets = {
+            str(o.order_id) for o in orders
+            if o.side == "SELL" and (
+                str(o.order_id) in known
+                or o.client_order_id.startswith(f"sp_stop_{position.id}_")
+            )
+        } | known
+        cancelled = 0
+        for oid in targets:
+            try:
+                await self._trader.cancel_spot_order(symbol, oid)
+                cancelled += 1
+            except ExchangeError:
+                # Already gone (filled or cancelled) is the common case here.
+                log.info("cancel of spot order %s on %s failed", oid, symbol)
+        if cancelled:
+            database.clear_stop_orders(self._conn, position.id)
+        return cancelled
 
     async def _cancel_task(self, position_id: int) -> None:
         """Cancel a running task for this position and AWAIT its cleanup before
@@ -1436,6 +1497,7 @@ class Executor:
         last_unreachable_alert = float("-inf")  # throttle "target unreachable" notices
         last_sale_alert = float("-inf")         # ...and failed-sale notices
         sale_blocked = False                    # venue says we hold less than the DB
+        released_locks = False                  # tried cancelling our own stops
         to_sell = Decimal(0)   # spot base units pending sale after perp buy-backs
         pend_perp_qty = Decimal(0)    # perp contracts behind `to_sell`
         pend_perp_cost = Decimal(0)   # ...and their cost, for the VWAP
@@ -1460,7 +1522,7 @@ class Executor:
 
         async def sell_pending(force: bool = False) -> None:
             nonlocal to_sell, pend_perp_qty, pend_perp_cost
-            nonlocal last_sale_alert, sale_blocked
+            nonlocal last_sale_alert, sale_blocked, released_locks
             if to_sell <= 0:
                 return
             book = self._md.mexc_books.get(pair.mexc_symbol)
@@ -1489,25 +1551,50 @@ class Executor:
             if to_sell <= 0:                 # pending batch cleared
                 pend_perp_qty = pend_perp_cost = Decimal(0)
             if shortfall > 0:
-                # "Oversold" means the venue holds LESS than the DB thinks, so
-                # retrying can never succeed — the spot-integrity check has to
-                # reconcile the DB first. Back off and stop shouting rather than
-                # hammering the venue every poll.
                 sale_blocked = bool(err) and (
                     "oversold" in err.lower() or "insufficient" in err.lower()
                 )
+                # 'Insufficient balance' has two causes and they need opposite
+                # responses. The coins can be GONE (DB and venue disagree —
+                # STONK #189 held 4 against a DB of 366), which only a reconcile
+                # fixes. Or they can be LOCKED by one of our own resting sell
+                # orders — a /stops limit — which a cancel fixes at once.
+                # Position 226 was the second: the balance sat on the venue for
+                # 35 minutes behind a stop-limit while the alert promised a
+                # reconcile that could never happen. So free our own locks
+                # first, and only then conclude the coins are missing.
+                if sale_blocked and not released_locks:
+                    released_locks = True
+                    freed = await self._release_spot_locks(
+                        position, pair.mexc_symbol
+                    )
+                    if freed:
+                        await self._notifier.alert(
+                            f"🔓 position {position.id} {symbol}: spot exit sale"
+                            f" was blocked by {freed} resting stop order(s)"
+                            f" locking the balance — cancelled them, retrying"
+                        )
+                        # The minute-long backoff is for coins that are
+                        # genuinely missing. These were just unlocked: retry
+                        # on the next poll, while the perp is naked.
+                        sale_blocked = False
+                        return
                 now_m = time.monotonic()
                 if now_m - last_sale_alert < config.PASSIVE_UNREACHABLE_ALERT_SECONDS:
                     return
                 last_sale_alert = now_m
                 reason = f" — MEXC: {err}" if err else " (no fill / thin book)"
+                # The perp is already bought back by now, so this is not a
+                # stalled exit — it is a naked long. Say so.
                 extra = (
-                    " — the venue holds less than this position's DB quantity;"
-                    " the spot-integrity check will reconcile it shortly"
-                    if sale_blocked else ""
+                    " — no resting order of ours is locking it, so the venue"
+                    " holds less than the DB thinks. The perp is already closed:"
+                    " you are NAKED LONG this spot until it sells. Check MEXC"
+                    if sale_blocked else
+                    " — the perp is already closed, so this spot is unhedged"
                 )
                 await self._notifier.alert(
-                    f"⚠️ position {position.id} {symbol}: spot exit sale incomplete,"
+                    f"🚨 position {position.id} {symbol}: spot exit sale incomplete,"
                     f" {shortfall} base units pending{reason}{extra}"
                 )
 

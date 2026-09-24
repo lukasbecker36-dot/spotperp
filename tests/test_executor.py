@@ -969,7 +969,12 @@ async def test_oversold_sale_is_throttled_and_backs_off(env, monkeypatch):
 
     sale_alerts = [m for m in notifier.messages if "sale incomplete" in m]
     assert len(sale_alerts) == 1                      # throttled, not per-poll
-    assert "reconcile it shortly" in sale_alerts[0]   # explains the cause
+    # No resting order of ours was locking the balance here, so the coins
+    # really are missing — and the perp is already closed, so the alert must
+    # say this is a naked long rather than promise a reconcile. "Will
+    # reconcile it shortly" is what kept position 226 waiting 35 minutes.
+    assert "no resting order of ours is locking it" in sale_alerts[0]
+    assert "NAKED LONG" in sale_alerts[0]
 
 
 async def test_add_reports_this_run_basis_separately_from_the_blend(env, monkeypatch):
@@ -1148,3 +1153,82 @@ async def test_a_partial_salvage_keeps_working_the_order(env, monkeypatch):
     # Kept working past the partly-unwound first clip.
     assert final.perp_qty > Decimal("5")
     assert final.spot_qty == final.perp_qty
+
+
+async def test_exit_frees_a_balance_locked_by_our_own_stop(env, monkeypatch):
+    """Position 226: the perp closed, the spot sale failed 'Oversold' for 35
+    minutes, and the moment the MEXC stop-limit was cancelled by hand the sale
+    went through. The coins were never missing — our own /stops sell LIMIT was
+    locking them. The exit must find and cancel that itself."""
+    from exchange_client import ExchangeError, OrderResult
+    md, positions, executor, notifier, conn = env
+    monkeypatch.setattr(config, "PASSIVE_UNREACHABLE_ALERT_SECONDS", 600)
+    monkeypatch.setattr(config, "HEDGE_RETRY_ATTEMPTS", 1)
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+    pos = positions.get(pos_id)
+    positions.record_fill(pos_id, "aster", "exit", "BUY",
+                          pos.perp_qty, Decimal("100.0"), Decimal(0))
+    # /stops recorded the MEXC stop-limit's venue id when it placed it.
+    database.save_stop_orders(conn, pos_id, "aster-9", "mexc-9", pos.perp_qty)
+
+    state = {"locked": True, "cancelled": []}
+    real_taker = executor._trader.spot_taker
+
+    async def taker(symbol, side, qty, cap):
+        if state["locked"]:
+            raise ExchangeError("mexc", "Oversold", 30005)
+        return await real_taker(symbol, side, qty, cap)
+
+    async def open_orders(symbol):
+        # The venue does NOT echo our client id — the case the prefix sweep
+        # alone could not handle. Only the recorded id identifies it.
+        return [OrderResult(
+            venue="mexc", symbol=symbol, order_id="mexc-9", client_order_id="",
+            side="SELL", status="NEW", price=Decimal("95"),
+            orig_qty=pos.spot_qty, executed_qty=Decimal(0),
+            avg_price=Decimal(0),
+        )]
+
+    async def cancel(symbol, order_id):
+        state["cancelled"].append(order_id)
+        state["locked"] = False
+
+    executor._trader.spot_taker = taker
+    executor._trader.spot_open_orders = open_orders
+    executor._trader.cancel_spot_order = cancel
+
+    positions.set_exit_request(pos_id, "passive", Decimal(15))
+    await executor.start_exit(positions.get(pos_id))
+    await wait_for_state(positions, pos_id, pm.CLOSED)
+    assert state["cancelled"] == ["mexc-9"]
+    assert any("locking the balance" in m for m in notifier.messages)
+    assert not any("NAKED LONG" in m for m in notifier.messages)
+    assert positions.get(pos_id).spot_qty == 0
+
+
+async def test_release_never_cancels_someone_elses_order(env, monkeypatch):
+    """A resting sell that is not ours — a manual order on the same coin — must
+    survive. Only the recorded stop id or our own prefix qualifies."""
+    from exchange_client import OrderResult
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    cancelled = []
+
+    async def open_orders(symbol):
+        return [OrderResult(
+            venue="mexc", symbol=symbol, order_id="manual-1",
+            client_order_id="myManualOrder", side="SELL", status="NEW",
+            price=Decimal("120"), orig_qty=Decimal(5),
+            executed_qty=Decimal(0), avg_price=Decimal(0),
+        )]
+
+    async def cancel(symbol, order_id):
+        cancelled.append(order_id)
+
+    executor._trader.spot_open_orders = open_orders
+    executor._trader.cancel_spot_order = cancel
+    freed = await executor._release_spot_locks(
+        positions.get(pos_id), "BTCUSDT"
+    )
+    assert freed == 0 and cancelled == []

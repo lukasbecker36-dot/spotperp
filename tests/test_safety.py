@@ -1862,3 +1862,38 @@ async def test_funding_discount_gate_is_tunable(engine, monkeypatch, tmp_path):
     import json
     snap = json.loads((tmp_path / "fnd.json").read_text())
     assert [r["symbol"] for r in snap["rows"]] == ["BTCUSDT"]
+
+
+async def test_cancel_stops_uses_the_recorded_ids_not_just_the_sweep(engine):
+    """Position 226: the exit's pre-close cancel deleted the recorded stop ids
+    and then relied on a client-id prefix sweep alone. When that sweep found
+    nothing, the MEXC stop-limit kept resting — locking the whole spot balance
+    — and the exit could not sell for 35 minutes. The recorded ids have to be
+    used, and only cleared once dealt with."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    database.save_stop_orders(engine.conn, pid, "aster-7", "mexc-7", Decimal(5))
+    engine._stops_orders[pid] = {"aster_id": "aster-7", "mexc_id": "mexc-7"}
+    # The sweep finds nothing: a venue that does not echo our client ids.
+    engine.aster = _StopClient(open_orders=[])
+    engine.mexc = _StopClient(open_orders=[])
+
+    n = await engine._cancel_stops_for(engine.positions.get(pid))
+    assert engine.aster.cancelled == ["aster-7"]
+    assert engine.mexc.cancelled == ["mexc-7"]
+    assert n == 2
+    # ...and the record is gone only now that it has been used.
+    assert database.load_stop_orders(engine.conn) == {}
+
+
+async def test_cancel_stops_survives_an_engine_restart(engine):
+    """The ids live in the DB precisely so a restart cannot lose them — an
+    empty in-memory map must still cancel what was recorded."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    database.save_stop_orders(engine.conn, pid, "aster-8", "mexc-8", Decimal(5))
+    engine._stops_orders = {}                     # fresh process
+    engine.aster = _StopClient(open_orders=[])
+    engine.mexc = _StopClient(open_orders=[])
+    await engine._cancel_stops_for(engine.positions.get(pid))
+    assert engine.mexc.cancelled == ["mexc-8"]
