@@ -1232,3 +1232,26 @@ async def test_release_never_cancels_someone_elses_order(env, monkeypatch):
         positions.get(pos_id), "BTCUSDT"
     )
     assert freed == 0 and cancelled == []
+
+
+def test_stop_close_reports_the_filled_basis_not_the_live_quote(env):
+    """Position 249: the stop closed perp at 0.0752979 and spot at 0.07395 —
+    +182.3bps — but the CLOSED alert said +84.6, the live book by the time the
+    message was written. A close with no clip record fills each leg once, so
+    its fills ARE the executed basis; reporting the quote showed a 20bp
+    give-back on a trade that had given back 118, irreconcilable with the
+    P&L beside it."""
+    md, positions, executor, notifier, conn = env
+    pos = positions.create("BTCUSDT", Decimal(1000), paper=False)
+    positions.record_fill(pos.id, "aster", "entry", "SELL", Decimal(23961),
+                          Decimal("0.0410838"), Decimal(0))
+    positions.record_fill(pos.id, "mexc", "entry", "BUY", Decimal(23961),
+                          Decimal("0.0408222"), Decimal(0))
+    positions.record_fill(pos.id, "aster", "exit", "BUY", Decimal(23961),
+                          Decimal("0.0752979"), Decimal(0), order_id="stop-1")
+    positions.record_fill(pos.id, "mexc", "exit", "SELL", Decimal(23961),
+                          Decimal("0.07395"), Decimal(0), order_id="stop-2")
+    # The live book afterwards reads a much tamer +84.6bps.
+    set_books(md, "0.0802", "0.0803", "0.07952", "0.07953")
+    got = executor._exit_basis_for_msg(positions.get(pos.id))
+    assert float(got) == pytest.approx(182.27, abs=0.1)

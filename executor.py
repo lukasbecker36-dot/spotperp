@@ -745,8 +745,9 @@ class Executor:
         (perp/mult - spot) / spot in bps. NOTE: this ratios two averages taken
         at DIFFERENT times across the exit — on a moving price (or when thin
         spot bids delay the spot leg) it can read far from the real per-clip
-        basis. Prefer _exit_basis_for_msg (live, same-instant) for user output;
-        this stays as a books-unavailable fallback."""
+        basis. On a multi-clip exit, the per-clip bases recorded during the
+        exit are better; on a close that fills each leg once (a stop, an ADL
+        rebalance) this IS the executed basis. _exit_basis_for_msg picks."""
         if perp_avg is None or spot_avg is None or spot_avg == 0:
             return None
         return (perp_avg / mult - spot_avg) / spot_avg * BPS
@@ -755,18 +756,27 @@ class Executor:
         """Basis to report for a completed exit.
 
         Prefer the notional-weighted mean of the bases the clips actually
-        filled at — the only measure that survives both failure modes: the
-        exit-VWAP ratio breaks when the legs fill at different times across a
-        moving price, and the completion-instant quote lies when the book
-        flickers. Fall back to the live close basis, then the VWAP ratio."""
+        filled at — on a multi-clip exit that survives the leg-timing problem,
+        where the exit-VWAP ratio breaks because the legs fill at different
+        times across a moving price.
+
+        Otherwise the exit-fill VWAPs, and only then the live quote. Closes with
+        no clip record — a stop firing, an ADL rebalance — each fill their legs
+        in one go, so their fills ARE the executed basis. The live quote is just
+        whatever the book shows once the message is written. Preferring it
+        reported position 249's stop close at +84.6bps when the fills locked
+        +182.3, so the alert showed a 20bp give-back on a trade that had given
+        back 118 — and the P&L could not be reconciled with it."""
         acc = self._exit_clip_basis.get(pos.id)
         if acc and acc[1] > 0:
             return Decimal(str(acc[0] / acc[1]))
-        live = self._close_basis_bps(pos.symbol)
-        if live is not None:
-            return live
         mult = self._pair(pos.symbol).qty_multiplier
-        return self._executed_basis_bps(pos.perp_exit_avg, pos.spot_exit_avg, mult)
+        filled = self._executed_basis_bps(
+            pos.perp_exit_avg, pos.spot_exit_avg, mult
+        )
+        if filled is not None:
+            return filled
+        return self._close_basis_bps(pos.symbol)
 
     def _fee_usd(self, venue: str, maker: bool, qty: Decimal, price: Decimal) -> Decimal:
         if venue == "aster":
