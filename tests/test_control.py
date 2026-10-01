@@ -191,3 +191,109 @@ def _cells(text):
 def test_pad_never_exceeds_its_width():
     for sym in ("哈基米USDT", "我踏马来了USDT", "A", "", "LONGASCIISYMBOLUSDT"):
         assert _cells(control_bot._pad(sym, 11)) <= 11
+
+
+def test_every_dispatched_command_is_in_the_menu():
+    """The reverse of the check above. Six commands — orders, equity,
+    recompute, truefill, auto, fills — were added to _dispatch and worked when
+    typed, but never reached the Telegram Menu, so they were invisible unless
+    you already knew the name."""
+    src = inspect.getsource(control_bot.ControlBot._dispatch)
+    dispatched = set(re.findall(r'command == "([a-z_]+)"', src))
+    menu = {c["command"] for c in control_bot.BOT_COMMANDS}
+    # help/menu are entry points rather than tools; everything else must show.
+    missing = dispatched - menu - {"help", "menu"}
+    assert not missing, f"dispatched but not in the menu: {sorted(missing)}"
+
+
+# ── /fills ───────────────────────────────────────────────────────────────────
+
+import database  # noqa: E402
+import position_manager as pm  # noqa: E402
+from decimal import Decimal  # noqa: E402
+
+
+@pytest.fixture
+def fills_bot(tmp_path):
+    conn = database.init_db(tmp_path / "t.db")
+    bot = _bot()
+    bot._positions = pm.PositionManager(conn)
+    yield bot
+    conn.close()
+
+
+def _closed(bot, symbol="GUSDT", perp_out=1000, spot_out=1000, mult=1):
+    mgr = bot._positions
+    pos = mgr.create(symbol, Decimal(100), paper=False, trade_kind="carry")
+    mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(1000),
+                    Decimal("1.0050") * mult, Decimal("0.05"))
+    mgr.record_fill(pos.id, "mexc", "entry", "BUY", Decimal(1000) * mult,
+                    Decimal("1.0000"), Decimal("0.05"))
+    mgr.record_fill(pos.id, "aster", "exit", "BUY", Decimal(perp_out),
+                    Decimal("1.0300") * mult, Decimal("0.09"))
+    mgr.record_fill(pos.id, "mexc", "exit", "SELL", Decimal(spot_out) * mult,
+                    Decimal("1.0280"), Decimal("0.05"))
+    mgr.set_state(pos.id, pm.CLOSED)
+    mgr.finalize_pnl(pos.id)
+    return pos.id
+
+
+def test_fills_shows_every_fill_and_the_pnl_components(fills_bot):
+    pid = _closed(fills_bot)
+    out = fills_bot._cmd_fills([str(pid)])
+    assert out.count(" perp entry") == 1 and out.count(" spot exit") == 1
+    assert "hedge  entry matched · exit matched" in out
+    for part in ("perp leg", "spot leg", "funding", "fees", "total"):
+        assert part in out
+    assert "differs by" not in out          # recorded == recomputed
+
+
+def test_fills_flags_a_hedge_size_mismatch(fills_bot):
+    """The question behind it: were the two legs the same size? A gap means
+    part of the position carried naked delta, and the coin's own move drove
+    that part of the P&L — position 249's loss was larger than its basis move
+    alone could explain."""
+    pid = _closed(fills_bot, perp_out=1000, spot_out=800)
+    out = fills_bot._cmd_fills([str(pid)])
+    assert "exit ⚠ spot -200" in out and "-20.0%" in out
+
+
+def test_fills_warns_when_the_recorded_pnl_is_stale(fills_bot):
+    pid = _closed(fills_bot)
+    fills_bot._positions._conn.execute(
+        "UPDATE positions SET realized_pnl_usd='-24.93' WHERE id=?", (pid,))
+    fills_bot._positions._conn.commit()
+    out = fills_bot._cmd_fills([str(pid)])
+    assert "recorded -$24.93" in out
+    assert f"/recompute {pid}" in out
+
+
+def test_fills_compares_legs_through_the_contract_multiplier(fills_bot):
+    """Perp in contracts, spot in coins: a 1000X contract is matched when the
+    spot holds 1000x the perp count, not when the counts are equal."""
+    pid = _closed(fills_bot, symbol="1000PEPEUSDT", mult=1000)
+    out = fills_bot._cmd_fills([str(pid)])
+    assert "x1000" in out and "exit matched" in out
+
+
+def test_fills_resolves_by_symbol_and_defaults_to_latest(fills_bot):
+    first = _closed(fills_bot, symbol="GUSDT")
+    second = _closed(fills_bot, symbol="BUSDT")
+    assert f"#{first} GUSDT" in fills_bot._cmd_fills(["g"])
+    assert f"#{second} BUSDT" in fills_bot._cmd_fills([])
+    assert "no position #999" in fills_bot._cmd_fills(["999"])
+
+
+def test_fills_elides_the_middle_of_a_long_history(fills_bot):
+    """Positions worked in $50 clips run to hundreds of fills; the message
+    stays readable on a phone."""
+    mgr = fills_bot._positions
+    pos = mgr.create("GUSDT", Decimal(100), paper=False)
+    for _ in range(30):
+        mgr.record_fill(pos.id, "aster", "entry", "SELL", Decimal(10),
+                        Decimal("1.005"), Decimal(0))
+        mgr.record_fill(pos.id, "mexc", "entry", "BUY", Decimal(10),
+                        Decimal("1.000"), Decimal(0))
+    out = fills_bot._cmd_fills([str(pos.id)])
+    assert "30 more fills" in out
+    assert "no realised P&L" in out

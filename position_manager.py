@@ -142,6 +142,24 @@ class PositionManager:
         ).fetchall()
         return [Position.from_row(r) for r in rows]
 
+    def fills(self, position_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM fills WHERE position_id=? ORDER BY id", (position_id,)
+        ).fetchall()
+
+    def latest(self, symbol: str | None = None) -> Position | None:
+        """The most recent position, optionally for one symbol (any state)."""
+        if symbol:
+            row = self._conn.execute(
+                "SELECT * FROM positions WHERE symbol=? ORDER BY id DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM positions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return Position.from_row(row) if row else None
+
     def closed(self, limit: int = 10) -> list[Position]:
         rows = self._conn.execute(
             "SELECT * FROM positions WHERE state IN (?, ?) ORDER BY id DESC LIMIT ?",
@@ -512,19 +530,19 @@ class PositionManager:
 
     # ── P&L ──
 
-    def finalize_pnl(self, position_id: int) -> Decimal:
-        """Compute realised P&L from fills + funding - fees and store it.
+    def breakdown(self, position_id: int) -> dict:
+        """Every component of a position's P&L, from the same arithmetic that
+        finalize_pnl stores — so a breakdown shown to a human can never quietly
+        disagree with the recorded figure about how it was computed.
 
-        Premium trade: perp pnl = (entry - exit) * qty (short), spot pnl =
-        (exit - entry) * qty (long).
+        Quantities come from the same derivation as the averages, so a
+        reversed (unwound) entry is excluded from both. Mixing a raw entry
+        count with an unwind-aware average prices the wrong size.
         """
         pos = self.get(position_id)
-        perp_pnl = spot_pnl = Decimal(0)
-        # Quantities from the same derivation that produced the averages, so a
-        # reversed (unwound) entry is excluded from both. Mixing a raw entry
-        # count with an unwind-aware average prices the wrong size.
         perp = self._derive_legs(position_id, "aster")
         spot = self._derive_legs(position_id, "mexc")
+        perp_pnl = spot_pnl = Decimal(0)
         if pos.perp_entry_avg is not None and pos.perp_exit_avg is not None:
             qty = min(perp["entry_qty"], perp["exit_qty"])
             perp_pnl = (pos.perp_entry_avg - pos.perp_exit_avg) * qty
@@ -533,10 +551,24 @@ class PositionManager:
             spot_pnl = (pos.spot_exit_avg - pos.spot_entry_avg) * qty
         # Unwound clips closed at a price of their own; that money is real but
         # belongs to neither average (see _derive_legs).
-        pnl = (
+        total = (
             perp_pnl + spot_pnl + pos.unwind_pnl_usd
             + pos.funding_usd - pos.fees_usd
         )
+        return {
+            "perp": perp, "spot": spot,
+            "perp_pnl": perp_pnl, "spot_pnl": spot_pnl,
+            "unwind_pnl": pos.unwind_pnl_usd, "funding": pos.funding_usd,
+            "fees": pos.fees_usd, "total": total,
+        }
+
+    def finalize_pnl(self, position_id: int) -> Decimal:
+        """Compute realised P&L from fills + funding - fees and store it.
+
+        Premium trade: perp pnl = (entry - exit) * qty (short), spot pnl =
+        (exit - entry) * qty (long).
+        """
+        pnl = self.breakdown(position_id)["total"]
         self._conn.execute(
             "UPDATE positions SET realized_pnl_usd=?, updated_ms=? WHERE id=?",
             (str(pnl), _now_ms(), position_id),

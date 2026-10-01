@@ -60,6 +60,7 @@ HELP = """Commands:
 /remove ID|SYMBOL YES — stop tracking a position closed manually on the exchange (DB only)
 /truefill ID|SYMBOL — re-price a mark-booked exit (ADL / lost stop) from Aster's real trades and recompute P&L
 /recompute ID|SYMBOL — re-derive quantities, averages and entry basis from the fill history (DB only)
+/fills [ID|SYMBOL] — every fill of one position, its legs, hedge balance and where the P&L came from (default: latest)
 /trades [n] — last closed trades (avg venue prices, open/close basis, funding, commission, P&L; default 5)
 /pnl — realised P&L summary (closed trades only)
 /equity [days] — total account value (perp margin + upnl, spot coins, USDT), daily change table and chart
@@ -80,24 +81,30 @@ BOT_COMMANDS = [
     {"command": "screen", "description": "Basis opportunities; 'diff' vs 24h avg, 'swing' round-trip"},
     {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
     {"command": "positions", "description": "Open positions, P&L + liq proximity"},
+    {"command": "orders", "description": "Working entries/exits vs level + 24h range"},
     {"command": "recon", "description": "Live venue P&L, funding rate + liq"},
     {"command": "balance", "description": "USDT balance on each venue"},
     {"command": "book", "description": "Order book both venues: SYMBOL"},
     {"command": "status", "description": "Engine status and heartbeat"},
     {"command": "review", "description": "AI review of book + opportunities (advisory)"},
-    {"command": "pnl", "description": "Realised P&L summary"},
+    {"command": "pnl", "description": "Realised P&L summary (closed trades)"},
+    {"command": "equity", "description": "Total account value, daily change + chart"},
     {"command": "trades", "description": "Recent closed trades"},
+    {"command": "fills", "description": "One position's fills, legs + P&L: [ID|SYMBOL]"},
     {"command": "log", "description": "Recent journal entries"},
     # trading
     {"command": "enter", "description": "Enter / size up: SYMBOL NOTIONAL [min_bps] [carry]"},
     {"command": "exit", "description": "Exit: ID|SYMBOL now|passive [bps]"},
     {"command": "cancel", "description": "Cancel working entry or exit: ID|SYMBOL"},
+    {"command": "auto", "description": "Auto passive exit on a plunge: [ID|SYMBOL] [off]"},
     {"command": "stops", "description": "Liq-protection orders 1% below liq: SYMBOL"},
     {"command": "flatten", "description": "Close all positions (YES)"},
     # position management
     {"command": "adopt", "description": "Import a venue carry trade: SYMBOL"},
     {"command": "remove", "description": "Stop tracking a manually-closed pos: ID|SYMBOL YES"},
     {"command": "refresh", "description": "Rebuild the cross-listed coin universe"},
+    {"command": "recompute", "description": "Re-derive a position from its fills: ID|SYMBOL"},
+    {"command": "truefill", "description": "Re-price a mark-booked exit from Aster: ID"},
     # mode + service
     {"command": "mode", "description": "Show paper/live mode"},
     {"command": "paper", "description": "Switch to paper mode"},
@@ -298,6 +305,8 @@ class ControlBot:
             return await self._queue_and_wait("remove", {"position_id": args[0]})
         if command == "trades":
             return self._cmd_trades(args)
+        if command == "fills":
+            return self._cmd_fills(args)
         if command == "pnl":
             return self._cmd_pnl()
         if command == "log":
@@ -934,6 +943,120 @@ class ControlBot:
                 + f"  →  P&L {pnl}{imbalance}",
             ]))
         return "last trades:\n\n" + "\n\n".join(blocks)
+
+    def _cmd_fills(self, args: list[str]) -> str:
+        """Every fill of one position, its legs, and where the P&L came from.
+
+        Read-only, straight from the bot's DB. Replaces asking for a server
+        shell to dump the fills table — which was needed for 217, 226 and 249
+        before this existed.
+        """
+        arg = args[0] if args else ""
+        if arg.isdigit():
+            try:
+                pos = self._positions.get(int(arg))
+            except KeyError:
+                return f"no position #{arg}"
+        else:
+            sym = arg.upper()
+            if sym and not sym.endswith("USDT"):
+                sym += "USDT"
+            pos = self._positions.latest(sym or None)
+            if pos is None:
+                return f"no position for {sym}" if sym else "no positions yet"
+        fills = self._positions.fills(pos.id)
+        b = self._positions.breakdown(pos.id)
+        perp, spot = b["perp"], b["spot"]
+
+        # The DB stores perp in contracts and spot in coins. Infer the contract
+        # multiplier from the leg prices (the bot has no symbol map), so the
+        # hedge check compares like with like on 1000X-style contracts.
+        mult = Decimal(1)
+        if perp["entry_avg"] and spot["entry_avg"]:
+            ratio = perp["entry_avg"] / spot["entry_avg"]
+            mult = min((Decimal(10) ** k for k in range(6)),
+                       key=lambda m: abs(ratio / m - 1))
+
+        kind = " ⚓carry" if pos.trade_kind == "carry" else ""
+        lines = [f"#{pos.id} {pos.symbol} {pos.state}{kind}"
+                 f"{' (paper)' if pos.paper else ''} · {len(fills)} fills"]
+        if not fills:
+            return lines[0] + "\n(no fills recorded)"
+
+        def fill_line(f) -> str:
+            leg = "perp" if f["venue"] == "aster" else "spot"
+            when = time.strftime("%d %H:%M", time.localtime(f["ts_ms"] / 1000))
+            tag = "  ADL" if f["order_id"] == "ADL" else ""
+            return (f"{when} {leg} {f['phase']:<6}"
+                    f"{self._fmt_qty(Decimal(f['qty'])):>10} @ "
+                    f"{self._fmt_px(Decimal(f['price']))}{tag}")
+
+        lines.append("")
+        # Long positions run to hundreds of clips; the first and last are what
+        # explain an entry and an exit, and the middle is repetition.
+        if len(fills) > 40:
+            lines += [fill_line(f) for f in fills[:15]]
+            lines.append(f"   … {len(fills) - 30} more fills …")
+            lines += [fill_line(f) for f in fills[-15:]]
+        else:
+            lines += [fill_line(f) for f in fills]
+
+        def leg(name, d):
+            ent = (f"in {self._fmt_qty(d['entry_qty'])} @ {self._fmt_px(d['entry_avg'])}"
+                   if d["entry_avg"] else "in -")
+            ext = (f"out {self._fmt_qty(d['exit_qty'])} @ {self._fmt_px(d['exit_avg'])}"
+                   if d["exit_avg"] else "out -")
+            return f"  {name}  {ent}   {ext}"
+
+        lines += ["", f"legs (perp in contracts x{mult}, spot in coins)",
+                  leg("perp", perp), leg("spot", spot)]
+        if b["unwind_pnl"]:
+            lines.append(f"  unwound clips  {float(b['unwind_pnl']):+,.2f} USD")
+
+        # The question that keeps coming up: were the two legs the same size?
+        # A gap means part of the position carried naked delta, and the coin's
+        # own move — not the basis — drove that part of the P&L.
+        def gap(p, s_) -> str:
+            want = p * mult
+            if want == 0 and s_ == 0:
+                return "-"
+            diff = s_ - want
+            if abs(diff) <= max(want, s_) * Decimal("0.01"):
+                return "matched"
+            return (f"⚠ spot {'+' if diff > 0 else ''}{self._fmt_qty(diff)}"
+                    f" vs perp ({float(diff / want * 100) if want else 0:+.1f}%)")
+        lines.append(f"  hedge  entry {gap(perp['entry_qty'], spot['entry_qty'])}"
+                     f" · exit {gap(perp['exit_qty'], spot['exit_qty'])}")
+
+        def usd(x) -> str:
+            # 0.0 - x, not -x: negating a zero Decimal prints "-0.00".
+            v = float(x) + 0.0
+            return f"{('-' if v < 0 else '+') + '$' + f'{abs(v):,.2f}':>10}"
+
+        lines += ["", "P&L"]
+        if perp["exit_avg"] and perp["entry_avg"]:
+            lines.append(f"  perp leg {usd(b['perp_pnl'])}"
+                         f"  short {self._fmt_px(perp['entry_avg'])}"
+                         f" -> {self._fmt_px(perp['exit_avg'])}")
+        if spot["exit_avg"] and spot["entry_avg"]:
+            lines.append(f"  spot leg {usd(b['spot_pnl'])}"
+                         f"  long  {self._fmt_px(spot['entry_avg'])}"
+                         f" -> {self._fmt_px(spot['exit_avg'])}")
+        if b["unwind_pnl"]:
+            lines.append(f"  unwinds  {usd(b['unwind_pnl'])}")
+        lines.append(f"  funding  {usd(b['funding'])}")
+        lines.append(f"  fees     {usd(0 - b['fees'])}")
+        lines.append(f"  total    {usd(b['total'])}")
+        rec = pos.realized_pnl_usd
+        if rec is not None and abs(rec - b["total"]) > Decimal("0.01"):
+            # The stored figure is from whatever arithmetic ran at close. If it
+            # differs from the fills now, it is stale — /recompute rewrites it.
+            lines.append(f"  ⚠ recorded {usd(rec).strip()} differs by"
+                         f" {usd(b['total'] - rec).strip()} —"
+                         f" /recompute {pos.id} to refresh it")
+        elif rec is None and pos.state not in ("CLOSED", "CANCELLED"):
+            lines.append("  (open: legs not yet closed, so no realised P&L)")
+        return "\n".join(lines)
 
     def _cmd_pnl(self) -> str:
         s = self._positions.pnl_summary()
