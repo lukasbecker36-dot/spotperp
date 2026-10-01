@@ -225,6 +225,8 @@ class Engine:
         for pid, row in stops.items():
             self._stops_orders[pid] = {
                 "aster_id": row["aster_id"], "mexc_id": row["mexc_id"],
+                "liq": (Decimal(row["liq_price"])
+                        if row.get("liq_price") else None),
             }
             self._stops_qty[pid] = Decimal(row["perp_qty"] or "0")
         if stops:
@@ -1099,6 +1101,34 @@ class Engine:
                 return
             await self._ensure_stops_locked(pos)
 
+    def _liq_moved(self, pos: pm.Position, pair) -> tuple | None:
+        """(old, new) liquidation price when it has moved enough since the
+        stops were placed to make them wrong, else None.
+
+        A stop sits STOP_LIQ_BUFFER_PCT below liquidation. Adding margin moves
+        liquidation away and leaves the stop at the old level, so it fires on
+        an ordinary move nowhere near danger — position 249 was 64% from liq
+        when its stale stop closed it. Removing margin is worse: liquidation
+        moves past the stop, which then sits BEYOND it. Size is unchanged
+        either way, which is why a size check alone never noticed.
+
+        Only acts on a fresh positionRisk snapshot, and a stop with no
+        recorded level (placed before this was tracked) counts as moved, so
+        every existing stop is re-placed once and gets one.
+        """
+        if (time.monotonic() - self._position_risk_ts
+                > config.HEDGE_BREAK_RISK_FRESH_SECONDS):
+            return None
+        row = self._position_risk.get(pair.aster_symbol)
+        now_liq = _dec_or_zero(row.get("liquidationPrice")) if row else Decimal(0)
+        if now_liq <= 0:
+            return None
+        rec = (self._stops_orders.get(pos.id) or {}).get("liq")
+        if rec is None or rec <= 0:
+            return (None, now_liq)
+        moved = abs(now_liq - rec) / rec * 100
+        return (rec, now_liq) if moved > config.STOP_LIQ_REFRESH_PCT else None
+
     def _stops_wanted(self, pos: pm.Position) -> bool:
         if pos.state != pm.OPEN or pos.perp_qty <= 0 or pos.spot_qty <= 0:
             return False
@@ -1120,7 +1150,8 @@ class Engine:
             return
         current = info.round_qty(pos.perp_qty)
         prior = self._stops_qty.get(pos.id)
-        if prior == current:
+        liq_move = self._liq_moved(pos, pair) if prior is not None else None
+        if prior == current and liq_move is None:
             return
         # _place_stops can fail without recording (no liquidation price yet on a
         # just-opened position, venue error). Throttle so a persistent failure
@@ -1134,7 +1165,23 @@ class Engine:
             return
         self._auto_stops_attempt[pos.id] = now
         result = await self._place_stops(pos)   # updates self._stops_qty
-        if prior is None:
+        if liq_move is not None and prior == current:
+            old_liq, new_liq = liq_move
+            if old_liq is None:
+                why = ("they were placed before the liquidation level was"
+                       f" recorded — re-placed against {recon._p(new_liq)}")
+            else:
+                pct = (new_liq - old_liq) / old_liq * 100
+                why = (f"liquidation moved {recon._p(old_liq)} ->"
+                       f" {recon._p(new_liq)} ({float(pct):+.1f}%"
+                       + (", margin added?" if new_liq > old_liq else
+                          ", margin reduced? — the old stop sat BEYOND it")
+                       + ") — re-placed against the new level")
+            await self.notifier.alert(
+                f"🔁 position {pos.id} {pos.symbol}: stops refreshed — {why}\n"
+                f"{result}"
+            )
+        elif prior is None:
             await self.notifier.alert(
                 f"🛡 position {pos.id} {pos.symbol}: stops auto-placed\n{result}"
             )
@@ -2287,11 +2334,15 @@ class Engine:
         # the position is later resized (a size-up otherwise leaves the added
         # portion unprotected until the operator remembers to re-run /stops).
         self._stops_qty[pos.id] = perp_qty
-        database.save_stop_orders(self.conn, pos.id, aster_id, mexc_id, perp_qty)
+        database.save_stop_orders(
+            self.conn, pos.id, aster_id, mexc_id, perp_qty, liq_price=liq
+        )
         # ...and the venue order ids, so the hedge guard can tell OUR OWN stop
         # firing apart from an ADL and read the real fill prices. In-memory:
         # after a restart the guard degrades to the mark-price ADL path.
-        self._stops_orders[pos.id] = {"aster_id": aster_id, "mexc_id": mexc_id}
+        self._stops_orders[pos.id] = {
+            "aster_id": aster_id, "mexc_id": mexc_id, "liq": liq,
+        }
         journal(self.conn, f"position {pos.id}: /stops liq={liq} stop={perp_stop}"
                 f" qty={perp_qty} (cancelled {cancelled} prior)")
         head = (f"stops for #{pos.id} {pos.symbol}: {float(config.STOP_LIQ_BUFFER_PCT):.0f}%"

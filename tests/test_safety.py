@@ -2386,3 +2386,96 @@ async def test_the_auto_mark_survives_a_restart(engine, monkeypatch):
     pid, placed = await _auto_exit_working(engine, monkeypatch)
     fresh = pm.PositionManager(engine.conn).get(pid)
     assert fresh.exit_auto is True
+
+
+# ── stops follow the liquidation price, not just the size ────────────────────
+
+async def _stops_at_liq(engine, monkeypatch, liq="150"):
+    """A live position with stops placed against `liq`, and a fresh risk
+    snapshot the test can move."""
+    monkeypatch.setattr(config, "AUTO_STOPS", True)
+    monkeypatch.setattr(config, "STOP_LIQ_REFRESH_PCT", Decimal("0.5"))
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _StopClient()
+    engine.mexc = _StopClient()
+    _set_liq(engine, liq)
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert len(engine.aster.placed) == 1
+    engine._auto_stops_attempt.clear()          # isolate the throttle
+    return pid
+
+
+def _set_liq(engine, liq):
+    engine._position_risk = {"BTCUSDT": {
+        "symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": liq,
+    }}
+    engine._position_risk_ts = _time.monotonic()
+
+
+async def test_stops_follow_liquidation_when_margin_is_added(engine, monkeypatch):
+    """Position 249: margin was added, moving liquidation from the level the
+    stops were placed at to far beyond it. Size never changed, and size was
+    all the refresh compared — so the stop stayed at the old, much closer
+    level and fired on an ordinary move with the position 64% from liq."""
+    pid = await _stops_at_liq(engine, monkeypatch, "150")
+    assert engine.aster.placed[0]["stop_price"] == Decimal("148.5")
+    _set_liq(engine, "200")                       # margin added
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert len(engine.aster.placed) == 2
+    assert engine.aster.placed[1]["stop_price"] == Decimal("198")   # 1% below
+    assert engine.mexc.placed[1]["price"] == Decimal("198")
+    msg = next(m for m in engine.notifier.messages if "refreshed" in m)
+    assert "margin added" in msg
+
+
+async def test_stops_follow_liquidation_when_it_moves_closer(engine, monkeypatch):
+    """The worse direction: liquidation moving TOWARDS the price leaves the
+    old stop beyond it, so the position liquidates before the stop can act."""
+    pid = await _stops_at_liq(engine, monkeypatch, "150")
+    _set_liq(engine, "130")
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert engine.aster.placed[-1]["stop_price"] == Decimal("128.7")
+    assert any("BEYOND" in m for m in engine.notifier.messages)
+
+
+async def test_small_liquidation_drift_does_not_churn(engine, monkeypatch):
+    """Funding nudges an isolated position's liquidation price continuously.
+    Re-placing on every wobble would cancel and re-place orders all day."""
+    pid = await _stops_at_liq(engine, monkeypatch, "150")
+    _set_liq(engine, "150.3")                     # +0.2%, inside 0.5%
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert len(engine.aster.placed) == 1
+
+
+async def test_no_refresh_on_a_stale_risk_snapshot(engine, monkeypatch):
+    """Never move protective orders on a position snapshot that may be out of
+    date — the same rule the hedge guard follows."""
+    pid = await _stops_at_liq(engine, monkeypatch, "150")
+    _set_liq(engine, "200")
+    engine._position_risk_ts = _time.monotonic() - 3600
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert len(engine.aster.placed) == 1
+
+
+async def test_existing_stops_without_a_recorded_level_are_refreshed_once(
+    engine, monkeypatch
+):
+    """Stops placed before the level was recorded have nothing to compare
+    against. They are re-placed once to pick it up — which is exactly the
+    stale state position 249 was in — and are then left alone."""
+    pid = await _stops_at_liq(engine, monkeypatch, "150")
+    engine._stops_orders[pid].pop("liq")          # as if placed before
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert len(engine.aster.placed) == 2
+    assert any("before the liquidation level was recorded" in m
+               for m in engine.notifier.messages)
+    engine._auto_stops_attempt.clear()
+    await engine._ensure_stops(engine.positions.get(pid))
+    assert len(engine.aster.placed) == 2          # now recorded: quiet
+
+
+async def test_the_recorded_level_survives_a_restart(engine, monkeypatch):
+    pid = await _stops_at_liq(engine, monkeypatch, "150")
+    row = database.load_stop_orders(engine.conn)[pid]
+    assert Decimal(row["liq_price"]) == Decimal("150")

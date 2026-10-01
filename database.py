@@ -147,6 +147,11 @@ _MIGRATIONS = [
     # exit stand itself down if the plunge reverses — and it has to survive a
     # restart, or a resumed exit would sit forever with its stops off.
     "ALTER TABLE positions ADD COLUMN exit_auto INTEGER NOT NULL DEFAULT 0",
+    # The liquidation price a stop was sized against. Without it a stop could
+    # only be refreshed on a SIZE change, so adding margin — which moves
+    # liquidation away and leaves size alone — left the stop at the old, much
+    # closer level, where it fired on an ordinary move (position 249).
+    "ALTER TABLE stop_orders ADD COLUMN liq_price TEXT",
 ]
 
 
@@ -241,27 +246,31 @@ def abandon_running_commands(conn: sqlite3.Connection) -> int:
 
 
 def save_stop_orders(
-    conn, position_id: int, aster_id, mexc_id, perp_qty
+    conn, position_id: int, aster_id, mexc_id, perp_qty, liq_price=None,
 ) -> None:
-    """Record the /stops order ids for a position, replacing any prior pair."""
+    """Record the /stops order ids for a position, replacing any prior pair,
+    with the size and liquidation price they were placed against."""
     conn.execute(
         "INSERT INTO stop_orders (position_id, aster_id, mexc_id, perp_qty,"
-        " updated_ms) VALUES (?,?,?,?,?)"
+        " liq_price, updated_ms) VALUES (?,?,?,?,?,?)"
         " ON CONFLICT(position_id) DO UPDATE SET aster_id=excluded.aster_id,"
         " mexc_id=excluded.mexc_id, perp_qty=excluded.perp_qty,"
-        " updated_ms=excluded.updated_ms",
-        (position_id, aster_id, mexc_id, str(perp_qty), int(time.time() * 1000)),
+        " liq_price=excluded.liq_price, updated_ms=excluded.updated_ms",
+        (position_id, aster_id, mexc_id, str(perp_qty),
+         str(liq_price) if liq_price is not None else None,
+         int(time.time() * 1000)),
     )
     conn.commit()
 
 
 def load_stop_orders(conn) -> dict[int, dict]:
-    """{position_id: {aster_id, mexc_id, perp_qty}} for every tracked stop."""
+    """{position_id: {aster_id, mexc_id, perp_qty, liq_price}} per stop."""
     return {
         row["position_id"]: {
             "aster_id": row["aster_id"],
             "mexc_id": row["mexc_id"],
             "perp_qty": row["perp_qty"],
+            "liq_price": row["liq_price"] if "liq_price" in row.keys() else None,
         }
         for row in conn.execute("SELECT * FROM stop_orders")
     }

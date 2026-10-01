@@ -260,6 +260,13 @@ LIQ_ALERT_THROTTLE_SECONDS = float(os.environ.get("LIQ_ALERT_THROTTLE_SECONDS", 
 # reduce-only buy STOP_MARKET on Aster (triggers on the mark, closing the short
 # before liquidation) and a resting sell LIMIT on MEXC at the same level.
 STOP_LIQ_BUFFER_PCT = Decimal(os.environ.get("STOP_LIQ_BUFFER_PCT", "1"))
+# Re-place the stops when the liquidation price moves by more than this (%)
+# from the level they were set against. Half the buffer: past that, a stop
+# either fires well short of liquidation (margin added — position 249 was
+# 64% from liq when its stale stop fired) or sits beyond it (margin removed).
+# Small enough to catch a margin change, large enough not to churn on the slow
+# drift funding causes on an isolated position.
+STOP_LIQ_REFRESH_PCT = Decimal(os.environ.get("STOP_LIQ_REFRESH_PCT", "0.5"))
 # Automatically keep /stops in place on a live OPEN position: place them when
 # it has none (a brand-new position, or one whose stops were cancelled to run a
 # partial exit and never re-armed) and re-place them whenever its size changes
