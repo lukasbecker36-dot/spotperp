@@ -1511,6 +1511,10 @@ class Executor:
         to_sell = Decimal(0)   # spot base units pending sale after perp buy-backs
         pend_perp_qty = Decimal(0)    # perp contracts behind `to_sell`
         pend_perp_cost = Decimal(0)   # ...and their cost, for the VWAP
+        # The spot sale in flight, if any. It runs shielded so a cancellation
+        # (liq guard, /exit now, shutdown) can't abandon it half-sent; the
+        # cancel handler waits for it before deciding what is still unsold.
+        sale_task: asyncio.Future | None = None
 
         async def absorb_fills(result: OrderResult) -> None:
             nonlocal to_sell, order_seen_executed, pend_perp_qty, pend_perp_cost
@@ -1532,7 +1536,7 @@ class Executor:
 
         async def sell_pending(force: bool = False) -> None:
             nonlocal to_sell, pend_perp_qty, pend_perp_cost
-            nonlocal last_sale_alert, sale_blocked, released_locks
+            nonlocal last_sale_alert, sale_blocked, released_locks, sale_task
             if to_sell <= 0:
                 return
             book = self._md.mexc_books.get(pair.mexc_symbol)
@@ -1544,9 +1548,10 @@ class Executor:
                 perp_vwap = (
                     pend_perp_cost / pend_perp_qty if pend_perp_qty > 0 else None
                 )
-                shortfall, err = await self._hedge_spot(
+                sale_task = asyncio.ensure_future(self._hedge_spot(
                     position, "SELL", qty, "exit", perp_vwap
-                )
+                ))
+                shortfall, err = await asyncio.shield(sale_task)
             except AmbiguousOrderError as exc:
                 # Spot sell may have filled; don't retry (could oversell). Stop
                 # this increment and alert for manual reconciliation.
@@ -1751,17 +1756,53 @@ class Executor:
                 await sell_pending()
                 await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
         except asyncio.CancelledError:
-            # Replaced by an aggressive exit or shutdown: cancel the resting
-            # order so the replacement doesn't double-close.
-            if order_id is not None:
-                try:
+            # Replaced by an aggressive exit, stood down by the liquidation
+            # guard, or shutdown: cancel the resting order so the replacement
+            # doesn't double-close, then sell whatever spot the bought-back
+            # perp no longer hedges.
+            #
+            # The sale must not depend on an order still resting. 龙虾 was
+            # cancelled by the liq guard just after a $100 clip had FULLY
+            # filled: order_id was already None, so the old handler skipped
+            # the sale and left 1504 coins long against a perp it no longer
+            # hedged.
+            try:
+                if order_id is not None:
                     result = await self._trader.cancel_perp_order(
                         pair.aster_symbol, order_id
                     )
                     await absorb_fills(result)
+            except ExchangeError:
+                log.exception("cleanup cancel failed for position %s", position.id)
+            ambiguous = False
+            if sale_task is not None and not sale_task.done():
+                # Let a half-sent sale finish and book its fills, so the DB
+                # says what is really still unsold before we sell more.
+                try:
+                    await sale_task
+                except AmbiguousOrderError:
+                    ambiguous = True
+                except Exception:
+                    log.exception("in-flight exit sale failed for position %s",
+                                  position.id)
+            if ambiguous:
+                await self._notifier.alert(
+                    f"🚨 position {position.id} {symbol}: spot exit sale AMBIGUOUS"
+                    f" while the exit was being cancelled — perp bought back but"
+                    f" spot sale UNKNOWN. Reconcile the spot balance manually."
+                )
+            else:
+                # DB truth, not just `to_sell`: the cancellation may have landed
+                # mid-sale, after `to_sell` was taken but before it was reset.
+                fresh = self._positions.get(position.id)
+                unhedged = mexc_info.round_qty(
+                    fresh.spot_qty - fresh.perp_qty * pair.qty_multiplier
+                )
+                to_sell = max(unhedged, Decimal(0))
+                try:
                     await sell_pending(force=True)
                 except ExchangeError:
-                    log.exception("cleanup cancel failed for position %s", position.id)
+                    log.exception("cleanup sale failed for position %s", position.id)
             raise
 
         if done:

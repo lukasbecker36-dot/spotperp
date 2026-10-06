@@ -1255,3 +1255,44 @@ def test_stop_close_reports_the_filled_basis_not_the_live_quote(env):
     set_books(md, "0.0802", "0.0803", "0.07952", "0.07953")
     got = executor._exit_basis_for_msg(positions.get(pos.id))
     assert float(got) == pytest.approx(182.27, abs=0.1)
+
+
+async def test_cancelled_passive_exit_still_sells_a_filled_clip(env):
+    """龙虾: the liquidation guard cancelled a passive exit just after a perp
+    buy-back clip had FULLY filled. With no order left resting, the cancel
+    handler skipped the spot sale and left 1504 coins long against a perp
+    that no longer hedged them. A cancel must sell the bought-back clip's
+    spot — once, even when it lands while that sale is already in flight."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    set_books(md, "100.0", "100.1", "99.9", "100.0")
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    orig_cap = executor._hedge_cap
+
+    async def stalled_cap(*args, **kwargs):
+        # The first exit sale stalls pricing its hedge; the cancel lands here.
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await orig_cap(*args, **kwargs)
+    executor._hedge_cap = stalled_cap
+
+    positions.set_exit_request(pos_id, "passive", Decimal(15))
+    await executor.start_exit(positions.get(pos_id))
+    await asyncio.wait_for(entered.wait(), 5)
+
+    mid = positions.get(pos_id)
+    assert mid.perp_qty < Decimal("9.95")          # a clip was bought back...
+    assert mid.spot_qty == Decimal("9.95")         # ...its spot not yet sold
+
+    task = executor._tasks[pos_id]
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    final = positions.get(pos_id)
+    assert final.spot_qty == final.perp_qty        # hedged again, not long
+    assert final.perp_qty == mid.perp_qty          # nothing further bought back
