@@ -703,6 +703,8 @@ class Engine:
                 # hidden for a number the reader cannot see.
                 if entry_now < config.FUNDING_MIN_ENTRY_BPS:
                     reject = "discount"
+                elif screener.no_exit_room(screen):
+                    reject = "exit"
             if reject:
                 hidden[reject] = hidden.get(reject, 0) + 1
                 continue
@@ -734,6 +736,7 @@ class Engine:
                 # where this pair has actually traded today.
                 "basis_p10_24h": screen.basis_p10_24h,
                 "basis_p90_24h": screen.basis_p90_24h,
+                "close_p10_24h": screen.close_p10_24h,
                 "hours_24h": screen.hours_24h,
                 # The board's one number: basis one-off + carry stream over a
                 # fixed horizon. Sorting on this replaces ranking by raw carry,

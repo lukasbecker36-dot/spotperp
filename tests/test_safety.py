@@ -2515,3 +2515,27 @@ async def test_ask_depth_sums_first_levels_for_board_symbols(
     row = json.loads((tmp_path / "fnd.json").read_text())["rows"][0]
     assert row["mexc_ask_depth_usd"] == 500.0
     assert "perp_volume_24h" in row
+
+
+async def test_funding_hides_names_whose_exit_never_comes_down(
+    engine, monkeypatch, tmp_path
+):
+    """A rich entry is no use if the exit basis never falls well below it."""
+    import funding as funding_mod
+    import json
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 0.0)
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._basis_24h = screener.DailyBasis()
+    engine.md.funding_stats["BTCUSDT"] = funding_mod.summarize(
+        "BTCUSDT", [], None, now_ms=0
+    )
+    import time as _time
+    now = int(_time.time() * 1000)
+    for h in range(24):   # entry ~+50 all day, exit never below ~+48
+        engine._basis_24h.add("BTCUSDT", now - h * 3_600_000, 50.0, 48.0)
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    engine._write_funding_snapshot()
+    snap = json.loads((tmp_path / "fnd.json").read_text())
+    assert snap["rows"] == []
+    assert snap["hidden"].get("exit") == 1

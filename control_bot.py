@@ -136,6 +136,13 @@ def _vol(v: float) -> str:
     return f"{v:.0f}"
 
 
+def _exit_lo(row: dict, default):
+    """lo24 on the boards: the 24h low of the EXIT basis (where an /exit
+    fills), or the entry-side low from a snapshot written before it existed."""
+    v = row.get("close_p10_24h")
+    return v if v is not None else row.get("basis_p10_24h", default)
+
+
 def _depth_usd(row: dict) -> float:
     """The board's depth figure: the first SCREEN_DEPTH_LEVELS MEXC asks
     summed, falling back to the top-of-book cap before the sweep has run."""
@@ -574,7 +581,7 @@ class ControlBot:
         lines = [f"fillability screen ({age_s:.0f}s old)", hdr, sep]
         for r in rows:
             entry_avg = r.get("entry_bps_avg", r["entry_bps"])
-            lo = r.get("basis_p10_24h", entry_avg)
+            lo = _exit_lo(r, entry_avg)
             jit = r.get("entry_bps_jitter", 0.0)
             jit_s = f"{jit:>5.1f}" if r.get("samples", 0) >= 3 else f"{'-':>5}"
             net = entry_avg - lo - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
@@ -618,8 +625,12 @@ class ControlBot:
             " tr/h = Aster perp trades per hour (flow, not resting depth — this"
             " is what lifts a maker). vol = Aster perp 24h volume in USDT;"
             f" rows under ${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f} are dropped."
-            " hi24 = p90 of the hourly basis over 24h, the rich end of the"
-            " pair's day (lo24 is the cheap end)."
+            " hi24 = p90 of the hourly ENTRY basis over 24h, the rich end of"
+            " the pair's day. lo24 = p10 of the hourly EXIT basis (maker"
+            " buy-back, taker spot sell), where an /exit actually fills."
+            f" Names whose lo24 is within {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}%"
+            " of hi24 are dropped: even the day's best exit barely beats its"
+            " best entry."
         )
         lines.append(
             f"net = (entry - lo24) - {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps"
@@ -708,7 +719,7 @@ class ControlBot:
                     return f"{'-':>{w}}"
                 return f"{f'{v:.0f}?':>{w}}" if thin else f"{v:>{w}.1f}"
 
-            lo24 = rng(r.get("basis_p10_24h"), 7)
+            lo24 = rng(_exit_lo(r, None), 7)
             hi24 = rng(r.get("basis_p90_24h"), 7)
             sc = r.get("score")
             # The score subtracts jit, but jit needs 3 samples to exist. After
@@ -759,11 +770,13 @@ class ControlBot:
             " sweep reaches a new row)."
         )
         lines.append(
-            "lo24/hi24 = p10/p90 of the HOURLY mean basis over 24h — where this"
-            " pair has actually traded today. entry near hi24 = rich end, a"
-            " good moment to sell the perp; entry near lo24 = you are entering"
-            " at the cheap end and paying for the carry. hi24-lo24 is also the"
-            " round trip on offer, and lo24 is where an /exit will fill."
+            "hi24 = p90 of the HOURLY mean ENTRY basis over 24h, the rich end"
+            " of this pair's day: entry near hi24 is a good moment to sell the"
+            " perp. lo24 = p10 of the hourly EXIT basis (maker buy-back, taker"
+            " spot sell), where an /exit actually fills. hi24-lo24 is the round"
+            " trip on offer; names whose lo24 is within"
+            f" {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}% of hi24 are hidden as"
+            " 'exit' — the best exit barely beats the best entry."
             f" '?' = under {config.SCREEN_DIFF_MIN_HOURS:.0f}h of history, so"
             " those two are the live basis, not a range."
         )
@@ -788,7 +801,9 @@ class ControlBot:
                 " basis is fiction; spread = books"
                 f" >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps apart, so the"
                 " quote is not a real price; depth/volume = too thin to fill;"
-                " jitter = flickers too hard to work)"
+                " jitter = flickers too hard to work; exit = 24h exit-basis low"
+                f" within {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}% of the 24h"
+                " entry high, so there is nowhere good to close)"
             )
         return "\n".join(lines)
 

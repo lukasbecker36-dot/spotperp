@@ -94,6 +94,11 @@ class ScreenerRow:
     # only flickers has a tight range because the noise averages out per hour.
     basis_p10_24h: float = 0.0
     basis_p90_24h: float = 0.0
+    # 24h p10 of the hourly EXIT (close, bid/bid) basis: where an /exit
+    # actually fills. The entry-side p10 above sits a spread higher, and a
+    # name can show a wide entry range while its exit basis never comes down.
+    # None when the window holds no close samples.
+    close_p10_24h: float | None = None
     # Can this actually be TRADED? Depth is resting size; these are flow.
     perp_volume_24h: float = 0.0    # Aster perp 24h quote volume (USDT)
     perp_trades_24h: float = 0.0    # ...and how many trades made it up
@@ -262,6 +267,31 @@ def _too_jittery(row: ScreenerRow) -> bool:
     )
 
 
+def exit_lo(row: ScreenerRow) -> float:
+    """Where an exit realistically fills: the 24h low of the EXIT basis,
+    falling back to the entry-side low when no close history exists yet."""
+    return row.close_p10_24h if row.close_p10_24h is not None else row.basis_p10_24h
+
+
+def no_exit_room(row: ScreenerRow) -> bool:
+    """True when even the day's best exit barely beats the day's best entry:
+    the 24h low of the exit basis is within SCREEN_MIN_EXIT_ROOM_PCT of the
+    24h high of the entry basis.
+
+    Such a name looks like a good entry at the top of its range, but the exit
+    basis never falls far enough below it to close at a profit — you get in
+    and then cannot get out at a good level. Fails OPEN on thin history (the
+    range is the live basis, not a day), with no close samples, or when the
+    entry high is not a premium at all.
+    """
+    if row.hours_24h < config.SCREEN_DIFF_MIN_HOURS or row.close_p10_24h is None:
+        return False
+    hi = row.basis_p90_24h
+    if hi <= 0:
+        return False
+    return row.close_p10_24h >= hi * (1 - config.SCREEN_MIN_EXIT_ROOM_PCT / 100.0)
+
+
 def quote_reject_reason(row: ScreenerRow) -> str | None:
     """Why this row's quoted basis should not be believed or worked, or None.
 
@@ -374,6 +404,7 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         and r.funding_8h_bps >= config.SCREEN_FILL_MIN_FUNDING_BPS
         and not _too_jittery(r)
         and not _bad_index(r)
+        and not no_exit_room(r)
         # Enterable RIGHT NOW. Dwell says a name is reliably workable, but a
         # row you cannot act on today is a watchlist entry, not a candidate.
         and r.entry_bps_avg >= float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
@@ -381,7 +412,7 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         # own 24h low must clear the cost floor. Without this the screen ranks
         # a name you can fill easily but whose basis never comes back far
         # enough to close for a profit ABOVE one that does.
-        and (r.entry_bps_avg - r.basis_p10_24h)
+        and (r.entry_bps_avg - exit_lo(r))
         - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
         >= config.SCREEN_FILL_MIN_NET_SWING_BPS
     ]
@@ -436,7 +467,7 @@ def fill_score(row: ScreenerRow) -> float:
     """
     net = (
         row.entry_bps_avg
-        - row.basis_p10_24h
+        - exit_lo(row)
         - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
     )
     factor = min(
@@ -474,7 +505,7 @@ def carry_score(
     with no takers is not an edge.
     """
     floor = float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
-    one_off = row.entry_bps_avg - row.basis_p10_24h - floor
+    one_off = row.entry_bps_avg - exit_lo(row) - floor
     carry = min(avg_8h_bps, current_8h_bps)
     stream = carry * config.FUNDING_SCORE_HOLD_HOURS / 8.0
     factor = min(
@@ -619,6 +650,7 @@ class DailyBasis:
         lo, hi = self.percentiles(row.symbol)
         row.basis_p10_24h = row.entry_bps if lo is None else lo
         row.basis_p90_24h = row.entry_bps if hi is None else hi
+        row.close_p10_24h, _ = self.percentiles(row.symbol, close=True)
         return row
 
 
