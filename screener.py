@@ -104,6 +104,9 @@ class ScreenerRow:
     # multiplier is wrong — in which case the basis is arithmetic on two
     # unrelated prices. None when premiumIndex has not supplied one.
     index_divergence_bps: float | None = None
+    # USD value of the first SCREEN_DEPTH_LEVELS MEXC asks. None until the
+    # depth sweep has reached this symbol (it only fetches displayed names).
+    mexc_ask_depth_usd: float | None = None
 
 
 class RollingBasis:

@@ -145,6 +145,10 @@ class Engine:
         # 24h mean entry basis per symbol, so /screen can show whether the
         # current level is elevated or just this pair's normal richness.
         self._basis_24h = screener.DailyBasis()
+        # MEXC symbols /screen fill and /funding are showing: the only ones
+        # whose multi-level ask depth is worth a REST call each scan.
+        self._depth_watch_fill: set[str] = set()
+        self._depth_watch_funding: set[str] = set()
         # A second, longer window. Hourly aggregates only, so a few hundred
         # floats per symbol — the cost is nil and it answers a question the
         # 24h band cannot: whether TODAY is the anomaly.
@@ -367,6 +371,10 @@ class Engine:
             await self._sample_equity()
         except Exception:
             log.exception("slow scan: equity snapshot failed")
+        try:
+            await self._refresh_ask_depth()
+        except Exception:
+            log.exception("slow scan: MEXC ask depth refresh failed")
         for label, fn in (
             ("screener snapshot", self._write_screener_snapshot),
             ("funding snapshot", self._write_funding_snapshot),
@@ -399,6 +407,29 @@ class Engine:
             self.conn, int(time.time() * 1000), eq.aster_usd,
             eq.spot_coins_usd, eq.spot_usdt_usd, eq.total_usd,
         )
+
+    async def _refresh_ask_depth(self) -> None:
+        """Sum the first SCREEN_DEPTH_LEVELS MEXC asks for the names on the
+        last /screen fill and /funding boards. The touch alone understates a
+        book that is thin at the top but stacked a tick behind it. Symbols that
+        left the boards are dropped; a failed fetch keeps the previous value."""
+        watch = sorted(self._depth_watch_fill | self._depth_watch_funding)
+        levels = config.SCREEN_DEPTH_LEVELS
+        cache = {s: v for s, v in self.md.mexc_ask_depth.items() if s in watch}
+        batch = max(1, config.FUNDING_FETCH_BATCH)
+        for i in range(0, len(watch), batch):
+            chunk = watch[i : i + batch]
+            books = await asyncio.gather(
+                *(self.mexc.depth(s, limit=levels) for s in chunk),
+                return_exceptions=True,
+            )
+            for sym, book in zip(chunk, books):
+                if isinstance(book, Exception) or not isinstance(book, dict):
+                    continue
+                cache[sym] = sum(
+                    float(p) * float(q) for p, q, *_ in (book.get("asks") or [])[:levels]
+                )
+        self.md.mexc_ask_depth = cache
 
     async def _refresh_books(self) -> None:
         aster_books, mexc_books = await asyncio.gather(
@@ -548,12 +579,18 @@ class Engine:
                 row.hours_tradeable_24h = self._basis_24h.hours_above(
                     sym, float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
                 )
+                row.mexc_ask_depth_usd = self.md.mexc_ask_depth.get(pair.mexc_symbol)
                 rows.append(row)
+        fill_rows = screener.rank_rows_by_fillability(rows)
+        self._depth_watch_fill = {
+            self.md.pair_maps[r.symbol].mexc_symbol
+            for r in fill_rows if r.symbol in self.md.pair_maps
+        }
         screener.write_snapshot(
             screener.rank_rows(rows),
             screener.rank_rows_by_dislocation(rows),
             screener.rank_rows_by_swing(rows),
-            screener.rank_rows_by_fillability(rows),
+            fill_rows,
         )
         self._log_basis_rows(rows)
 
@@ -689,6 +726,9 @@ class Engine:
                 "max_notional_usd": screen.max_notional_usd,
                 "entry_bps_jitter": screen.entry_bps_jitter,
                 "perp_trades_24h": screen.perp_trades_24h,
+                "perp_volume_24h": screen.perp_volume_24h,
+                "mexc_symbol": pair.mexc_symbol,
+                "mexc_ask_depth_usd": self.md.mexc_ask_depth.get(pair.mexc_symbol),
                 # 24h range of the hourly mean basis, so /funding can say
                 # whether the live entry sits at the rich or the cheap end of
                 # where this pair has actually traded today.
@@ -701,10 +741,12 @@ class Engine:
                 "score": screener.carry_score(screen, stat.avg_24h_8h_bps, current_8h),
             })
         rows.sort(key=lambda r: r["score"], reverse=True)
+        rows = rows[: config.SCREENER_TOP_N]
+        self._depth_watch_funding = {r["mexc_symbol"] for r in rows}
         config.FUNDING_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "ts_ms": now,
-            "rows": rows[: config.SCREENER_TOP_N],
+            "rows": rows,
             "hidden": hidden,
         }
         tmp = config.FUNDING_SNAPSHOT_FILE.with_suffix(".tmp")

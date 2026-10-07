@@ -297,3 +297,37 @@ def test_fills_elides_the_middle_of_a_long_history(fills_bot):
     out = fills_bot._cmd_fills([str(pos.id)])
     assert "30 more fills" in out
     assert "no realised P&L" in out
+
+
+def test_screen_fill_shows_hi24_volume_and_level_depth(tmp_path, monkeypatch):
+    _screen_snapshot(tmp_path, monkeypatch, [])
+    import json as _json, time as _time
+    import config as _config
+    row = {**_srow("AAAUSDT", 60.0, 30.0, 24.0, depth=10.0),
+           "basis_p10_24h": 5.0, "basis_p90_24h": 88.8,
+           "perp_volume_24h": 1_250_000, "hours_tradeable_24h": 20,
+           "perp_trades_24h": 2400, "mexc_ask_depth_usd": 2000.0}
+    _config.SCREENER_SNAPSHOT_FILE.write_text(_json.dumps(
+        {"ts_ms": int(_time.time() * 1000), "rows": [row], "fill_rows": [row]}))
+    out = control_bot.ControlBot._cmd_screen(_bot(), ["fill"])
+    assert "hi24" in out and "88.8" in out
+    assert "1.2M" in out
+    net = 60.0 - 5.0 - float(_config.ENTRY_MIN_EDGE_FLOOR_BPS)
+    assert f"{net * 2000.0 / 10000.0:.1f}" in out     # $clip off 5-level depth
+
+
+def test_funding_shows_volume_and_level_depth(tmp_path, monkeypatch):
+    import json as _json, time as _time
+    import config as _config
+    p = tmp_path / "fnd.json"
+    p.write_text(_json.dumps({"ts_ms": int(_time.time() * 1000), "rows": [{
+        "symbol": "AAAUSDT", "current_8h_bps": 2.0, "avg_24h_8h_bps": 2.0,
+        "entry_bps": 40.0, "entry_bps_avg": 40.0, "samples": 5,
+        "max_notional_usd": 12.0, "mexc_ask_depth_usd": 3456.0,
+        "perp_volume_24h": 640_000, "score": 30.0, "hours_24h": 24.0,
+        "basis_p10_24h": 10.0, "basis_p90_24h": 60.0,
+    }]}))
+    monkeypatch.setattr(_config, "FUNDING_SNAPSHOT_FILE", p)
+    out = control_bot.ControlBot._cmd_funding(_bot(), [])
+    assert "640k" in out
+    assert "3,456" in out

@@ -94,6 +94,8 @@ def engine(tmp_path, monkeypatch):
     eng._opp_since = {}
     eng._opp_alerted = set()
     eng._standdown_since = {}
+    eng._depth_watch_fill = set()
+    eng._depth_watch_funding = set()
 
     class _NoOrders:
         """Venue stub for command handlers that list resting orders."""
@@ -2479,3 +2481,37 @@ async def test_the_recorded_level_survives_a_restart(engine, monkeypatch):
     pid = await _stops_at_liq(engine, monkeypatch, "150")
     row = database.load_stop_orders(engine.conn)[pid]
     assert Decimal(row["liq_price"]) == Decimal("150")
+
+
+async def test_ask_depth_sums_first_levels_for_board_symbols(
+    engine, monkeypatch, tmp_path
+):
+    """depth$ on /funding and /screen fill is the first SCREEN_DEPTH_LEVELS
+    MEXC asks summed, not the touch: a book thin at the top but stacked a tick
+    behind it is fillable. Only the names on the boards are fetched."""
+    import funding as funding_mod
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._basis_24h = screener.DailyBasis()
+    engine.md.funding_stats["BTCUSDT"] = funding_mod.summarize(
+        "BTCUSDT", [], None, now_ms=0
+    )
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    engine._write_funding_snapshot()
+    assert engine._depth_watch_funding == {"BTCUSDT"}
+
+    fetched = []
+
+    async def depth(symbol, limit=20):
+        fetched.append((symbol, limit))
+        return {"asks": [["100", "1"]] * 7, "bids": []}
+    engine.mexc.depth = depth
+    await engine._refresh_ask_depth()
+    assert fetched == [("BTCUSDT", 5)]
+    assert engine.md.mexc_ask_depth == {"BTCUSDT": 500.0}   # 5 levels, not 7
+
+    engine._write_funding_snapshot()
+    import json
+    row = json.loads((tmp_path / "fnd.json").read_text())["rows"][0]
+    assert row["mexc_ask_depth_usd"] == 500.0
+    assert "perp_volume_24h" in row

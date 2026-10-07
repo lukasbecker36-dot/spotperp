@@ -125,6 +125,24 @@ def _hourly(bps_8h: float | None) -> float:
     return (bps_8h or 0.0) / 8.0
 
 
+def _vol(v: float) -> str:
+    """Compact USD volume: 1.2B / 3.4M / 560k."""
+    if v >= 1e9:
+        return f"{v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"{v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"{v / 1e3:.0f}k"
+    return f"{v:.0f}"
+
+
+def _depth_usd(row: dict) -> float:
+    """The board's depth figure: the first SCREEN_DEPTH_LEVELS MEXC asks
+    summed, falling back to the top-of-book cap before the sweep has run."""
+    v = row.get("mexc_ask_depth_usd")
+    return v if v is not None else (row.get("max_notional_usd") or 0.0)
+
+
 def _pad(text: str, width: int) -> str:
     """Left-pad to WIDTH *display* columns, not code points.
 
@@ -549,17 +567,9 @@ class ControlBot:
                 " build from the seeded basis history."
             )
 
-        def vol(v: float) -> str:
-            if v >= 1e9:
-                return f"{v / 1e9:.1f}B"
-            if v >= 1e6:
-                return f"{v / 1e6:.1f}M"
-            if v >= 1e3:
-                return f"{v / 1e3:.0f}k"
-            return f"{v:.0f}"
-
-        hdr = (f"{'symbol':<11}{'score':>6}{'entry':>6}{'lo24':>7}{'net':>7}"
-               f"{'fund':>6}{'hrs':>4}{'tr/h':>6}{'jit':>5}{'$clip':>6}")
+        hdr = (f"{'symbol':<11}{'score':>6}{'entry':>6}{'lo24':>7}{'hi24':>7}"
+               f"{'net':>7}{'fund':>6}{'hrs':>4}{'tr/h':>6}{'vol':>6}{'jit':>5}"
+               f"{'$clip':>6}")
         sep = "-" * len(hdr)
         lines = [f"fillability screen ({age_s:.0f}s old)", hdr, sep]
         for r in rows:
@@ -579,12 +589,15 @@ class ControlBot:
             # you can exit at — the trip is a carry, not a round trip.
             lo_s = (f"{f'{lo:.1f}!':>7}"
                     if lo > config.SCREEN_FILL_FLAG_LO_BPS else f"{lo:>7.1f}")
+            hi = r.get("basis_p90_24h", entry_avg)
             lines.append(
                 f"{_pad(r['symbol'], 11)}{score:>+6.1f}{entry_avg:>6.1f}{lo_s}"
+                f"{hi:>7.1f}"
                 f"{net:>+7.1f}{_hourly(r.get('funding_8h_bps')):>+6.2f}"
                 f"{r.get('hours_tradeable_24h', 0):>4.0f}"
-                f"{r.get('perp_trades_24h', 0) / 24.0:>6.1f}{jit_s}"
-                f"{net * r['max_notional_usd'] / 10000.0:>6.1f}"
+                f"{r.get('perp_trades_24h', 0) / 24.0:>6.1f}"
+                f"{_vol(r.get('perp_volume_24h') or 0):>6}{jit_s}"
+                f"{net * _depth_usd(r) / 10000.0:>6.1f}"
             )
         lines.append(sep)
         lines.append(
@@ -603,7 +616,10 @@ class ControlBot:
         lines.append(
             "hrs = hours of the last 24 the basis cleared the entry floor."
             " tr/h = Aster perp trades per hour (flow, not resting depth — this"
-            " is what lifts a maker). Full 24h volume is in /book."
+            " is what lifts a maker). vol = Aster perp 24h volume in USDT;"
+            f" rows under ${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f} are dropped."
+            " hi24 = p90 of the hourly basis over 24h, the rich end of the"
+            " pair's day (lo24 is the cheap end)."
         )
         lines.append(
             f"net = (entry - lo24) - {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps"
@@ -616,10 +632,10 @@ class ControlBot:
             " not worth working."
         )
         lines.append(
-            "$clip = net x TOP-OF-BOOK depth: what one clip at the touch is"
-            " worth. It UNDERSTATES a name you work over time — STONK shows ~$8"
-            " at the touch yet fills $42-99 clips — so read it with hrs, which"
-            " is what such a name actually trades on."
+            f"$clip = net x depth, where depth is the first"
+            f" {config.SCREEN_DEPTH_LEVELS} MEXC asks summed (the touch until"
+            " the depth sweep reaches a new row). It still UNDERSTATES a name"
+            " you work over time, so read it with hrs."
         )
         lines.append(
             "fund = funding in bps per HOUR; + means the SHORT receives, so"
@@ -659,7 +675,7 @@ class ControlBot:
         # still says when the cash lands, and /book has the interval.
         hdr = (f"{'symbol':<11}{'score':>6}{'24h':>7}{'fund':>6}"
                f"{'next':>5}{'entry':>6}{'lo24':>7}{'hi24':>7}{'jit':>5}"
-               f"{'depth$':>7}")
+               f"{'vol':>6}{'depth$':>7}")
         sep = "-" * len(hdr)
         lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
 
@@ -675,7 +691,9 @@ class ControlBot:
             jv = r.get("entry_bps_jitter")
             jit = (f"{jv:>5.1f}" if jv is not None and r.get("samples", 0) >= 3
                    else f"{'-':>5}")
-            depth = f"{r['max_notional_usd']:>6,.0f}" if r.get("max_notional_usd") else f"{'-':>6}"
+            dv = _depth_usd(r)
+            depth = f"{dv:>7,.0f}" if dv else f"{'-':>7}"
+            volume = f"{_vol(r['perp_volume_24h']):>6}" if r.get("perp_volume_24h") else f"{'-':>6}"
             nh = r.get("next_funding_h")
             nxt = f"{nh:>4.1f}h" if nh is not None and nh >= 0 else f"{'-':>5}"
             # Where the live basis sits inside the pair's own 24h range. A '?'
@@ -706,7 +724,7 @@ class ControlBot:
                 f"{_pad(r['symbol'], 11)}{score}"
                 f"{_hourly(r['avg_24h_8h_bps']):>7.2f}"
                 f"{_hourly(r['current_8h_bps']):>7.2f}{nxt}"
-                f"{entry}{lo24}{hi24}{jit}{depth}"
+                f"{entry}{lo24}{hi24}{jit}{volume}{depth}"
             )
         lines.append(sep)
         lines.append(
@@ -733,6 +751,13 @@ class ControlBot:
             " settlement interval)."
         )
         lines.append(f"entry = {win_m:.0f}m avg basis (short perp gets +funding).")
+        lines.append(
+            f"vol = Aster perp 24h volume in USDT; rows under"
+            f" ${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f} are hidden. depth$ ="
+            f" the first {config.SCREEN_DEPTH_LEVELS} MEXC asks summed, i.e."
+            " the spot you could buy for an entry (the touch until the depth"
+            " sweep reaches a new row)."
+        )
         lines.append(
             "lo24/hi24 = p10/p90 of the HOURLY mean basis over 24h — where this"
             " pair has actually traded today. entry near hi24 = rich end, a"

@@ -63,6 +63,10 @@ class MarketData:
     # book isn't empty; this says someone is actually trading, which is what
     # lifts a resting maker entry.
     perp_volume: dict[str, dict] = field(default_factory=dict)
+    # USD value of the first SCREEN_DEPTH_LEVELS MEXC ask levels, per MEXC
+    # symbol. Fetched only for the names /funding and /screen fill show — the
+    # all-symbols bookTicker has the touch alone, which understates a book.
+    mexc_ask_depth: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

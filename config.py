@@ -94,8 +94,11 @@ SCREEN_SWING_MIN_FUNDING_BPS = float(
 # the profile worth trading. Check a known-good symbol's vol24 in /book and
 # calibrate from that rather than trusting this default.
 SCREEN_FILL_MIN_VOLUME_USD = float(
-    os.environ.get("SCREEN_FILL_MIN_VOLUME_USD", "50000")
+    os.environ.get("SCREEN_FILL_MIN_VOLUME_USD", "500000")
 )
+# depth$ on /funding and /screen fill: the summed value of this many MEXC
+# ask levels (the spot BUY side of an entry), not just the touch.
+SCREEN_DEPTH_LEVELS = int(os.environ.get("SCREEN_DEPTH_LEVELS", "5"))
 SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
 # Reject a basis that jumps wildly tick to tick: a resting order can't be
 # worked against it, because the price you get is a lottery (BULLA printed
