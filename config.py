@@ -96,6 +96,12 @@ SCREEN_SWING_MIN_FUNDING_BPS = float(
 SCREEN_FILL_MIN_VOLUME_USD = float(
     os.environ.get("SCREEN_FILL_MIN_VOLUME_USD", "500000")
 )
+# /funding's own floor. Lower than /screen fill's: its score already scales
+# down a name with little flow, and a $500k floor hid 281 of ~412 names.
+FUNDING_MIN_VOLUME_USD = float(os.environ.get("FUNDING_MIN_VOLUME_USD", "150000"))
+# Band edges for /funding's near-miss line: names hidden ONLY for volume,
+# counted by how far under the floor they sit.
+VOLUME_BAND_EDGES = (25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000)
 # depth$ on /funding and /screen fill: the summed value of this many MEXC
 # ask levels (the spot BUY side of an entry), not just the touch.
 SCREEN_DEPTH_LEVELS = int(os.environ.get("SCREEN_DEPTH_LEVELS", "5"))

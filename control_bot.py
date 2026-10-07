@@ -890,7 +890,8 @@ class ControlBot:
         lines.append(f"entry = {win_m:.0f}m avg basis (short perp gets +funding).")
         lines.append(
             f"vol = Aster perp 24h volume in USDT; rows under"
-            f" ${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f} are hidden. depth$ ="
+            f" ${config.FUNDING_MIN_VOLUME_USD:,.0f} are hidden"
+            f" (/screen fill uses ${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f}). depth$ ="
             f" the first {config.SCREEN_DEPTH_LEVELS} MEXC asks summed, i.e."
             " the spot you could buy for an entry (the touch until the depth"
             " sweep reaches a new row)."
@@ -930,6 +931,19 @@ class ControlBot:
                 " jitter = flickers too hard to work; exit = 24h exit-basis low"
                 f" less than {_exit_room_desc()} below the 24h entry high, so"
                 " there is nowhere good to close)"
+            )
+        near = snap.get("volume_near_miss") or []
+        if near:
+            parts = [
+                (f"{n} at ${_vol(lo)}-{_vol(hi)}" if lo > 0
+                 else f"{n} under ${_vol(hi)}")
+                for lo, hi, n in near
+            ]
+            lines.append(
+                "near misses (hidden ONLY for volume — they pass every other"
+                " check, so a lower floor would show them): "
+                + ", ".join(parts)
+                + ". Set FUNDING_MIN_VOLUME_USD in .env to move the floor."
             )
         return "\n".join(lines)
 

@@ -2570,3 +2570,32 @@ async def test_score_alert_fires_once_and_records_history(engine, monkeypatch):
     engine._record_scores()
     rows = database.score_history(engine.conn, "fill")
     assert [(r["symbol"], r["score"]) for r in rows] == [("BTCUSDT", 42.0)]
+
+
+async def test_funding_uses_its_own_volume_floor_and_counts_near_misses(
+    engine, monkeypatch, tmp_path
+):
+    import funding as funding_mod
+    import json
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 500_000.0)
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._basis_24h = screener.DailyBasis()
+    engine.md.funding_stats["BTCUSDT"] = funding_mod.summarize(
+        "BTCUSDT", [], None, now_ms=0
+    )
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+
+    # $200k: under /screen fill's floor but over /funding's -> shown.
+    monkeypatch.setattr(config, "FUNDING_MIN_VOLUME_USD", 150_000.0)
+    engine.md.perp_volume = {"BTCUSDT": {"quote_volume": 200_000, "trades": 900}}
+    engine._write_funding_snapshot()
+    snap = json.loads((tmp_path / "fnd.json").read_text())
+    assert [r["symbol"] for r in snap["rows"]] == ["BTCUSDT"]
+
+    # Raise the floor: now hidden ONLY for volume -> a near miss, banded.
+    monkeypatch.setattr(config, "FUNDING_MIN_VOLUME_USD", 300_000.0)
+    engine._write_funding_snapshot()
+    snap = json.loads((tmp_path / "fnd.json").read_text())
+    assert snap["rows"] == [] and snap["hidden"] == {"volume": 1}
+    assert snap["volume_near_miss"] == [[100_000, 250_000, 1]]

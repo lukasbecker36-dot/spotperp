@@ -703,6 +703,10 @@ class Engine:
         now = int(time.time() * 1000)
         rows = []
         hidden: dict[str, int] = {}
+        # Names hidden ONLY for volume — they pass every other gate — by how
+        # far under the floor they sit, so /funding shows what a lower floor
+        # would add before anyone changes it.
+        near: dict[tuple[float, float], int] = {}
         for sym, stat in self.md.funding_stats.items():
             pair = self.md.pair_maps.get(sym)
             if pair is None:
@@ -749,8 +753,16 @@ class Engine:
             # worst quote errors on the whole system. Hide them, and count
             # them so /funding can say the screen is filtering rather than
             # leaving the user wondering where a row went.
-            reject = screener.quote_reject_reason(screen) if screen else "book"
-            if not reject:
+            reject = (
+                screener.quote_reject_reason(
+                    screen, min_volume=config.FUNDING_MIN_VOLUME_USD
+                ) if screen else "book"
+            )
+            # The volume check is the last in quote_reject_reason, so a
+            # volume reject passed index/depth/spread/jitter; run the board's
+            # own gates too, to know whether it is a genuine near miss.
+            later = None
+            if reject in (None, "volume"):
                 entry_now = (
                     screen.entry_bps_avg if screen.samples
                     else screen.entry_bps
@@ -758,9 +770,15 @@ class Engine:
                 # Gate on the figure the board SHOWS, so a row cannot be
                 # hidden for a number the reader cannot see.
                 if entry_now < config.FUNDING_MIN_ENTRY_BPS:
-                    reject = "discount"
+                    later = "discount"
                 elif screener.no_exit_room(screen):
-                    reject = "exit"
+                    later = "exit"
+            if reject == "volume" and later is None:
+                band = screener.volume_band(
+                    screen.perp_volume_24h, config.FUNDING_MIN_VOLUME_USD
+                )
+                near[band] = near.get(band, 0) + 1
+            reject = reject or later
             if reject:
                 hidden[reject] = hidden.get(reject, 0) + 1
                 continue
@@ -821,6 +839,9 @@ class Engine:
             "ts_ms": now,
             "rows": rows,
             "hidden": hidden,
+            "volume_near_miss": [
+                [lo, hi, n] for (lo, hi), n in sorted(near.items(), reverse=True)
+            ],
         }
         tmp = config.FUNDING_SNAPSHOT_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=1))

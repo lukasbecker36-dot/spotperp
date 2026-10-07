@@ -331,3 +331,20 @@ def test_funding_shows_volume_and_level_depth(tmp_path, monkeypatch):
     out = control_bot.ControlBot._cmd_funding(_bot(), [])
     assert "640k" in out
     assert "3,456" in out
+
+
+def test_funding_lists_volume_near_misses(tmp_path, monkeypatch):
+    import json as _json, time as _time
+    import config as _config
+    p = tmp_path / "fnd.json"
+    p.write_text(_json.dumps({
+        "ts_ms": int(_time.time() * 1000),
+        "rows": [{"symbol": "AAAUSDT", "current_8h_bps": 2.0,
+                  "avg_24h_8h_bps": 2.0, "entry_bps": 40.0, "samples": 5,
+                  "score": 30.0}],
+        "hidden": {"volume": 9},
+        "volume_near_miss": [[100_000, 150_000, 3], [0, 25_000, 6]],
+    }))
+    monkeypatch.setattr(_config, "FUNDING_SNAPSHOT_FILE", p)
+    out = control_bot.ControlBot._cmd_funding(_bot(), [])
+    assert "3 at $100k-150k" in out and "6 under $25k" in out

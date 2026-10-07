@@ -299,7 +299,9 @@ def no_exit_room_of(close_lo24_bps: float, entry_hi24_bps: float) -> bool:
     return entry_hi24_bps - close_lo24_bps < exit_room_needed(entry_hi24_bps)
 
 
-def quote_reject_reason(row: ScreenerRow) -> str | None:
+def quote_reject_reason(
+    row: ScreenerRow, min_volume: float | None = None,
+) -> str | None:
     """Why this row's quoted basis should not be believed or worked, or None.
 
     /screen fill earns its trust by gating hard on flow and steadiness. Any
@@ -327,7 +329,8 @@ def quote_reject_reason(row: ScreenerRow) -> str | None:
         return "jitter"
     # perp_volume_24h is 0 when the ticker sweep has not landed yet; fail OPEN
     # there rather than blanking the whole screen on a slow start.
-    if row.perp_volume_24h and row.perp_volume_24h < config.SCREEN_FILL_MIN_VOLUME_USD:
+    floor = config.SCREEN_FILL_MIN_VOLUME_USD if min_volume is None else min_volume
+    if row.perp_volume_24h and row.perp_volume_24h < floor:
         return "volume"
     return None
 
@@ -727,3 +730,13 @@ def seed_daily_from_logs(daily: DailyBasis, now_ms: int, hours: int = 24) -> int
         except OSError:
             log.warning("could not seed 24h basis from %s", path, exc_info=True)
     return seeded
+
+
+def volume_band(volume: float, floor: float) -> tuple[float, float]:
+    """The [lo, hi) band of VOLUME_BAND_EDGES below `floor` holding `volume`;
+    the top band ends at the floor itself."""
+    edges = [0.0] + [float(e) for e in config.VOLUME_BAND_EDGES if e < floor] + [floor]
+    for lo, hi in zip(edges, edges[1:]):
+        if lo <= volume < hi:
+            return lo, hi
+    return edges[-2], edges[-1]

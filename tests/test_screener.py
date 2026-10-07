@@ -853,3 +853,17 @@ def test_fill_screen_drops_names_with_no_exit_room(monkeypatch):
         r.entry_bps_avg = r.basis_p90_24h
     out = [r.symbol for r in screener.rank_rows_by_fillability([good, stuck])]
     assert out == ["GOOD"]
+
+
+def test_volume_band_below_floor(monkeypatch):
+    monkeypatch.setattr(config, "VOLUME_BAND_EDGES", (25_000, 50_000, 100_000, 250_000))
+    assert screener.volume_band(120_000, 150_000) == (100_000, 150_000)
+    assert screener.volume_band(60_000, 150_000) == (50_000, 100_000)
+    assert screener.volume_band(10_000, 150_000) == (0.0, 25_000)
+
+
+def test_quote_reject_takes_its_own_volume_floor(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 500_000.0)
+    r = _quote_row("X", 40.0, 35.0, depth=500.0, volume=200_000.0)
+    assert screener.quote_reject_reason(r) == "volume"
+    assert screener.quote_reject_reason(r, min_volume=150_000.0) is None
