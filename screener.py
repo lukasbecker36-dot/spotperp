@@ -269,27 +269,34 @@ def _too_jittery(row: ScreenerRow) -> bool:
 
 def no_exit_room(row: ScreenerRow) -> bool:
     """True when even the day's best exit barely beats the day's best entry:
-    the 24h low of the exit basis is within SCREEN_MIN_EXIT_ROOM_PCT of the
-    24h high of the entry basis.
+    the 24h high of the entry basis is less than exit_room_needed() above the
+    24h low of the exit basis.
 
     Such a name looks like a good entry at the top of its range, but the exit
     basis never falls far enough below it to close at a profit — you get in
     and then cannot get out at a good level. Fails OPEN on thin history (the
-    range is the live basis, not a day), with no close samples, or when the
-    entry high is not a premium at all.
+    range is the live basis, not a day) or with no close samples.
     """
     if row.hours_24h < config.SCREEN_DIFF_MIN_HOURS or row.close_p10_24h is None:
         return False
     return no_exit_room_of(row.close_p10_24h, row.basis_p90_24h)
 
 
+def exit_room_needed(entry_hi24_bps: float) -> float:
+    """Minimum bps between the day's best entry and best exit: the absolute
+    floor (default the round-trip cost), or the % of the entry high when that
+    is larger — 10% of a +300 basis is a bigger ask than 25bps."""
+    floor = (
+        config.SCREEN_MIN_EXIT_ROOM_BPS
+        if config.SCREEN_MIN_EXIT_ROOM_BPS is not None
+        else float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+    )
+    return max(floor, abs(entry_hi24_bps) * config.SCREEN_MIN_EXIT_ROOM_PCT / 100.0)
+
+
 def no_exit_room_of(close_lo24_bps: float, entry_hi24_bps: float) -> bool:
     """no_exit_room from plain numbers (history checks are the caller's)."""
-    if entry_hi24_bps <= 0:
-        return False
-    return close_lo24_bps >= entry_hi24_bps * (
-        1 - config.SCREEN_MIN_EXIT_ROOM_PCT / 100.0
-    )
+    return entry_hi24_bps - close_lo24_bps < exit_room_needed(entry_hi24_bps)
 
 
 def quote_reject_reason(row: ScreenerRow) -> str | None:

@@ -133,6 +133,12 @@ def _hourly(bps_8h: float | None) -> float:
 _vol = score_alerts.fmt_volume
 
 
+def _exit_room_desc() -> str:
+    """The exit-room rule in words, e.g. '25bps (or 10% of hi24 if larger)'."""
+    return (f"{screener.exit_room_needed(0.0):.0f}bps (or"
+            f" {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}% of hi24 if larger)")
+
+
 def _depth_usd(row: dict) -> float:
     """The board's depth figure: the first SCREEN_DEPTH_LEVELS MEXC asks
     summed, falling back to the top-of-book cap before the sweep has run."""
@@ -622,9 +628,9 @@ class ControlBot:
             f" rows under ${config.SCREEN_FILL_MIN_VOLUME_USD:,.0f} are dropped."
             " lo24/hi24 = p10/p90 of the hourly ENTRY basis over 24h, the"
             " range of the pair's day at entry. Names whose 24h EXIT-basis low"
-            f" (maker buy-back, taker spot sell) is within"
-            f" {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}% of hi24 are dropped:"
-            " even the day's best exit barely beats its best entry."
+            " (maker buy-back, taker spot sell) is less than"
+            f" {_exit_room_desc()} below hi24 are dropped: even the day's best"
+            " exit barely beats its best entry."
         )
         lines.append(
             f"net = (entry - lo24) - {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps"
@@ -894,9 +900,9 @@ class ControlBot:
             " where this pair has traded today at entry. entry near hi24 = rich"
             " end, a good moment to sell the perp; entry near lo24 = you are"
             " entering at the cheap end and paying for the carry. Names whose"
-            " 24h EXIT-basis low (maker buy-back, taker spot sell) is within"
-            f" {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}% of hi24 are hidden as"
-            " 'exit' — the best exit barely beats the best entry."
+            " 24h EXIT-basis low (maker buy-back, taker spot sell) is less than"
+            f" {_exit_room_desc()} below hi24 are hidden as 'exit' — the best"
+            " exit barely beats the best entry."
             f" '?' = under {config.SCREEN_DIFF_MIN_HOURS:.0f}h of history, so"
             " those two are the live basis, not a range."
         )
@@ -922,8 +928,8 @@ class ControlBot:
                 f" >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps apart, so the"
                 " quote is not a real price; depth/volume = too thin to fill;"
                 " jitter = flickers too hard to work; exit = 24h exit-basis low"
-                f" within {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}% of the 24h"
-                " entry high, so there is nowhere good to close)"
+                f" less than {_exit_room_desc()} below the 24h entry high, so"
+                " there is nowhere good to close)"
             )
         return "\n".join(lines)
 

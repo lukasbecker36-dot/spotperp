@@ -802,10 +802,32 @@ def test_no_exit_room_when_exit_low_hugs_entry_high(monkeypatch):
     """Entered near the top of the range, then found the exit basis never came
     down: the day's best exit (+75) barely beat its best entry (+80)."""
     monkeypatch.setattr(config, "SCREEN_MIN_EXIT_ROOM_PCT", 10.0)
-    assert screener.no_exit_room(_range_row(80.0, 75.0))        # within 10%
+    monkeypatch.setattr(config, "SCREEN_MIN_EXIT_ROOM_BPS", 25.0)
+    assert screener.no_exit_room(_range_row(80.0, 75.0))        # 5bps of room
     assert not screener.no_exit_room(_range_row(80.0, 20.0))    # real round trip
     assert not screener.no_exit_room(_range_row(80.0, 75.0, hours=1.0))  # thin
-    assert not screener.no_exit_room(_range_row(-10.0, -12.0))  # no premium
+
+
+def test_no_exit_room_works_near_zero_and_below(monkeypatch):
+    """UPUSDT: best entry -6.7, best exit -6.0 — the same level. A percentage
+    of -6.7 can never see that; the bps floor does."""
+    monkeypatch.setattr(config, "SCREEN_MIN_EXIT_ROOM_PCT", 10.0)
+    monkeypatch.setattr(config, "SCREEN_MIN_EXIT_ROOM_BPS", 25.0)
+    assert screener.no_exit_room(_range_row(-6.7, -6.0))
+    assert not screener.no_exit_room(_range_row(-6.7, -60.0))   # 53bps of room
+
+
+def test_exit_room_pct_takes_over_on_a_rich_basis(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_MIN_EXIT_ROOM_PCT", 10.0)
+    monkeypatch.setattr(config, "SCREEN_MIN_EXIT_ROOM_BPS", 25.0)
+    assert screener.exit_room_needed(300.0) == 30.0
+    assert screener.no_exit_room(_range_row(300.0, 272.0))      # 28 < 30
+    assert screener.exit_room_needed(80.0) == 25.0
+
+
+def test_exit_room_floor_defaults_to_the_cost_floor(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_MIN_EXIT_ROOM_BPS", None)
+    assert screener.exit_room_needed(0.0) == float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
 
 
 def test_daily_basis_annotates_the_close_low():

@@ -99,9 +99,14 @@ SCREEN_FILL_MIN_VOLUME_USD = float(
 # depth$ on /funding and /screen fill: the summed value of this many MEXC
 # ask levels (the spot BUY side of an entry), not just the touch.
 SCREEN_DEPTH_LEVELS = int(os.environ.get("SCREEN_DEPTH_LEVELS", "5"))
-# /funding and /screen fill drop a name whose 24h EXIT-basis low is within
-# this % of its 24h ENTRY-basis high: the best exit of the day barely beats
-# the best entry, so a "good" entry has nowhere profitable to close.
+# /funding and /screen fill drop a name whose day's best round trip is too
+# small: 24h ENTRY-basis high minus 24h EXIT-basis low must be at least
+# SCREEN_MIN_EXIT_ROOM_BPS (default: the round-trip cost floor), or
+# SCREEN_MIN_EXIT_ROOM_PCT of the entry high when that is larger. A % alone
+# fails near zero: UPUSDT's best entry (-6.7) and best exit (-6.0) were the
+# same level, which no percentage of -6.7 can see.
+_room_bps = os.environ.get("SCREEN_MIN_EXIT_ROOM_BPS")
+SCREEN_MIN_EXIT_ROOM_BPS = float(_room_bps) if _room_bps else None
 SCREEN_MIN_EXIT_ROOM_PCT = float(os.environ.get("SCREEN_MIN_EXIT_ROOM_PCT", "10"))
 # Score history + /alert. Every row on /screen fill and /funding is stored
 # with its score this often, and kept this long, so /scores can say how often
