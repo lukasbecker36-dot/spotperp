@@ -103,6 +103,17 @@ SCREEN_DEPTH_LEVELS = int(os.environ.get("SCREEN_DEPTH_LEVELS", "5"))
 # this % of its 24h ENTRY-basis high: the best exit of the day barely beats
 # the best entry, so a "good" entry has nowhere profitable to close.
 SCREEN_MIN_EXIT_ROOM_PCT = float(os.environ.get("SCREEN_MIN_EXIT_ROOM_PCT", "10"))
+# Score history + /alert. Every row on /screen fill and /funding is stored
+# with its score this often, and kept this long, so /scores can say how often
+# a level is reached. An alert re-arms for a name once it has been below the
+# level for SCORE_ALERT_REARM_MINUTES; `/alert <board> auto` picks the lowest
+# level that would have fired at most SCORE_ALERT_AUTO_PER_DAY times a day
+# over the last SCORE_ALERT_LOOKBACK_DAYS.
+SCORE_HISTORY_SECONDS = float(os.environ.get("SCORE_HISTORY_SECONDS", "120"))
+SCORE_HISTORY_DAYS = int(os.environ.get("SCORE_HISTORY_DAYS", "30"))
+SCORE_ALERT_REARM_MINUTES = float(os.environ.get("SCORE_ALERT_REARM_MINUTES", "30"))
+SCORE_ALERT_AUTO_PER_DAY = float(os.environ.get("SCORE_ALERT_AUTO_PER_DAY", "3"))
+SCORE_ALERT_LOOKBACK_DAYS = float(os.environ.get("SCORE_ALERT_LOOKBACK_DAYS", "7"))
 SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
 # Reject a basis that jumps wildly tick to tick: a resting order can't be
 # worked against it, because the price you get is a lottery (BULLA printed

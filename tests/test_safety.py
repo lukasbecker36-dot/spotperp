@@ -13,6 +13,7 @@ import config
 import database
 import live_monitor
 import position_manager as pm
+import score_alerts
 import screener
 from exchange_client import BookTicker, SymbolInfo
 from executor import Executor, MarketData, PaperTrader
@@ -96,6 +97,10 @@ def engine(tmp_path, monkeypatch):
     eng._standdown_since = {}
     eng._depth_watch_fill = set()
     eng._depth_watch_funding = set()
+    eng._board_rows = {}
+    eng._last_score_record = 0.0
+    eng._score_alerts = score_alerts.AlertState()
+    eng._score_alert_levels = {}
 
     class _NoOrders:
         """Venue stub for command handlers that list resting orders."""
@@ -2539,3 +2544,29 @@ async def test_funding_hides_names_whose_exit_never_comes_down(
     snap = json.loads((tmp_path / "fnd.json").read_text())
     assert snap["rows"] == []
     assert snap["hidden"].get("exit") == 1
+
+
+async def test_score_alert_fires_once_and_records_history(engine, monkeypatch):
+    monkeypatch.setattr(config, "SCORE_HISTORY_SECONDS", 0.0)
+    engine._board_rows = {"fill": [{
+        "symbol": "BTCUSDT", "score": 42.0, "entry_bps": 60.0, "lo24_bps": 5.0,
+        "hi24_bps": 80.0, "funding_8h_bps": 1.6, "volume_24h": 1_200_000,
+        "depth_usd": 900.0,
+    }]}
+    await engine._check_score_alerts()
+    assert not engine.notifier.messages                 # alerts off by default
+
+    database.set_setting(engine.conn, "score_alert", {"fill": 40.0})
+    await engine._check_score_alerts()
+    await engine._check_score_alerts()                  # same episode: quiet
+    alerts = [m for m in engine.notifier.messages if "🔔" in m]
+    assert len(alerts) == 1
+    assert "BTCUSDT" in alerts[0] and "+42.0" in alerts[0] and "1.2M" in alerts[0]
+
+    database.set_setting(engine.conn, "score_alert", {"fill": 41.0})
+    await engine._check_score_alerts()                  # level moved: re-alert
+    assert len([m for m in engine.notifier.messages if "🔔" in m]) == 2
+
+    engine._record_scores()
+    rows = database.score_history(engine.conn, "fill")
+    assert [(r["symbol"], r["score"]) for r in rows] == [("BTCUSDT", 42.0)]

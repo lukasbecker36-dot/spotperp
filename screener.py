@@ -280,10 +280,16 @@ def no_exit_room(row: ScreenerRow) -> bool:
     """
     if row.hours_24h < config.SCREEN_DIFF_MIN_HOURS or row.close_p10_24h is None:
         return False
-    hi = row.basis_p90_24h
-    if hi <= 0:
+    return no_exit_room_of(row.close_p10_24h, row.basis_p90_24h)
+
+
+def no_exit_room_of(close_lo24_bps: float, entry_hi24_bps: float) -> bool:
+    """no_exit_room from plain numbers (history checks are the caller's)."""
+    if entry_hi24_bps <= 0:
         return False
-    return row.close_p10_24h >= hi * (1 - config.SCREEN_MIN_EXIT_ROOM_PCT / 100.0)
+    return close_lo24_bps >= entry_hi24_bps * (
+        1 - config.SCREEN_MIN_EXIT_ROOM_PCT / 100.0
+    )
 
 
 def quote_reject_reason(row: ScreenerRow) -> str | None:
@@ -459,14 +465,20 @@ def fill_score(row: ScreenerRow) -> float:
     clips), so weighting by it would re-bury them — the very bug the screen
     depth floor was lowered to fix. Size is a separate question: read $clip.
     """
-    net = (
-        row.entry_bps_avg
-        - row.basis_p10_24h
-        - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+    return fill_score_of(
+        row.entry_bps_avg, row.basis_p10_24h,
+        row.hours_tradeable_24h, row.perp_trades_24h,
     )
-    factor = min(
-        1.0, _fill_chances(row) / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0)
-    )
+
+
+def fill_score_of(
+    entry_bps: float, lo24_bps: float, dwell_hours: float, trades_24h: float,
+) -> float:
+    """fill_score from plain numbers, so a replay of the basis logs
+    (scripts/build_dataset.py) scores history with the board's own formula."""
+    net = entry_bps - lo24_bps - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+    chances = dwell_hours * (trades_24h / 24.0)
+    factor = min(1.0, chances / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0))
     return net * factor
 
 
@@ -498,14 +510,24 @@ def carry_score(
     depth$ — and scaled by a saturating fill factor, since an edge on a book
     with no takers is not an edge.
     """
+    return carry_score_of(
+        row.entry_bps_avg, row.basis_p10_24h, avg_8h_bps, current_8h_bps,
+        row.perp_trades_24h,
+    )
+
+
+def carry_score_of(
+    entry_bps: float, lo24_bps: float, avg_8h_bps: float,
+    current_8h_bps: float, trades_24h: float,
+) -> float:
+    """carry_score from plain numbers (see fill_score_of)."""
     floor = float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
-    one_off = row.entry_bps_avg - row.basis_p10_24h - floor
+    one_off = entry_bps - lo24_bps - floor
     carry = min(avg_8h_bps, current_8h_bps)
     stream = carry * config.FUNDING_SCORE_HOLD_HOURS / 8.0
     factor = min(
-        1.0,
-        row.perp_trades_24h / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0),
-    ) if row.perp_trades_24h else 1.0
+        1.0, trades_24h / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0),
+    ) if trades_24h else 1.0
     return (one_off + stream) * factor
 
 

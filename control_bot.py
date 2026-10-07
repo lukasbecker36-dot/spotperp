@@ -24,6 +24,7 @@ import aiohttp
 import advisor
 import config
 import database
+import score_alerts
 import screener
 from auth import load_env, load_telegram_credentials
 from database import enqueue_command
@@ -41,6 +42,8 @@ HELP = """Commands:
 /screen swing [n] — pairs that go wide then return to closeable (round-trip candidates)
 /screen fill [n] — pairs with real perp volume + a persistently workable basis (you can actually get filled)
 /funding [n] — top funding carry (bps per hour)
+/alert [fill|funding LEVEL|auto|off] — message when a /screen fill or /funding score reaches LEVEL (no args: status)
+/scores [fill|funding] [days] — recorded score history: how many alerts a day each level would have sent
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
 /positions — active positions detail (bot DB)
@@ -80,6 +83,8 @@ BOT_COMMANDS = [
     # monitoring
     {"command": "screen", "description": "Basis opportunities; 'diff' vs 24h avg, 'swing' round-trip"},
     {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
+    {"command": "alert", "description": "Score alert: fill|funding LEVEL|auto|off"},
+    {"command": "scores", "description": "Score history: alerts/day per level"},
     {"command": "positions", "description": "Open positions, P&L + liq proximity"},
     {"command": "orders", "description": "Working entries/exits vs level + 24h range"},
     {"command": "recon", "description": "Live venue P&L, funding rate + liq"},
@@ -125,15 +130,7 @@ def _hourly(bps_8h: float | None) -> float:
     return (bps_8h or 0.0) / 8.0
 
 
-def _vol(v: float) -> str:
-    """Compact USD volume: 1.2B / 3.4M / 560k."""
-    if v >= 1e9:
-        return f"{v / 1e9:.1f}B"
-    if v >= 1e6:
-        return f"{v / 1e6:.1f}M"
-    if v >= 1e3:
-        return f"{v / 1e3:.0f}k"
-    return f"{v:.0f}"
+_vol = score_alerts.fmt_volume
 
 
 def _depth_usd(row: dict) -> float:
@@ -263,6 +260,10 @@ class ControlBot:
             return self._cmd_screen(args)
         if command == "funding":
             return self._cmd_funding(args)
+        if command == "alert":
+            return self._cmd_alert(args)
+        if command == "scores":
+            return self._cmd_scores(args)
         if command == "status":
             return await self._cmd_status()
         if command == "review":
@@ -584,7 +585,9 @@ class ControlBot:
             factor = min(
                 1.0, chances / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0)
             )
-            score = (net - jit) * factor
+            # Same figure the board ranks by and /alert fires on
+            # (screener.fill_score) — no jitter haircut.
+            score = net * factor
             # A lo24 well above 0 means the basis never comes back to a level
             # you can exit at — the trip is a carry, not a round trip.
             lo_s = (f"{f'{lo:.1f}!':>7}"
@@ -601,10 +604,9 @@ class ControlBot:
             )
         lines.append(sep)
         lines.append(
-            "Ranked by score = (net - jit) x min(1, hrs x tr/h /"
+            "Ranked by score = net x min(1, hrs x tr/h /"
             f" {config.SCREEN_FILL_TARGET_CHANCES:.0f}): what the trip is worth"
-            " after costs, haircut by how much the basis moves against a"
-            " resting order, scaled down if there is too little taker flow to"
+            " after costs, scaled down if there is too little taker flow to"
             " lift it. It is the whole board in one number — read the columns"
             " only to see WHY a row scores what it does."
         )
@@ -661,6 +663,132 @@ class ControlBot:
         )
         return "\n".join(lines)
 
+
+    def _score_history(self, board: str, days: float) -> list:
+        since = int((time.time() - days * 86400) * 1000)
+        return [tuple(r) for r in database.score_history(self._conn, board, since)]
+
+    def _cmd_alert(self, args: list[str]) -> str:
+        """Turn the /screen fill or /funding score alert on or off.
+
+        The bot only stores the level; the engine checks it every scan and
+        sends one message per name per episode (score_alerts.AlertState).
+        """
+        levels = dict(database.get_setting(self._conn, "score_alert", {}) or {})
+        usage = (
+            "usage: /alert fill 30 | /alert funding 40 | /alert fill auto |"
+            " /alert fill off | /alert off\n"
+            "auto = the lowest level that would have alerted at most"
+            f" {config.SCORE_ALERT_AUTO_PER_DAY:g} times a day over the last"
+            f" {config.SCORE_ALERT_LOOKBACK_DAYS:g} days. /scores shows the"
+            " trade-off for each level."
+        )
+        if args and args[0].lower() == "off" and len(args) == 1:
+            database.set_setting(self._conn, "score_alert", {})
+            return "score alerts OFF for both boards"
+        if args:
+            board = args[0].lower()
+            if board not in score_alerts.BOARDS or len(args) < 2:
+                return usage
+            arg = args[1].lower()
+            if arg == "off":
+                levels.pop(board, None)
+                database.set_setting(self._conn, "score_alert", levels)
+                return f"{score_alerts.BOARD_LABEL[board]} alert OFF"
+            note = ""
+            if arg == "auto":
+                hist = self._score_history(board, config.SCORE_ALERT_LOOKBACK_DAYS)
+                level = score_alerts.auto_level(hist)
+                if level is None:
+                    return ("no score history yet — it records every"
+                            f" {config.SCORE_HISTORY_SECONDS:.0f}s once deployed."
+                            " Set a level by hand for now, e.g. /alert"
+                            f" {board} 30")
+                days = score_alerts.span_days(hist)
+                fired = len(score_alerts.simulate(hist, level))
+                note = (f" (auto: would have fired {fired / days:.1f}/day over"
+                        f" {days:.1f} days of history)")
+            else:
+                try:
+                    level = float(arg)
+                except ValueError:
+                    return usage
+            levels[board] = level
+            database.set_setting(self._conn, "score_alert", levels)
+            return (
+                f"🔔 {score_alerts.BOARD_LABEL[board]} alert ON at score"
+                f" ≥ {level:g}{note}. One message per name until it has been"
+                f" below the level for {config.SCORE_ALERT_REARM_MINUTES:g}m."
+                f" /alert {board} off to stop."
+            )
+        lines = ["score alerts:"]
+        for board in score_alerts.BOARDS:
+            lv = levels.get(board)
+            state = f"ON at ≥ {lv:g}" if lv is not None else "off"
+            lines.append(f"  {score_alerts.BOARD_LABEL[board]}: {state}")
+        lines.append(usage)
+        return "\n".join(lines)
+
+    def _cmd_scores(self, args: list[str]) -> str:
+        """How often each score level is reached, from recorded history — the
+        data for choosing an /alert level."""
+        boards = list(score_alerts.BOARDS)
+        days = config.SCORE_ALERT_LOOKBACK_DAYS
+        for a in args:
+            if a.lower() in score_alerts.BOARDS:
+                boards = [a.lower()]
+            else:
+                try:
+                    days = float(a)
+                except ValueError:
+                    return "usage: /scores [fill|funding] [days]"
+        levels = database.get_setting(self._conn, "score_alert", {}) or {}
+        lines = []
+        for board in boards:
+            hist = self._score_history(board, days)
+            span = score_alerts.span_days(hist)
+            label = score_alerts.BOARD_LABEL[board]
+            if not hist or span <= 0:
+                lines.append(f"{label}: no score history yet (records every"
+                             f" {config.SCORE_HISTORY_SECONDS:.0f}s once deployed)")
+                continue
+            scores = sorted(r[2] for r in hist)
+            lines.append(
+                f"{label}: {span:.1f} days, {len(hist):,} board rows,"
+                f" score median {scores[len(scores) // 2]:+.1f},"
+                f" max {scores[-1]:+.1f}"
+            )
+            ladder = score_alerts.ladder(hist)
+            cur = levels.get(board)
+            if cur is not None and all(r["level"] != cur for r in ladder):
+                ladder = score_alerts.ladder(
+                    hist, sorted({r["level"] for r in ladder} | {cur})
+                )
+            hdr = f"{'level':>7}{'alerts/day':>12}{'names':>7}"
+            lines += [hdr, "-" * len(hdr)]
+            for r in ladder:
+                mark = "  ← current" if cur is not None and r["level"] == cur else ""
+                lines.append(f"{r['level']:>7.0f}{r['per_day']:>12.1f}"
+                             f"{r['names']:>7}{mark}")
+            auto = score_alerts.auto_level(hist)
+            if auto is not None:
+                lines.append(
+                    f"auto (≤{config.SCORE_ALERT_AUTO_PER_DAY:g}/day): {auto:g}"
+                )
+            lines.append("")
+        lines.append(
+            "alerts/day = how many messages /alert at that level would have"
+            " sent: one per name, re-armed after"
+            f" {config.SCORE_ALERT_REARM_MINUTES:g}m below the level. Levels are"
+            " percentiles of every recorded board score (p50 .. p99.5). A LOW"
+            " level can look quiet too: names that sit above it all day alert"
+            " only once, so it tells you nothing — auto walks down from the"
+            " top and stops where it first gets noisy. For"
+            " whether a level's names then actually paid, run"
+            " scripts/dataset_report.py --by fill_score (or carry_score) on"
+            " the server."
+        )
+        return "\n".join(lines)
 
     def _cmd_funding(self, args: list[str]) -> str:
         n = int(args[0]) if args else 10

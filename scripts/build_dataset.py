@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config  # noqa: E402
+import screener  # noqa: E402
 from backtest_divergence import Series, load_logs, pctile  # noqa: E402
 
 HOUR_MS = 3_600_000
@@ -184,6 +185,14 @@ def features_at(
     # 24h low of +120 — the 24h band had gone stale and was describing a
     # regime that already ended. Whether it ranks better than the 24h band is
     # what the report is for; both are emitted so they can be compared.
+    dwell = sum(1 for m in ent24 if m >= floor)
+    trades = (
+        round(s.trades[i], 0)
+        if s.trades is not None and i < len(s.trades) else ""
+    )
+    fund_avg = _accrue_funding(
+        s, bisect.bisect_left(s.ts, ts - 24 * HOUR_MS), i
+    ) / 24.0 * 8.0
     entB, clsB = hourly.window(ts, baseline_h)
     lo_entry_b, hi_entry_b = pctile(list(entB), 10), pctile(list(entB), 90)
     lo_close_b, hi_close_b = pctile(list(clsB), 10), pctile(list(clsB), 90)
@@ -215,19 +224,31 @@ def features_at(
             if hi_entry_b > lo_entry_b else ""
         ),
         f"hours_history_{baseline_h}": len(entB),
-        "dwell_h": sum(1 for m in ent24 if m >= floor),
+        "dwell_h": dwell,
         "hours_history": len(ent24),
         "funding_8h_bps": round(s.funding[i], 3),
-        "funding_24h_avg_8h_bps": round(_accrue_funding(
-            s, bisect.bisect_left(s.ts, ts - 24 * HOUR_MS), i
-        ) / 24.0 * 8.0, 3),
+        "funding_24h_avg_8h_bps": round(fund_avg, 3),
         "depth_usd": round(s.depth[i], 0),
         # Present only on logs written after the column was added; older days
         # leave it blank rather than pretending to a number.
-        "trades_24h": (
-            round(s.trades[i], 0)
-            if s.trades is not None and i < len(s.trades) else ""
+        "trades_24h": trades,
+        # The two board scores, by the boards' own formulas, so a /alert level
+        # can be chosen from how each score band actually played out:
+        #   dataset_report.py dataset.csv --by fill_score
+        # fill_score needs trade flow, so it is blank on logs older than the
+        # trades column. carry_score uses the 24h avg funding and
+        # the logged live rate as the latest settlement.
+        "fill_score": (
+            round(screener.fill_score_of(
+                entry_avg, lo_entry, dwell, float(trades)), 2)
+            if trades != "" else ""
         ),
+        "carry_score": round(screener.carry_score_of(
+            entry_avg, lo_entry, fund_avg, s.funding[i],
+            float(trades) if trades != "" else 0.0), 2),
+        # 1 when the board would hide it: the 24h exit low sits within
+        # SCREEN_MIN_EXIT_ROOM_PCT of the 24h entry high.
+        "no_exit_room": int(screener.no_exit_room_of(lo_close, hi_entry)),
     }
 
 

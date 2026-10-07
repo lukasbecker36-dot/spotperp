@@ -114,7 +114,32 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     total_usd TEXT NOT NULL
 );
 
+-- What /screen fill and /funding showed, sampled every SCORE_HISTORY_SECONDS:
+-- every row on each board with its score. The snapshots are overwritten each
+-- scan, so without this there is no way to say how often a score is reached
+-- and so where a /alert level belongs.
+CREATE TABLE IF NOT EXISTS score_history (
+    ts_ms INTEGER NOT NULL,
+    board TEXT NOT NULL,              -- 'fill' | 'funding'
+    symbol TEXT NOT NULL,
+    score REAL NOT NULL,
+    entry_bps REAL,
+    lo24_bps REAL,
+    hi24_bps REAL,
+    funding_8h_bps REAL,
+    volume_24h REAL,
+    depth_usd REAL
+);
+
+-- Small operator settings shared by the bot (writes) and engine (reads),
+-- e.g. the /alert levels. JSON values.
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_positions_state ON positions(state);
+CREATE INDEX IF NOT EXISTS idx_score_history ON score_history(board, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_fills_position ON fills(position_id);
 CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
 """
@@ -213,7 +238,7 @@ def claim_command(conn: sqlite3.Connection, command_id: int) -> bool:
 
 
 def prune_old_rows(conn: sqlite3.Connection, *, journal_days: int = 14,
-                   ledger_days: int = 7) -> None:
+                   ledger_days: int = 7, score_days: int | None = None) -> None:
     """Delete resolved commands/intents and old journal lines so the DB (and
     its WAL/backups) doesn't grow without bound. Positions and fills are the
     permanent record and are never pruned."""
@@ -229,6 +254,10 @@ def prune_old_rows(conn: sqlite3.Connection, *, journal_days: int = 14,
     conn.execute(
         "DELETE FROM intents WHERE status != 'pending' AND"
         " COALESCE(resolved_ms, created_ms) < ?", (cutoff,)
+    )
+    days = config.SCORE_HISTORY_DAYS if score_days is None else score_days
+    conn.execute(
+        "DELETE FROM score_history WHERE ts_ms < ?", (now - days * 86_400_000,)
     )
     conn.commit()
 
@@ -297,3 +326,47 @@ def equity_history(conn, since_ms: int = 0) -> list:
         "SELECT * FROM equity_snapshots WHERE ts_ms >= ? ORDER BY ts_ms",
         (int(since_ms),),
     ))
+
+
+def record_scores(conn, ts_ms: int, board: str, rows: list[dict]) -> None:
+    """Store one sample of a board: each row needs symbol + score; the other
+    columns are optional context for reading the alert back later."""
+    conn.executemany(
+        "INSERT INTO score_history (ts_ms, board, symbol, score, entry_bps,"
+        " lo24_bps, hi24_bps, funding_8h_bps, volume_24h, depth_usd)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [
+            (ts_ms, board, r["symbol"], float(r["score"]), r.get("entry_bps"),
+             r.get("lo24_bps"), r.get("hi24_bps"), r.get("funding_8h_bps"),
+             r.get("volume_24h"), r.get("depth_usd"))
+            for r in rows if r.get("score") is not None
+        ],
+    )
+    conn.commit()
+
+
+def score_history(conn, board: str, since_ms: int = 0) -> list:
+    return conn.execute(
+        "SELECT ts_ms, symbol, score FROM score_history"
+        " WHERE board = ? AND ts_ms >= ? ORDER BY ts_ms",
+        (board, since_ms),
+    ).fetchall()
+
+
+def get_setting(conn, key: str, default=None):
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return default
+    try:
+        return json.loads(row["value"])
+    except (TypeError, ValueError):
+        return default
+
+
+def set_setting(conn, key: str, value) -> None:
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, json.dumps(value)),
+    )
+    conn.commit()

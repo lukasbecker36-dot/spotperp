@@ -23,6 +23,7 @@ import position_manager as pm
 import book
 import recon
 import recovery
+import score_alerts
 import screener
 from screener import BPS
 from auth import (
@@ -149,6 +150,12 @@ class Engine:
         # whose multi-level ask depth is worth a REST call each scan.
         self._depth_watch_fill: set[str] = set()
         self._depth_watch_funding: set[str] = set()
+        # Each board's current rows in score_history shape, for recording and
+        # the /alert check; and the alert episode state.
+        self._board_rows: dict[str, list[dict]] = {}
+        self._last_score_record = 0.0
+        self._score_alerts = score_alerts.AlertState()
+        self._score_alert_levels: dict[str, float | None] = {}
         # A second, longer window. Hourly aggregates only, so a few hundred
         # floats per symbol — the cost is nil and it answers a question the
         # 24h band cannot: whether TODAY is the anomaly.
@@ -379,11 +386,48 @@ class Engine:
             ("screener snapshot", self._write_screener_snapshot),
             ("funding snapshot", self._write_funding_snapshot),
             ("heartbeat", self._write_heartbeat),
+            ("score history", self._record_scores),
         ):
             try:
                 fn()
             except Exception:
                 log.exception("slow scan: %s write failed", label)
+        try:
+            await self._check_score_alerts()
+        except Exception:
+            log.exception("slow scan: score alert check failed")
+
+    def _record_scores(self) -> None:
+        now = time.monotonic()
+        if now - self._last_score_record < config.SCORE_HISTORY_SECONDS:
+            return
+        self._last_score_record = now
+        ts = int(time.time() * 1000)
+        for board, rows in self._board_rows.items():
+            if rows:
+                database.record_scores(self.conn, ts, board, rows)
+
+    async def _check_score_alerts(self) -> None:
+        """Message when a board score reaches the /alert level — once per name
+        per episode (see score_alerts.AlertState)."""
+        levels = database.get_setting(self.conn, "score_alert", {}) or {}
+        ts = int(time.time() * 1000)
+        for board in score_alerts.BOARDS:
+            level = levels.get(board)
+            if level != self._score_alert_levels.get(board):
+                # Switched on/off or moved: names already above a new level
+                # should alert now, not wait out an old episode.
+                self._score_alerts.reset(board)
+                self._score_alert_levels[board] = level
+            if level is None:
+                continue
+            for row in self._board_rows.get(board) or []:
+                if self._score_alerts.observe(
+                    ts, board, row["symbol"], float(row["score"]), float(level)
+                ):
+                    await self.notifier.alert(
+                        score_alerts.format_alert(board, row, float(level))
+                    )
 
     async def _sample_equity(self) -> None:
         """Record total account value on its own cadence inside the slow scan.
@@ -582,6 +626,18 @@ class Engine:
                 row.mexc_ask_depth_usd = self.md.mexc_ask_depth.get(pair.mexc_symbol)
                 rows.append(row)
         fill_rows = screener.rank_rows_by_fillability(rows)
+        self._board_rows["fill"] = [
+            {
+                "symbol": r.symbol, "score": screener.fill_score(r),
+                "entry_bps": r.entry_bps_avg, "lo24_bps": r.basis_p10_24h,
+                "hi24_bps": r.basis_p90_24h, "funding_8h_bps": r.funding_8h_bps,
+                "volume_24h": r.perp_volume_24h,
+                "depth_usd": (r.mexc_ask_depth_usd
+                              if r.mexc_ask_depth_usd is not None
+                              else r.max_notional_usd),
+            }
+            for r in fill_rows
+        ]
         self._depth_watch_fill = {
             self.md.pair_maps[r.symbol].mexc_symbol
             for r in fill_rows if r.symbol in self.md.pair_maps
@@ -746,6 +802,20 @@ class Engine:
         rows.sort(key=lambda r: r["score"], reverse=True)
         rows = rows[: config.SCREENER_TOP_N]
         self._depth_watch_funding = {r["mexc_symbol"] for r in rows}
+        self._board_rows["funding"] = [
+            {
+                "symbol": r["symbol"], "score": r["score"],
+                "entry_bps": (r["entry_bps_avg"] if r["samples"]
+                              else r["entry_bps"]),
+                "lo24_bps": r["basis_p10_24h"], "hi24_bps": r["basis_p90_24h"],
+                "funding_8h_bps": r["current_8h_bps"],
+                "volume_24h": r["perp_volume_24h"],
+                "depth_usd": (r["mexc_ask_depth_usd"]
+                              if r["mexc_ask_depth_usd"] is not None
+                              else r["max_notional_usd"]),
+            }
+            for r in rows
+        ]
         config.FUNDING_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "ts_ms": now,
