@@ -233,6 +233,18 @@ ADVERSE_WIDEN_STOP_BPS: Decimal | None = (
 #      position returns to OPEN (keeps collecting funding, max-hold re-armed).
 # Carry trades ignore all of this — operator /exit only.
 CONVERGED_PASSIVE_BPS = Decimal(os.environ.get("CONVERGED_PASSIVE_BPS", "0.0"))
+# Where the convergence auto-close starts, per position: 10% of the way back
+# from the pair's 24h EXIT-basis low (p10 of the hourly maker-taker close
+# basis) towards the entry basis — i.e. bank 90% of the move the day has
+# shown is reachable, rather than waiting for zero. Entry +60, exit low +10
+# -> close at +15. Capped at entry - ENTRY_MIN_EDGE_FLOOR_BPS so it never
+# works an exit that can't cover costs. Falls back to CONVERGED_PASSIVE_BPS
+# with too little history (SCREEN_DIFF_MIN_HOURS). Empty/"off" = fixed
+# CONVERGED_PASSIVE_BPS as before.
+_low_pct = os.environ.get("CONVERGED_EXIT_LOW_PCT", "10").strip().lower()
+CONVERGED_EXIT_LOW_PCT: Decimal | None = (
+    None if _low_pct in ("", "off", "none") else Decimal(_low_pct)
+)
 CONVERGED_PASSIVE_RESET_BPS = Decimal(
     os.environ.get("CONVERGED_PASSIVE_RESET_BPS", "5.0")
 )

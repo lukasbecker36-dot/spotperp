@@ -1011,9 +1011,15 @@ class ControlBot:
                 size = f"~${notional:,.0f}" if notional else "~$?"
                 total_notional += notional or 0.0
                 total_upnl += m["upnl_usd"]
+                auto = ""
+                if m.get("auto_exit_bps") is not None:
+                    lo = m.get("exit_low_bps")
+                    auto = (f"  auto-exit ≤{m['auto_exit_bps']:+.1f}"
+                            + (f" (24h exit low {lo:+.1f})" if lo is not None
+                               else " (fixed)"))
                 tail = [
                     f"  basis  entry {ob}  now {now_basis:+.1f}"
-                    f"  captured {drift} bps",
+                    f"  captured {drift} bps{auto}",
                     f"  size {size}  funding ${m['funding_usd']:+.2f}"
                     f"  commission ${float(p.fees_usd):.2f}"
                     f"  →  uPnL ${m['upnl_usd']:+.2f}{liq}",

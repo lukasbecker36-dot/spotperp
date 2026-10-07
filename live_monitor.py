@@ -917,6 +917,10 @@ class Engine:
             liq_stats = self._liq_stats(pos)
             if liq_stats is not None:
                 mark["liq_price"], mark["liq_dist_pct"] = liq_stats
+            if pos.trade_kind != "carry" and pos.entry_basis_bps is not None:
+                target, low = self._convergence_target(pos)
+                mark["auto_exit_bps"] = float(target)
+                mark["exit_low_bps"] = float(low) if low is not None else None
             marks[str(pos.id)] = mark
         return marks
 
@@ -1629,9 +1633,18 @@ class Engine:
             "" if config.ADVERSE_WIDEN_STOP_BPS is None
             else f"; adverse-widen stop at +{float(config.ADVERSE_WIDEN_STOP_BPS):.0f}bps"
         )
+        if config.CONVERGED_EXIT_LOW_PCT is not None:
+            lo, _ = self._basis_24h.percentiles(symbol, close=True)
+            lo_s = f", now {lo:+.1f}" if lo is not None else ""
+            level = (
+                f"{float(config.CONVERGED_EXIT_LOW_PCT):g}% short of the 24h"
+                f" exit low{lo_s} (capped at entry -"
+                f" {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps; see /positions)"
+            )
+        else:
+            level = f"{float(config.CONVERGED_PASSIVE_BPS):.0f}bps"
         auto = (
-            f"auto-closes: passive maker at"
-            f" {float(config.CONVERGED_PASSIVE_BPS):.0f}bps, crosses if taker"
+            f"auto-closes: passive maker at {level}, crosses if taker"
             f" turns profitable, max-hold {config.MAX_HOLD_HOURS}h{adverse}"
             if kind == "convergence"
             else f"CARRY: manual /exit only{adverse}"
@@ -3088,10 +3101,11 @@ class Engine:
         )
         if held_min < config.CONVERGENCE_MIN_HOLD_MINUTES:
             return
-        # Two-tier convergence auto-close (see config.CONVERGED_PASSIVE_BPS).
-        # While still in premium (close above the passive trigger) just hold and
-        # collect funding; max-hold below still bounds the carry.
-        if (close is not None and close <= config.CONVERGED_PASSIVE_BPS
+        # Two-tier convergence auto-close (see config.CONVERGED_PASSIVE_BPS
+        # and CONVERGED_EXIT_LOW_PCT). While still above the trigger just hold
+        # and collect funding; max-hold below still bounds the carry.
+        target, low = self._convergence_target(pos)
+        if (close is not None and close <= target
                 and pos.id not in self._liq_protect):
             pnl = self._aggressive_close_pnl(pos)
             if pnl is not None and pnl > 0:
@@ -3127,22 +3141,25 @@ class Engine:
             # Converged but a taker close isn't worth it yet: work it passively
             # at the convergence target (maker perp buy-back, 0 perp fee).
             self._tp_confirm.pop(pos.id, None)
+            why = (
+                f" ({float(config.CONVERGED_EXIT_LOW_PCT):g}% short of the 24h"
+                f" exit low {float(low):+.1f}bps"
+                if low is not None else " (fixed target"
+            )
             journal(
                 self.conn,
                 f"position {pos.id}: CONVERGED basis={close:.1f}bps -> passive"
-                f" exit at {config.CONVERGED_PASSIVE_BPS}bps",
+                f" exit at {target}bps{why})",
             )
             await self.notifier.alert(
-                f"🎯 position {pos.id} {pos.symbol}: basis converged to"
+                f"🎯 position {pos.id} {pos.symbol}: basis reached"
                 f" {float(close):.1f}bps — working a passive maker close at"
-                f" {float(config.CONVERGED_PASSIVE_BPS):.0f}bps (will cross if a"
-                f" taker close turns profitable)"
+                f" {float(target):+.1f}bps{why}; will cross if a taker close"
+                f" turns profitable)"
             )
             self._auto_passive.add(pos.id)
             # Exit requested before the cancel — see _ensure_stops.
-            self.positions.set_exit_request(
-                pos.id, "passive", config.CONVERGED_PASSIVE_BPS
-            )
+            self.positions.set_exit_request(pos.id, "passive", target)
             await self._cancel_stops_for(pos)
             await self.executor.start_exit(self.positions.get(pos.id))
             return
@@ -3151,6 +3168,26 @@ class Engine:
             hold_hours = (time.time() * 1000 - pos.opened_ms) / 3_600_000
             if hold_hours > config.MAX_HOLD_HOURS:
                 await self._force_close_timeout(pos)
+
+    def _convergence_target(
+        self, pos: pm.Position,
+    ) -> tuple[Decimal, Decimal | None]:
+        """(close basis at which the convergence auto-close starts, the 24h
+        exit low it was derived from — None when the fixed fallback applies).
+        See config.CONVERGED_EXIT_LOW_PCT."""
+        base = config.CONVERGED_PASSIVE_BPS
+        pct = config.CONVERGED_EXIT_LOW_PCT
+        if pct is None or pos.entry_basis_bps is None:
+            return base, None
+        _, hours = self._basis_24h.stats(pos.symbol)
+        lo, _ = self._basis_24h.percentiles(pos.symbol, close=True)
+        if lo is None or hours < config.SCREEN_DIFF_MIN_HOURS:
+            return base, None
+        low = Decimal(str(round(lo, 2)))
+        entry = pos.entry_basis_bps
+        target = low + (entry - low) * pct / Decimal(100)
+        target = min(target, entry - config.ENTRY_MIN_EDGE_FLOOR_BPS)
+        return target.quantize(Decimal("0.1")), low
 
     async def _check_auto_passive(self, pos: pm.Position) -> None:
         """Manage a convergence-auto passive exit while it works: escalate to a
@@ -3168,7 +3205,13 @@ class Engine:
             return
         # Basis recovered into premium: stop working the close, hand back to
         # OPEN so it keeps collecting funding and max-hold is re-armed.
-        if close > config.CONVERGED_PASSIVE_BPS + config.CONVERGED_PASSIVE_RESET_BPS:
+        # Stand down relative to the target this exit was started at — it is
+        # per position now (the 24h exit low), not the fixed config level.
+        started_at = (
+            pos.exit_target_bps if pos.exit_target_bps is not None
+            else config.CONVERGED_PASSIVE_BPS
+        )
+        if close > started_at + config.CONVERGED_PASSIVE_RESET_BPS:
             self._auto_passive.discard(pos.id)
             self._tp_confirm.pop(pos.id, None)
             await self._cancel_exit(pos)

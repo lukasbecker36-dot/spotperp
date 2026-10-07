@@ -2599,3 +2599,70 @@ async def test_funding_uses_its_own_volume_floor_and_counts_near_misses(
     snap = json.loads((tmp_path / "fnd.json").read_text())
     assert snap["rows"] == [] and snap["hidden"] == {"volume": 1}
     assert snap["volume_near_miss"] == [[100_000, 250_000, 1]]
+
+
+def _seed_exit_low(engine, low: float, other: float = 40.0) -> None:
+    """24h of hourly close samples whose p10 is `low`."""
+    import time as _time
+    now = int(_time.time() * 1000)
+    for h in range(24):
+        engine._basis_24h.add("BTCUSDT", now - h * 3_600_000, 60.0,
+                              low if h % 2 else other)
+
+
+async def test_convergence_exit_starts_short_of_the_24h_exit_low(engine):
+    """Not at zero: 10% of the way back from the 24h exit low towards entry."""
+    pos_id = await open_position(engine)
+    _seed_exit_low(engine, 10.0)
+    pos = engine.positions.get(pos_id)
+    entry = pos.entry_basis_bps
+    target, low = engine._convergence_target(pos)
+    assert low == Decimal("10")
+    assert target == (low + (entry - low) / 10).quantize(Decimal("0.1"))
+
+    # Above the target (wide ask so a taker close isn't profitable): hold.
+    set_books(engine.md, "100.1", "101.5", "99.9", "100.0")       # close ~+20
+    await engine._check_safety(engine.positions.get(pos_id))
+    assert engine.positions.get(pos_id).exit_mode is None
+
+    # At/below it: work the passive close AT the target, not at 0.
+    set_books(engine.md, "100.02", "101.5", "99.9", "100.0")      # close ~+12
+    await engine._check_safety(engine.positions.get(pos_id))
+    pos = engine.positions.get(pos_id)
+    assert pos.exit_mode == "passive"
+    assert pos.exit_target_bps == target
+    assert any("24h exit low +10.0bps" in m for m in engine.notifier.messages)
+
+
+async def test_convergence_target_capped_to_cover_costs(engine):
+    """Exit low close to entry: the derived level would exit at a loss, so it
+    is capped at entry - the cost floor."""
+    pos_id = await open_position(engine)
+    pos = engine.positions.get(pos_id)
+    _seed_exit_low(engine, float(pos.entry_basis_bps) - 5, other=float(pos.entry_basis_bps))
+    target, _ = engine._convergence_target(pos)
+    assert target == (pos.entry_basis_bps - config.ENTRY_MIN_EDGE_FLOOR_BPS).quantize(Decimal("0.1"))
+
+
+async def test_convergence_target_falls_back_without_history(engine, monkeypatch):
+    pos_id = await open_position(engine)
+    pos = engine.positions.get(pos_id)
+    assert engine._convergence_target(pos) == (config.CONVERGED_PASSIVE_BPS, None)
+    _seed_exit_low(engine, 10.0)
+    monkeypatch.setattr(config, "CONVERGED_EXIT_LOW_PCT", None)       # switched off
+    assert engine._convergence_target(pos) == (config.CONVERGED_PASSIVE_BPS, None)
+
+
+async def test_auto_passive_stands_down_relative_to_its_own_target(engine):
+    pos_id = await open_position(engine)
+    engine.positions.set_exit_request(pos_id, "passive", Decimal("14"))
+    engine.positions.set_state(pos_id, pm.EXITING)
+    engine._auto_passive.add(pos_id)
+    # close ~+16: above 0+5 (the old fixed band) but inside 14+5 -> keep working.
+    set_books(engine.md, "100.06", "101.5", "99.9", "100.0")
+    await engine._check_auto_passive(engine.positions.get(pos_id))
+    assert engine.positions.get(pos_id).exit_mode == "passive"
+    # close ~+25: past 14+5 -> stand down.
+    set_books(engine.md, "100.15", "101.5", "99.9", "100.0")
+    await engine._check_auto_passive(engine.positions.get(pos_id))
+    assert engine.positions.get(pos_id).state == pm.OPEN
