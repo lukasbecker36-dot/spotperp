@@ -808,13 +808,6 @@ def test_no_exit_room_when_exit_low_hugs_entry_high(monkeypatch):
     assert not screener.no_exit_room(_range_row(-10.0, -12.0))  # no premium
 
 
-def test_exit_lo_is_the_close_side_low():
-    r = _range_row(80.0, 20.0)
-    assert screener.exit_lo(r) == 20.0
-    r.close_p10_24h = None                     # no close history yet
-    assert screener.exit_lo(r) == r.basis_p10_24h
-
-
 def test_daily_basis_annotates_the_close_low():
     d = screener.DailyBasis()
     for h in range(24):
@@ -833,6 +826,7 @@ def test_fill_screen_drops_names_with_no_exit_room(monkeypatch):
     good = _range_row(80.0, 10.0)
     stuck = _range_row(300.0, 275.0)    # clears the net gate, but within 10%
     good.symbol, stuck.symbol = "GOOD", "STUCK"
+    stuck.basis_p10_24h = 100.0         # wide ENTRY range: net alone would pass
     for r in (good, stuck):
         r.entry_bps_avg = r.basis_p90_24h
     out = [r.symbol for r in screener.rank_rows_by_fillability([good, stuck])]

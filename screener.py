@@ -94,9 +94,9 @@ class ScreenerRow:
     # only flickers has a tight range because the noise averages out per hour.
     basis_p10_24h: float = 0.0
     basis_p90_24h: float = 0.0
-    # 24h p10 of the hourly EXIT (close, bid/bid) basis: where an /exit
-    # actually fills. The entry-side p10 above sits a spread higher, and a
-    # name can show a wide entry range while its exit basis never comes down.
+    # 24h p10 of the hourly EXIT (close, bid/bid) basis. Not displayed — the
+    # boards show the entry range — but a name can show a wide entry range
+    # while its exit basis never comes down, and no_exit_room gates on this.
     # None when the window holds no close samples.
     close_p10_24h: float | None = None
     # Can this actually be TRADED? Depth is resting size; these are flow.
@@ -267,12 +267,6 @@ def _too_jittery(row: ScreenerRow) -> bool:
     )
 
 
-def exit_lo(row: ScreenerRow) -> float:
-    """Where an exit realistically fills: the 24h low of the EXIT basis,
-    falling back to the entry-side low when no close history exists yet."""
-    return row.close_p10_24h if row.close_p10_24h is not None else row.basis_p10_24h
-
-
 def no_exit_room(row: ScreenerRow) -> bool:
     """True when even the day's best exit barely beats the day's best entry:
     the 24h low of the exit basis is within SCREEN_MIN_EXIT_ROOM_PCT of the
@@ -412,7 +406,7 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         # own 24h low must clear the cost floor. Without this the screen ranks
         # a name you can fill easily but whose basis never comes back far
         # enough to close for a profit ABOVE one that does.
-        and (r.entry_bps_avg - exit_lo(r))
+        and (r.entry_bps_avg - r.basis_p10_24h)
         - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
         >= config.SCREEN_FILL_MIN_NET_SWING_BPS
     ]
@@ -467,7 +461,7 @@ def fill_score(row: ScreenerRow) -> float:
     """
     net = (
         row.entry_bps_avg
-        - exit_lo(row)
+        - row.basis_p10_24h
         - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
     )
     factor = min(
@@ -505,7 +499,7 @@ def carry_score(
     with no takers is not an edge.
     """
     floor = float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
-    one_off = row.entry_bps_avg - exit_lo(row) - floor
+    one_off = row.entry_bps_avg - row.basis_p10_24h - floor
     carry = min(avg_8h_bps, current_8h_bps)
     stream = carry * config.FUNDING_SCORE_HOLD_HOURS / 8.0
     factor = min(
