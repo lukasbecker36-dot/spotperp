@@ -2666,3 +2666,61 @@ async def test_auto_passive_stands_down_relative_to_its_own_target(engine):
     set_books(engine.md, "100.15", "101.5", "99.9", "100.0")
     await engine._check_auto_passive(engine.positions.get(pos_id))
     assert engine.positions.get(pos_id).state == pm.OPEN
+
+
+def _fill_board(engine, symbol="BTCUSDT", score=42.0):
+    engine._board_rows = {"fill": [{
+        "symbol": symbol, "score": score, "entry_bps": 50.0, "lo24_bps": 5.0,
+        "hi24_bps": 80.0, "funding_8h_bps": 1.6, "volume_24h": 1_200_000,
+        "depth_usd": 900.0,
+    }]}
+
+
+async def test_autoenter_starts_a_convergence_entry_on_the_alert(engine):
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    _fill_board(engine)
+    database.set_setting(engine.conn, "score_alert", {"fill": 40.0})
+    database.set_setting(engine.conn, "auto_enter", {"fill": 300})
+    await engine._check_score_alerts()
+    act = engine.positions.active()
+    assert len(act) == 1
+    pos = act[0]
+    assert pos.auto_entered and pos.trade_kind == "convergence"
+    assert pos.target_notional == Decimal(300)
+    msg = [m for m in engine.notifier.messages if "🔔" in m][-1]
+    assert f"auto-entry #{pos.id} started (PAPER)" in msg
+
+
+async def test_autoenter_off_or_held_does_not_enter(engine):
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    _fill_board(engine)
+    database.set_setting(engine.conn, "score_alert", {"fill": 40.0})
+    await engine._check_score_alerts()                  # alert only
+    assert engine.positions.active() == []
+
+    pos_id = await open_position(engine)                # now held by hand
+    database.set_setting(engine.conn, "auto_enter", {"fill": 300})
+    database.set_setting(engine.conn, "score_alert", {"fill": 41.0})  # re-alert
+    await engine._check_score_alerts()
+    assert [p.id for p in engine.positions.active()] == [pos_id]
+    assert "already holding" in engine.notifier.messages[-1]
+
+
+async def test_autoenter_respects_caps_and_cooldown(engine, monkeypatch):
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    database.set_setting(engine.conn, "auto_enter", {"fill": 300})
+    assert engine._auto_enter("fill", "BTCUSDT").startswith("🤖 auto-entry #")
+    # Cooldown: close it out, the same symbol may not be re-entered within 24h.
+    for p in engine.positions.active():
+        engine.positions.set_state(p.id, pm.CLOSED)
+    assert "within 24h" in engine._auto_enter("fill", "BTCUSDT")
+    # Daily cap.
+    monkeypatch.setattr(config, "AUTO_ENTER_SYMBOL_COOLDOWN_HOURS", 0.0)
+    monkeypatch.setattr(config, "AUTO_ENTER_MAX_PER_DAY", 1)
+    assert "auto entries in 24h" in engine._auto_enter("fill", "BTCUSDT")
+    # Open cap.
+    monkeypatch.setattr(config, "AUTO_ENTER_MAX_PER_DAY", 10)
+    monkeypatch.setattr(config, "AUTO_ENTER_MAX_OPEN", 1)
+    pos = engine.positions.create("ETHUSDT", Decimal(100), paper=True)
+    engine.positions.set_auto_entered(pos.id)
+    assert "auto positions open" in engine._auto_enter("fill", "BTCUSDT")

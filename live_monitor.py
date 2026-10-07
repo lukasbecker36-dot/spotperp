@@ -425,9 +425,55 @@ class Engine:
                 if self._score_alerts.observe(
                     ts, board, row["symbol"], float(row["score"]), float(level)
                 ):
-                    await self.notifier.alert(
-                        score_alerts.format_alert(board, row, float(level))
-                    )
+                    msg = score_alerts.format_alert(board, row, float(level))
+                    entered = self._auto_enter(board, row["symbol"])
+                    if entered:
+                        msg += "\n" + entered
+                    await self.notifier.alert(msg)
+
+    def _auto_enter(self, board: str, symbol: str) -> str | None:
+        """Start an /autoenter entry for a name whose score alert just fired.
+        Returns a line for the alert message, or None when auto-entry is off
+        for this board. Every skip says why, so a quiet bot is explainable."""
+        notional = (database.get_setting(self.conn, "auto_enter", {}) or {}).get(board)
+        if not notional:
+            return None
+        if symbol not in self.md.pair_maps:
+            return "🤖 auto-entry skipped: not cross-listed"
+        held = [p for p in self.positions.active() if p.symbol == symbol]
+        if held:
+            return f"🤖 auto-entry skipped: already holding #{held[0].id}"
+        open_auto = [p for p in self.positions.active() if p.auto_entered]
+        if len(open_auto) >= config.AUTO_ENTER_MAX_OPEN:
+            return (f"🤖 auto-entry skipped: {len(open_auto)} auto positions open"
+                    f" (max {config.AUTO_ENTER_MAX_OPEN})")
+        now_ms = int(time.time() * 1000)
+        today = self.positions.auto_entries_since(now_ms - 86_400_000)
+        if today >= config.AUTO_ENTER_MAX_PER_DAY:
+            return (f"🤖 auto-entry skipped: {today} auto entries in 24h"
+                    f" (max {config.AUTO_ENTER_MAX_PER_DAY})")
+        cool_ms = int(config.AUTO_ENTER_SYMBOL_COOLDOWN_HOURS * 3_600_000)
+        if self.positions.auto_entries_since(now_ms - cool_ms, symbol):
+            return (f"🤖 auto-entry skipped: {symbol} auto-entered within"
+                    f" {config.AUTO_ENTER_SYMBOL_COOLDOWN_HOURS:g}h")
+        amount = Decimal(str(notional))
+        if amount <= 0 or amount > config.MAX_NOTIONAL_PER_LEG_USD:
+            return (f"🤖 auto-entry skipped: notional ${amount} outside"
+                    f" (0, {config.MAX_NOTIONAL_PER_LEG_USD}]")
+        pos = self.positions.create(
+            symbol, amount, paper=self.paper, trade_kind="convergence",
+        )
+        self.positions.set_auto_entered(pos.id)
+        self.executor.start_entry(self.positions.get(pos.id))
+        journal(self.conn, f"position {pos.id}: AUTO-ENTER {symbol} ${amount}"
+                f" off the {board} score alert")
+        mode = "PAPER" if self.paper else "LIVE"
+        return (
+            f"🤖 auto-entry #{pos.id} started ({mode}): ${amount} {symbol},"
+            f" basis floor {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps;"
+            " auto-exits short of the 24h exit low (see /positions)."
+            f" /cancel {pos.id} to stop it"
+        )
 
     async def _sample_equity(self) -> None:
         """Record total account value on its own cadence inside the slow scan.

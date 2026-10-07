@@ -43,6 +43,7 @@ HELP = """Commands:
 /screen fill [n] — pairs with real perp volume + a persistently workable basis (you can actually get filled)
 /funding [n] — top funding carry (bps per hour)
 /alert [fill|funding LEVEL|auto|off] — message when a /screen fill or /funding score reaches LEVEL (no args: status)
+/autoenter [fill|funding NOTIONAL|off] — auto-start a normal entry when that board's /alert fires (needs the alert on; capped)
 /scores [fill|funding] [days] — recorded score history: how many alerts a day each level would have sent
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
@@ -85,6 +86,7 @@ BOT_COMMANDS = [
     {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
     {"command": "alert", "description": "Score alert: fill|funding LEVEL|auto|off"},
     {"command": "scores", "description": "Score history: alerts/day per level"},
+    {"command": "autoenter", "description": "Auto-enter on alerts: fill|funding NOTIONAL|off"},
     {"command": "positions", "description": "Open positions, P&L + liq proximity"},
     {"command": "orders", "description": "Working entries/exits vs level + 24h range"},
     {"command": "recon", "description": "Live venue P&L, funding rate + liq"},
@@ -270,6 +272,8 @@ class ControlBot:
             return self._cmd_alert(args)
         if command == "scores":
             return self._cmd_scores(args)
+        if command == "autoenter":
+            return self._cmd_autoenter(args)
         if command == "status":
             return await self._cmd_status()
         if command == "review":
@@ -691,7 +695,8 @@ class ControlBot:
         )
         if args and args[0].lower() == "off" and len(args) == 1:
             database.set_setting(self._conn, "score_alert", {})
-            return "score alerts OFF for both boards"
+            return ("score alerts OFF for both boards (auto-entry, if on, is"
+                    " idle until an alert is set again)")
         if args:
             board = args[0].lower()
             if board not in score_alerts.BOARDS or len(args) < 2:
@@ -732,6 +737,72 @@ class ControlBot:
             lv = levels.get(board)
             state = f"ON at ≥ {lv:g}" if lv is not None else "off"
             lines.append(f"  {score_alerts.BOARD_LABEL[board]}: {state}")
+        lines.append(usage)
+        return "\n".join(lines)
+
+    def _cmd_autoenter(self, args: list[str]) -> str:
+        """Turn auto-entry on a board's score alert on or off.
+
+        The bot stores the notional; the engine acts when that board's alert
+        fires for a name (one entry per alert episode), within the caps."""
+        auto = dict(database.get_setting(self._conn, "auto_enter", {}) or {})
+        alerts = database.get_setting(self._conn, "score_alert", {}) or {}
+        caps = (
+            f"limits: {config.AUTO_ENTER_MAX_OPEN} open auto positions,"
+            f" {config.AUTO_ENTER_MAX_PER_DAY} entries per 24h,"
+            f" {config.AUTO_ENTER_SYMBOL_COOLDOWN_HOURS:g}h per-symbol cooldown,"
+            " never into a symbol already held."
+        )
+        usage = (
+            "usage: /autoenter fill 200 | /autoenter funding 150 |"
+            " /autoenter fill off | /autoenter off\n"
+            "Starts a normal (non-carry) entry, same as /enter SYMBOL NOTIONAL,"
+            " when that board's /alert fires for a name. It auto-exits short of"
+            " the 24h exit low like any non-carry trade. " + caps
+        )
+        if args and args[0].lower() == "off" and len(args) == 1:
+            database.set_setting(self._conn, "auto_enter", {})
+            return "🤖 auto-entry OFF for both boards (alerts unchanged)"
+        if args:
+            board = args[0].lower()
+            if board not in score_alerts.BOARDS or len(args) < 2:
+                return usage
+            label = score_alerts.BOARD_LABEL[board]
+            if args[1].lower() == "off":
+                auto.pop(board, None)
+                database.set_setting(self._conn, "auto_enter", auto)
+                return f"🤖 {label} auto-entry OFF"
+            try:
+                notional = float(args[1].lstrip("$"))
+            except ValueError:
+                return usage
+            if notional <= 0 or notional > float(config.MAX_NOTIONAL_PER_LEG_USD):
+                return (f"notional must be in (0,"
+                        f" {config.MAX_NOTIONAL_PER_LEG_USD}]")
+            auto[board] = notional
+            database.set_setting(self._conn, "auto_enter", auto)
+            level = alerts.get(board)
+            trigger = (
+                f"when a {label} score reaches {level:g}" if level is not None
+                else f"— but the {label} alert is OFF, so nothing will trigger"
+                f" until you set one: /alert {board} LEVEL"
+            )
+            return (
+                f"🤖 {label} auto-entry ON at ${notional:,.0f} {trigger}."
+                f" Trades in the engine's current mode (/mode). {caps}"
+                f" /autoenter {board} off to stop."
+            )
+        lines = ["auto-entry:"]
+        for board in score_alerts.BOARDS:
+            label = score_alerts.BOARD_LABEL[board]
+            n = auto.get(board)
+            lv = alerts.get(board)
+            if n is None:
+                lines.append(f"  {label}: off")
+            elif lv is None:
+                lines.append(f"  {label}: ${n:,.0f} — idle, alert is off")
+            else:
+                lines.append(f"  {label}: ${n:,.0f} when score ≥ {lv:g}")
         lines.append(usage)
         return "\n".join(lines)
 
@@ -987,6 +1058,8 @@ class ControlBot:
             kind_tag = " ⚓carry" if p.trade_kind == "carry" else ""
             if p.auto_exit:
                 kind_tag += " 🤖auto"
+            if p.auto_entered:
+                kind_tag += " ⚡auto-in"
             base = p.symbol[:-4] if p.symbol.endswith("USDT") else p.symbol
             head = (f"#{p.id} {p.symbol} [{p.state}]{kind_tag}  held {held}"
                     f"{' · exit ' + p.exit_mode if p.exit_mode else ''}"

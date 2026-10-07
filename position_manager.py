@@ -64,6 +64,7 @@ class Position:
     note: str | None
     auto_exit: bool = False  # /auto: passive exit when the opportunity alert fires
     exit_auto: bool = False  # the working exit was started by /auto
+    auto_entered: bool = False  # opened by /autoenter off a score alert
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Position":
@@ -100,6 +101,9 @@ class Position:
             note=row["note"],
             auto_exit=bool(row["auto_exit"]) if "auto_exit" in row.keys() else False,
             exit_auto=bool(row["exit_auto"]) if "exit_auto" in row.keys() else False,
+            auto_entered=(
+                bool(row["auto_entered"]) if "auto_entered" in row.keys() else False
+            ),
         )
 
 
@@ -220,6 +224,23 @@ class PositionManager:
             (int(on), _now_ms(), position_id),
         )
         self._conn.commit()
+
+    def set_auto_entered(self, position_id: int) -> None:
+        self._conn.execute(
+            "UPDATE positions SET auto_entered=1, updated_ms=? WHERE id=?",
+            (_now_ms(), position_id),
+        )
+        self._conn.commit()
+
+    def auto_entries_since(self, since_ms: int, symbol: str | None = None) -> int:
+        """How many /autoenter positions were opened since `since_ms`
+        (optionally on one symbol) — whatever state they are in now."""
+        sql = "SELECT COUNT(*) FROM positions WHERE auto_entered=1 AND created_ms >= ?"
+        params: list = [since_ms]
+        if symbol is not None:
+            sql += " AND symbol = ?"
+            params.append(symbol)
+        return int(self._conn.execute(sql, params).fetchone()[0])
 
     def set_auto_exit(self, position_id: int, armed: bool) -> None:
         self._conn.execute(

@@ -125,6 +125,16 @@ SCORE_HISTORY_DAYS = int(os.environ.get("SCORE_HISTORY_DAYS", "30"))
 SCORE_ALERT_REARM_MINUTES = float(os.environ.get("SCORE_ALERT_REARM_MINUTES", "30"))
 SCORE_ALERT_AUTO_PER_DAY = float(os.environ.get("SCORE_ALERT_AUTO_PER_DAY", "3"))
 SCORE_ALERT_LOOKBACK_DAYS = float(os.environ.get("SCORE_ALERT_LOOKBACK_DAYS", "7"))
+# /autoenter: when a board's score alert fires for a name, start a normal
+# (non-carry) entry at the operator's notional. Hard limits, whatever the
+# alerts say: open auto-entered positions, auto entries per rolling 24h, and
+# a per-symbol cooldown since its last auto entry. A symbol already held is
+# never auto-entered (no auto size-ups).
+AUTO_ENTER_MAX_OPEN = int(os.environ.get("AUTO_ENTER_MAX_OPEN", "3"))
+AUTO_ENTER_MAX_PER_DAY = int(os.environ.get("AUTO_ENTER_MAX_PER_DAY", "6"))
+AUTO_ENTER_SYMBOL_COOLDOWN_HOURS = float(
+    os.environ.get("AUTO_ENTER_SYMBOL_COOLDOWN_HOURS", "24")
+)
 SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
 # Reject a basis that jumps wildly tick to tick: a resting order can't be
 # worked against it, because the price you get is a lottery (BULLA printed

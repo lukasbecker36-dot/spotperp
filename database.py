@@ -177,6 +177,9 @@ _MIGRATIONS = [
     # liquidation away and leaves size alone — left the stop at the old, much
     # closer level, where it fired on an ordinary move (position 249).
     "ALTER TABLE stop_orders ADD COLUMN liq_price TEXT",
+    # Opened by /autoenter off a score alert rather than by hand — counted
+    # against the auto-entry caps and cooldowns.
+    "ALTER TABLE positions ADD COLUMN auto_entered INTEGER NOT NULL DEFAULT 0",
 ]
 
 

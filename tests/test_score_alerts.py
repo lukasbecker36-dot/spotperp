@@ -109,3 +109,17 @@ def test_alert_auto_and_scores_use_recorded_history(tmp_path, monkeypatch):
     scores = bot._cmd_scores(["fill"])
     assert "alerts/day" in scores and "← current" in scores
     assert "no score history yet" in bot._cmd_scores(["funding"])
+
+
+def test_autoenter_command(tmp_path):
+    bot = _bot_with_db(tmp_path)
+    out = bot._cmd_autoenter(["fill", "200"])
+    assert "auto-entry ON at $200" in out and "alert is OFF" in out
+    bot._cmd_alert(["fill", "30"])
+    assert "$200 when score ≥ 30" in bot._cmd_autoenter([])
+    assert "must be in" in bot._cmd_autoenter(["fill", "999999"])
+    bot._cmd_autoenter(["funding", "150"])
+    bot._cmd_autoenter(["fill", "off"])
+    assert database.get_setting(bot._conn, "auto_enter") == {"funding": 150.0}
+    bot._cmd_autoenter(["off"])
+    assert database.get_setting(bot._conn, "auto_enter") == {}
