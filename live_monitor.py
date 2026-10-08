@@ -753,6 +753,7 @@ class Engine:
         # far under the floor they sit, so /funding shows what a lower floor
         # would add before anyone changes it.
         near: dict[tuple[float, float], int] = {}
+        all_rows: list[dict] = []
         for sym, stat in self.md.funding_stats.items():
             pair = self.md.pair_maps.get(sym)
             if pair is None:
@@ -825,47 +826,33 @@ class Engine:
                 )
                 near[band] = near.get(band, 0) + 1
             reject = reject or later
-            if reject:
-                hidden[reject] = hidden.get(reject, 0) + 1
-                continue
-            rows.append({
+            row = {
                 "symbol": sym,
                 "interval_hours": stat.interval_hours,
                 "current_8h_bps": current_8h,
                 "avg_24h_8h_bps": stat.avg_24h_8h_bps,
                 "realized_24h_bps": stat.realized_24h_bps,
                 "next_funding_h": next_funding_h,
-                # `screen` is non-None past the gate above, so these no
-                # longer need the None guards they carried when an empty book
-                # still made the board.
-                "entry_bps": screen.entry_bps,
-                "close_bps": screen.close_bps,
-                "spread_cost_bps": screen.spread_cost_bps,
-                "net_edge_bps": screen.net_edge_bps,
-                "entry_bps_avg": screen.entry_bps_avg,
-                "net_edge_bps_avg": screen.net_edge_bps_avg,
-                "samples": screen.samples,
-                "max_notional_usd": screen.max_notional_usd,
-                "entry_bps_jitter": screen.entry_bps_jitter,
-                "perp_trades_24h": screen.perp_trades_24h,
-                "perp_volume_24h": screen.perp_volume_24h,
-                "mexc_symbol": pair.mexc_symbol,
-                "mexc_ask_depth_usd": self.md.mexc_ask_depth.get(pair.mexc_symbol),
-                # 24h range of the hourly mean basis, so /funding can say
-                # whether the live entry sits at the rich or the cheap end of
-                # where this pair has actually traded today.
-                "basis_p10_24h": screen.basis_p10_24h,
-                "basis_p90_24h": screen.basis_p90_24h,
-                "close_p10_24h": screen.close_p10_24h,
-                "hours_24h": screen.hours_24h,
-                # The board's one number: basis one-off + carry stream over a
-                # fixed horizon. Sorting on this replaces ranking by raw carry,
-                # which put a collapsed 61bps average on a $5 book on top.
-                "score": screener.carry_score(screen, stat.avg_24h_8h_bps, current_8h),
-            })
+                "hidden": reject,
+            }
+            if screen is not None:
+                row.update(self._funding_screen_fields(
+                    screen, pair, stat.avg_24h_8h_bps, current_8h
+                ))
+            # /funding all: every name, ranked purely by 24h funding, with the
+            # reason the main board hides it (if it does) shown, not applied.
+            all_rows.append(row)
+            if reject:
+                hidden[reject] = hidden.get(reject, 0) + 1
+                continue
+            rows.append(row)
         rows.sort(key=lambda r: r["score"], reverse=True)
         rows = rows[: config.SCREENER_TOP_N]
-        self._depth_watch_funding = {r["mexc_symbol"] for r in rows}
+        all_rows.sort(key=lambda r: r["avg_24h_8h_bps"], reverse=True)
+        all_rows = all_rows[: config.FUNDING_ALL_TOP_N]
+        self._depth_watch_funding = {
+            r["mexc_symbol"] for r in rows + all_rows if r.get("mexc_symbol")
+        }
         self._board_rows["funding"] = [
             {
                 "symbol": r["symbol"], "score": r["score"],
@@ -884,6 +871,7 @@ class Engine:
         payload = {
             "ts_ms": now,
             "rows": rows,
+            "all_rows": all_rows,
             "hidden": hidden,
             "volume_near_miss": [
                 [lo, hi, n] for (lo, hi), n in sorted(near.items(), reverse=True)
@@ -892,6 +880,37 @@ class Engine:
         tmp = config.FUNDING_SNAPSHOT_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=1))
         tmp.replace(config.FUNDING_SNAPSHOT_FILE)
+
+    def _funding_screen_fields(
+        self, screen: screener.ScreenerRow, pair, avg_8h: float, current_8h: float,
+    ) -> dict:
+        """The basis/flow half of a /funding row (absent with no live book)."""
+        return {
+            "entry_bps": screen.entry_bps,
+            "close_bps": screen.close_bps,
+            "spread_cost_bps": screen.spread_cost_bps,
+            "net_edge_bps": screen.net_edge_bps,
+            "entry_bps_avg": screen.entry_bps_avg,
+            "net_edge_bps_avg": screen.net_edge_bps_avg,
+            "samples": screen.samples,
+            "max_notional_usd": screen.max_notional_usd,
+            "entry_bps_jitter": screen.entry_bps_jitter,
+            "perp_trades_24h": screen.perp_trades_24h,
+            "perp_volume_24h": screen.perp_volume_24h,
+            "mexc_symbol": pair.mexc_symbol,
+            "mexc_ask_depth_usd": self.md.mexc_ask_depth.get(pair.mexc_symbol),
+            # 24h range of the hourly mean basis, so /funding can say
+            # whether the live entry sits at the rich or the cheap end of
+            # where this pair has actually traded today.
+            "basis_p10_24h": screen.basis_p10_24h,
+            "basis_p90_24h": screen.basis_p90_24h,
+            "close_p10_24h": screen.close_p10_24h,
+            "hours_24h": screen.hours_24h,
+            # The board's one number: basis one-off + carry stream over a
+            # fixed horizon. Sorting on this replaces ranking by raw carry,
+            # which put a collapsed 61bps average on a $5 book on top.
+            "score": screener.carry_score(screen, avg_8h, current_8h),
+        }
 
     def _position_marks(self) -> dict[str, dict]:
         """Live marks for open positions: closeable basis now, accrued-funding

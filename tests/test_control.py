@@ -348,3 +348,31 @@ def test_funding_lists_volume_near_misses(tmp_path, monkeypatch):
     monkeypatch.setattr(_config, "FUNDING_SNAPSHOT_FILE", p)
     out = control_bot.ControlBot._cmd_funding(_bot(), [])
     assert "3 at $100k-150k" in out and "6 under $25k" in out
+
+
+def test_funding_all_ranks_by_24h_funding_and_tags_hidden(tmp_path, monkeypatch):
+    import json as _json, time as _time
+    import config as _config
+
+    def row(sym, avg, hidden=None, **kw):
+        return {"symbol": sym, "current_8h_bps": avg, "avg_24h_8h_bps": avg,
+                "hidden": hidden, **kw}
+    p = tmp_path / "fnd.json"
+    p.write_text(_json.dumps({
+        "ts_ms": int(_time.time() * 1000),
+        "rows": [row("ONBOARDUSDT", 4.0, entry_bps=20.0, score=10.0)],
+        "all_rows": [row("THINUSDT", 40.0, "volume", entry_bps=30.0,
+                         perp_volume_24h=90_000, score=55.0),
+                     row("NOBOOKUSDT", 24.0, "book"),
+                     row("ONBOARDUSDT", 4.0, entry_bps=20.0, score=10.0)],
+        "hidden": {"volume": 1, "book": 1},
+    }))
+    monkeypatch.setattr(_config, "FUNDING_SNAPSHOT_FILE", p)
+    out = control_bot.ControlBot._cmd_funding(_bot(), ["all"])
+    body = out.splitlines()
+    assert "ALL names" in body[0]
+    order = [l.split()[0] for l in body[3:6]]
+    assert order == ["THINUSDT", "NOBOOKUSDT", "ONBOARDUSDT"]
+    assert body[3].rstrip().endswith("vol") and body[4].rstrip().endswith("book")
+    assert "hidden as unworkable" not in out
+    assert "THINUSDT" not in control_bot.ControlBot._cmd_funding(_bot(), [])

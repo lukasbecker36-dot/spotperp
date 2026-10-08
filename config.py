@@ -37,6 +37,7 @@ EXIT_FEE_AGGRESSIVE = ASTER_TAKER_FEE + MEXC_TAKER_FEE
 
 # ── Screener ──
 SCREENER_TOP_N = 15                      # rows kept in the snapshot
+FUNDING_ALL_TOP_N = 20                   # /funding all: names by 24h funding
 SCREENER_MIN_NET_EDGE_BPS = Decimal("0") # show rows above this net edge
 # Slippage allowance per ROUND TRIP, on top of fees, in the cost floor.
 #

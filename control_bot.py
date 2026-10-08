@@ -42,6 +42,7 @@ HELP = """Commands:
 /screen swing [n] — pairs that go wide then return to closeable (round-trip candidates)
 /screen fill [n] — pairs with real perp volume + a persistently workable basis (you can actually get filled)
 /funding [n] — top funding carry (bps per hour)
+/funding all [n] — top 20 names by 24h avg funding, unfiltered (same columns + why /funding hides it)
 /alert [fill|funding LEVEL|auto|off] — message when a /screen fill or /funding score reaches LEVEL (no args: status)
 /autoenter [fill|funding NOTIONAL|off] — auto-start a normal entry when that board's /alert fires (needs the alert on; capped)
 /scores [fill|funding] [days] — recorded score history: how many alerts a day each level would have sent
@@ -139,6 +140,13 @@ def _exit_room_desc() -> str:
     """The exit-room rule in words, e.g. '25bps (or 10% of hi24 if larger)'."""
     return (f"{screener.exit_room_needed(0.0):.0f}bps (or"
             f" {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}% of hi24 if larger)")
+
+
+# /funding all: short tag for why the main board hides a row.
+_HIDDEN_TAG = {
+    "volume": "vol", "discount": "disc", "exit": "exit", "depth": "depth",
+    "spread": "sprd", "index": "index", "jitter": "jit", "book": "book",
+}
 
 
 def _depth_usd(row: dict) -> float:
@@ -868,24 +876,41 @@ class ControlBot:
         return "\n".join(lines)
 
     def _cmd_funding(self, args: list[str]) -> str:
-        n = int(args[0]) if args else 10
+        # /funding all [n]: every name ranked purely by 24h average funding,
+        # no gates — the reason the main board would hide a row is SHOWN in
+        # the last column instead of applied.
+        all_mode = bool(args) and args[0].lower() == "all"
+        if all_mode:
+            args = args[1:]
+        try:
+            n = int(args[0]) if args else (config.FUNDING_ALL_TOP_N if all_mode else 10)
+        except ValueError:
+            return "usage: /funding [n] | /funding all [n]"
         try:
             snap = json.loads(config.FUNDING_SNAPSHOT_FILE.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             return "no funding data yet (first sweep runs at startup, ~1min)"
         age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
-        rows = snap["rows"][:n]
+        if all_mode and "all_rows" not in snap:
+            return ("no /funding all data yet — the engine writes it from the"
+                    " next scan after /update")
+        rows = (snap.get("all_rows") if all_mode else snap["rows"])[:n]
         if not rows:
             return "no funding data yet"
         win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
         # No interval column: normalising to a per-hour rate is precisely what
         # makes the settlement interval stop mattering for comparison. 'next'
         # still says when the cash lands, and /book has the interval.
-        hdr = (f"{'symbol':<11}{'score':>6}{'24h':>7}{'fund':>6}"
+        hdr = (f"{'symbol':<11}{'score':>6}{'24h':>7}{'fund':>7}"
                f"{'next':>5}{'entry':>6}{'lo24':>7}{'hi24':>7}{'jit':>5}"
-               f"{'vol':>6}{'depth$':>7}")
+               f"{'vol':>6}{'depth$':>7}" + (f" {'hid':<5}" if all_mode else ""))
         sep = "-" * len(hdr)
-        lines = [f"funding carry ({age_s:.0f}s old)", hdr, sep]
+        title = (
+            f"funding — top {len(rows)} by 24h avg funding, ALL names"
+            f" ({age_s:.0f}s old)" if all_mode
+            else f"funding carry ({age_s:.0f}s old)"
+        )
+        lines = [title, hdr, sep]
 
         def avg(r, key_avg, key_live):
             # 5m windowed mean; fall back to live (old snapshot / no samples).
@@ -933,6 +958,8 @@ class ControlBot:
                 f"{_hourly(r['avg_24h_8h_bps']):>7.2f}"
                 f"{_hourly(r['current_8h_bps']):>7.2f}{nxt}"
                 f"{entry}{lo24}{hi24}{jit}{volume}{depth}"
+                + (f" {_HIDDEN_TAG.get(r.get('hidden'), r.get('hidden') or ''):<5}"
+                   if all_mode else "")
             )
         lines.append(sep)
         lines.append(
@@ -983,6 +1010,21 @@ class ControlBot:
             " an extreme is hard to work, NOT as a cost: measured on real"
             " fills it does not predict slippage either way."
         )
+        if all_mode:
+            lines.append(
+                "ALL names, ranked by 24h average funding only — none of the"
+                " board's checks applied. hid = why /funding would hide it:"
+                " vol = perp volume under"
+                f" ${config.FUNDING_MIN_VOLUME_USD:,.0f}, disc = entry below"
+                f" {config.FUNDING_MIN_ENTRY_BPS:+.0f}, exit = no room between"
+                " best entry and best exit, depth = book under"
+                f" ${config.SCREEN_MIN_DEPTH_USD:.0f}, sprd = books"
+                f" >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps apart, index ="
+                " Aster index disagrees with MEXC (likely not the same asset),"
+                " jit = basis flickers, book = no live quote. Blank = it is on"
+                " /funding. Check /book before entering a hidden name."
+            )
+            return "\n".join(lines)
         hid = snap.get("hidden") or {}
         if hid:
             lines.append(

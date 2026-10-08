@@ -2724,3 +2724,26 @@ async def test_autoenter_respects_caps_and_cooldown(engine, monkeypatch):
     pos = engine.positions.create("ETHUSDT", Decimal(100), paper=True)
     engine.positions.set_auto_entered(pos.id)
     assert "auto positions open" in engine._auto_enter("fill", "BTCUSDT")
+
+
+async def test_funding_all_lists_hidden_names_with_their_reason(
+    engine, monkeypatch, tmp_path
+):
+    import funding as funding_mod
+    import json
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    monkeypatch.setattr(config, "FUNDING_MIN_VOLUME_USD", 300_000.0)
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._basis_24h = screener.DailyBasis()
+    engine.md.funding_stats["BTCUSDT"] = funding_mod.summarize(
+        "BTCUSDT", [], None, now_ms=0
+    )
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    engine.md.perp_volume = {"BTCUSDT": {"quote_volume": 200_000, "trades": 900}}
+    engine._write_funding_snapshot()
+    snap = json.loads((tmp_path / "fnd.json").read_text())
+    assert snap["rows"] == []                              # hidden on /funding
+    assert [(r["symbol"], r["hidden"]) for r in snap["all_rows"]] == [
+        ("BTCUSDT", "volume")
+    ]
+    assert snap["all_rows"][0]["entry_bps"] is not None    # full columns kept
