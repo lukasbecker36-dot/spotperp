@@ -150,6 +150,9 @@ class Engine:
         # whose multi-level ask depth is worth a REST call each scan.
         self._depth_watch_fill: set[str] = set()
         self._depth_watch_funding: set[str] = set()
+        # Names passing every check but depth: fetched so the depth check can
+        # use their 5-level figure rather than the touch.
+        self._depth_watch_candidates: set[str] = set()
         # Each board's current rows in score_history shape, for recording and
         # the /alert check; and the alert episode state.
         self._board_rows: dict[str, list[dict]] = {}
@@ -503,7 +506,10 @@ class Engine:
         last /screen fill and /funding boards. The touch alone understates a
         book that is thin at the top but stacked a tick behind it. Symbols that
         left the boards are dropped; a failed fetch keeps the previous value."""
-        watch = sorted(self._depth_watch_fill | self._depth_watch_funding)
+        watch = sorted(
+            self._depth_watch_fill | self._depth_watch_funding
+            | self._depth_watch_candidates
+        )
         levels = config.SCREEN_DEPTH_LEVELS
         cache = {s: v for s, v in self.md.mexc_ask_depth.items() if s in watch}
         batch = max(1, config.FUNDING_FETCH_BATCH)
@@ -672,6 +678,21 @@ class Engine:
                 row.mexc_ask_depth_usd = self.md.mexc_ask_depth.get(pair.mexc_symbol)
                 rows.append(row)
         fill_rows = screener.rank_rows_by_fillability(rows)
+        # Names whose only failing check could be depth: fetch their 5-level
+        # depth so the check judges them on it (touch until then). Highest
+        # volume first, capped, so a slow scan stays a handful of calls.
+        floor = min(config.FUNDING_MIN_VOLUME_USD, config.SCREEN_FILL_MIN_VOLUME_USD)
+        cands = [
+            r for r in rows
+            if not [x for x in screener.all_reject_reasons(r, min_volume=floor)
+                    if x != "depth"]
+        ]
+        cands.sort(key=lambda r: r.perp_volume_24h, reverse=True)
+        self._depth_watch_candidates = {
+            self.md.pair_maps[r.symbol].mexc_symbol
+            for r in cands[: config.SCREEN_DEPTH_WATCH_MAX]
+            if r.symbol in self.md.pair_maps
+        }
         self._board_rows["fill"] = [
             {
                 "symbol": r.symbol, "score": screener.fill_score(r),
@@ -776,6 +797,10 @@ class Engine:
                 if screen is not None:
                     self._basis_avg.annotate(screen)
                     self._basis_24h.annotate(screen)
+                    # The depth check reads the 5-level figure when known.
+                    screen.mexc_ask_depth_usd = self.md.mexc_ask_depth.get(
+                        pair.mexc_symbol
+                    )
                     # The flow figures are set on the /screen path only; the
                     # quality gate below needs them here too.
                     vol = self.md.perp_volume.get(pair.aster_symbol) or {}

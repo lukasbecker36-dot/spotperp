@@ -229,11 +229,21 @@ def rank_rows(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     eligible = [
         r
         for r in rows
-        if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
+        if not too_thin(r)
         and not _bad_index(r)
     ]
     eligible.sort(key=lambda r: r.net_edge_bps_avg, reverse=True)
     return eligible[: config.SCREENER_TOP_N]
+
+
+def too_thin(row: ScreenerRow) -> bool:
+    """The screens' depth check: the first SCREEN_DEPTH_LEVELS MEXC asks
+    summed under SCREEN_MIN_DEPTH5_USD — what an entry's spot hedge can
+    actually sweep. Falls back to the touch (smallest of the four best-price
+    sizes under SCREEN_MIN_DEPTH_USD) until that name's levels are fetched."""
+    if row.mexc_ask_depth_usd is not None:
+        return row.mexc_ask_depth_usd < config.SCREEN_MIN_DEPTH5_USD
+    return row.max_notional_usd < config.SCREEN_MIN_DEPTH_USD
 
 
 def _bad_index(row: ScreenerRow) -> bool:
@@ -319,7 +329,7 @@ def quote_reject_reason(
     """
     if _bad_index(row):
         return "index"
-    if row.max_notional_usd < config.SCREEN_MIN_DEPTH_USD:
+    if too_thin(row):
         return "depth"
     # Entry (ask/ask) minus close (bid/bid) is what crossing both books costs
     # now. 170bps of it means the quotes are nowhere near each other.
@@ -344,7 +354,7 @@ def all_reject_reasons(
     out = []
     if _bad_index(row):
         out.append("index")
-    if row.max_notional_usd < config.SCREEN_MIN_DEPTH_USD:
+    if too_thin(row):
         out.append("depth")
     if row.spread_cost_bps > config.SCREEN_MAX_SPREAD_COST_BPS:
         out.append("spread")
@@ -370,7 +380,7 @@ def rank_rows_by_dislocation(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     eligible = [
         r
         for r in rows
-        if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
+        if not too_thin(r)
         and r.hours_24h >= config.SCREEN_DIFF_MIN_HOURS
     ]
     eligible.sort(
@@ -398,7 +408,7 @@ def rank_rows_by_swing(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     eligible = [
         r
         for r in rows
-        if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
+        if not too_thin(r)
         and r.hours_24h >= config.SCREEN_DIFF_MIN_HOURS
         and r.basis_p10_24h <= config.SCREEN_SWING_EXIT_BPS
         and r.funding_8h_bps >= config.SCREEN_SWING_MIN_FUNDING_BPS
@@ -426,7 +436,7 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     eligible = [
         r
         for r in rows
-        if r.max_notional_usd >= config.SCREEN_MIN_DEPTH_USD
+        if not too_thin(r)
         and r.perp_volume_24h >= config.SCREEN_FILL_MIN_VOLUME_USD
         and r.hours_tradeable_24h >= config.SCREEN_FILL_MIN_HOURS
         # Funding is the carry you collect while working the round trip. A

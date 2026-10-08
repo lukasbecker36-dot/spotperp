@@ -142,6 +142,14 @@ def _exit_room_desc() -> str:
             f" {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}% of hi24 if larger)")
 
 
+def _depth_rule() -> str:
+    return (
+        f"first {config.SCREEN_DEPTH_LEVELS} MEXC asks under"
+        f" ${config.SCREEN_MIN_DEPTH5_USD:,.0f} (touch under"
+        f" ${config.SCREEN_MIN_DEPTH_USD:.0f} until fetched)"
+    )
+
+
 def _bps_col(v: float | None, width: int, mark: str = "") -> str:
     """A basis figure right-aligned in `width`, always leaving a gap before
     it: one decimal normally, none from 1,000bps, and '>9999' / '<-9999'
@@ -1036,16 +1044,13 @@ class ControlBot:
                 " vol = perp volume under"
                 f" ${config.FUNDING_MIN_VOLUME_USD:,.0f}, disc = entry below"
                 f" {config.FUNDING_MIN_ENTRY_BPS:+.0f}, exit = no room between"
-                " best entry and best exit, depth = book under"
-                f" ${config.SCREEN_MIN_DEPTH_USD:.0f}, sprd = books"
+                f" best entry and best exit, depth = {_depth_rule()}, sprd = books"
                 f" >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps apart, index ="
                 " Aster index disagrees with MEXC (likely not the same asset),"
                 " jit = basis flickers, book = no live quote. Every failing"
                 " check is listed (the board's counts use the first only)."
-                " Blank = it is on /funding. depth is the TOUCH: the smallest"
-                " of the four best-price sizes (Aster and MEXC, bid and ask) —"
-                " not the 5-level depth$. Check /book before entering a hidden"
-                " name."
+                " Blank = it is on /funding. Check /book before entering a"
+                " hidden name."
             )
             return "\n".join(lines)
         hid = snap.get("hidden") or {}
@@ -1063,7 +1068,8 @@ class ControlBot:
                 " two symbols are not the same asset at the same scale and the"
                 " basis is fiction; spread = books"
                 f" >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps apart, so the"
-                " quote is not a real price; depth/volume = too thin to fill;"
+                f" quote is not a real price; depth = {_depth_rule()};"
+                " volume = too little trading to fill;"
                 " jitter = flickers too hard to work; exit = 24h exit-basis low"
                 f" less than {_exit_room_desc()} below the 24h entry high, so"
                 " there is nowhere good to close)"

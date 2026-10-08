@@ -877,3 +877,16 @@ def test_all_reject_reasons_lists_every_failure(monkeypatch):
         "depth", "spread", "volume",
     ]
     assert screener.quote_reject_reason(r, min_volume=150_000) == "depth"
+
+
+def test_depth_check_uses_five_levels_once_known(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 5.0)
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH5_USD", 50.0)
+    r = _quote_row("Z", 40.0, 35.0, depth=1.0)     # $1 at the touch
+    assert screener.too_thin(r)                     # unknown levels: touch rules
+    r.mexc_ask_depth_usd = 295.0                    # stacked behind the touch
+    assert not screener.too_thin(r)
+    assert "depth" not in screener.all_reject_reasons(r, min_volume=0)
+    deep_touch = _quote_row("Y", 40.0, 35.0, depth=500.0)
+    deep_touch.mexc_ask_depth_usd = 30.0            # five levels can't hedge a clip
+    assert screener.too_thin(deep_touch)

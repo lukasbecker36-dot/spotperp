@@ -65,6 +65,17 @@ MIN_DEPTH_NOTIONAL_USD = Decimal("200")  # min top-of-book notional on both side
 # deep books with no edge. The dwell, net-swing, jitter and $clip columns now
 # do the discriminating; this only drops books that are outright empty.
 SCREEN_MIN_DEPTH_USD = float(os.environ.get("SCREEN_MIN_DEPTH_USD", "5"))
+# The screens' depth check once the 5-level figure is known: the first
+# SCREEN_DEPTH_LEVELS MEXC asks summed must reach this. An entry hedges each
+# perp fill with a spot buy that can sweep several levels while the blended
+# basis holds, so the touch alone understates what is fillable. Default = one
+# entry clip (ENTRY_MAX_CLIP_NOTIONAL_USD's $50): five levels that cannot
+# hedge one clip stall the entry. Until a name's 5-level depth has been
+# fetched, the touch check above (SCREEN_MIN_DEPTH_USD) stands in.
+SCREEN_MIN_DEPTH5_USD = float(os.environ.get("SCREEN_MIN_DEPTH5_USD", "50"))
+# Most names fetched for 5-level depth per scan (one REST call each): the
+# boards' rows plus every name that passes the other checks, by volume.
+SCREEN_DEPTH_WATCH_MAX = int(os.environ.get("SCREEN_DEPTH_WATCH_MAX", "150"))
 BASIS_LOG_SECONDS = 60.0                 # touch-basis CSV sampling cadence
 # /screen reports a time-windowed mean of entry/net basis (sampled once per
 # slow scan) so a persistent edge is distinguishable from a one-tick blip, and

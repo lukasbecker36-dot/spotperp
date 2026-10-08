@@ -97,6 +97,7 @@ def engine(tmp_path, monkeypatch):
     eng._standdown_since = {}
     eng._depth_watch_fill = set()
     eng._depth_watch_funding = set()
+    eng._depth_watch_candidates = set()
     eng._board_rows = {}
     eng._last_score_record = 0.0
     eng._score_alerts = score_alerts.AlertState()
@@ -2768,3 +2769,26 @@ async def test_funding_all_carries_every_hidden_reason(engine, monkeypatch, tmp_
     assert row["hidden"] == "volume"
     assert row["hidden_all"] == ["volume", "discount"]
     assert snap["hidden"] == {"volume": 1}          # counts stay first-reason
+
+
+async def test_depth_only_failures_are_fetched_for_five_level_depth(engine, monkeypatch):
+    monkeypatch.setattr(config, "SCREENER_SNAPSHOT_FILE",
+                        config.OUTPUT_DIR / "_t_snap.json")
+    monkeypatch.setattr(config, "FUNDING_MIN_VOLUME_USD", 0.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_VOLUME_USD", 0.0)
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._basis_24h = screener.DailyBasis()
+    engine._basis_base = screener.DailyBasis(hours=72)
+    engine._last_basis_log = float("inf")
+    import time as _time
+    ts = int(_time.time() * 1000)
+    # $0.10 at the MEXC touch: fails the touch check, passes everything else.
+    engine.md.aster_books["BTCUSDT"] = BookTicker(
+        "BTCUSDT", Decimal("100.4"), Decimal(100), Decimal("100.5"), Decimal(100), ts)
+    engine.md.mexc_books["BTCUSDT"] = BookTicker(
+        "BTCUSDT", Decimal("99.9"), Decimal(100), Decimal("100.0"), Decimal("0.001"), ts)
+    try:
+        engine._write_screener_snapshot()
+    finally:
+        (config.OUTPUT_DIR / "_t_snap.json").unlink(missing_ok=True)
+    assert engine._depth_watch_candidates == {"BTCUSDT"}
