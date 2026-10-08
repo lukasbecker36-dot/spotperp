@@ -171,7 +171,7 @@ def _bps_col(v: float | None, width: int, mark: str = "") -> str:
 # /funding all: short tag for why the main board hides a row.
 _HIDDEN_TAG = {
     "volume": "vol", "discount": "disc", "exit": "exit", "depth": "depth",
-    "spread": "sprd", "index": "index", "jitter": "jit", "book": "book",
+    "spread": "sprd", "roundtrip": "rt", "index": "index", "jitter": "jit", "book": "book",
 }
 
 
@@ -1044,8 +1044,11 @@ class ControlBot:
                 " vol = perp volume under"
                 f" ${config.FUNDING_MIN_VOLUME_USD:,.0f}, disc = entry below"
                 f" {config.FUNDING_MIN_ENTRY_BPS:+.0f}, exit = no room between"
-                f" best entry and best exit, depth = {_depth_rule()}, sprd = books"
-                f" >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps apart, index ="
+                f" best entry and best exit, depth = {_depth_rule()}, sprd ="
+                f" instant round trip above +{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}"
+                " (perp book too wide to be a real quote), rt = instant round"
+                f" trip below {config.SCREEN_MIN_ROUNDTRIP_BPS:+.0f} (crossing the"
+                " books costs more than a typical edge), index ="
                 " Aster index disagrees with MEXC (likely not the same asset),"
                 " jit = basis flickers, book = no live quote. Every failing"
                 " check is listed (the board's counts use the first only)."
@@ -1066,9 +1069,12 @@ class ControlBot:
                 + f"index = Aster's own index disagrees with MEXC spot by"
                 f" >{config.SCREEN_MAX_INDEX_DIVERGENCE_BPS / 100:.0f}%, so the"
                 " two symbols are not the same asset at the same scale and the"
-                " basis is fiction; spread = books"
-                f" >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps apart, so the"
-                f" quote is not a real price; depth = {_depth_rule()};"
+                " basis is fiction; spread = instant round trip (entry basis -"
+                f" exit basis) above +{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}, a"
+                " perp book too wide to be a real quote; roundtrip = it is"
+                f" below {config.SCREEN_MIN_ROUNDTRIP_BPS:+.0f}, so the basis must"
+                " converge that far just to break even (usually a wide spot"
+                f" book); depth = {_depth_rule()};"
                 " volume = too little trading to fill;"
                 " jitter = flickers too hard to work; exit = 24h exit-basis low"
                 f" less than {_exit_room_desc()} below the 24h entry high, so"

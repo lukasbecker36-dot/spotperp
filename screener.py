@@ -331,10 +331,12 @@ def quote_reject_reason(
         return "index"
     if too_thin(row):
         return "depth"
-    # Entry (ask/ask) minus close (bid/bid) is what crossing both books costs
-    # now. 170bps of it means the quotes are nowhere near each other.
+    # Entry (ask/ask) minus close (bid/bid) is the instant round trip; see
+    # config.SCREEN_MAX_SPREAD_COST_BPS / SCREEN_MIN_ROUNDTRIP_BPS.
     if row.spread_cost_bps > config.SCREEN_MAX_SPREAD_COST_BPS:
         return "spread"
+    if row.spread_cost_bps < config.SCREEN_MIN_ROUNDTRIP_BPS:
+        return "roundtrip"
     if _too_jittery(row):
         return "jitter"
     # perp_volume_24h is 0 when the ticker sweep has not landed yet; fail OPEN
@@ -358,6 +360,8 @@ def all_reject_reasons(
         out.append("depth")
     if row.spread_cost_bps > config.SCREEN_MAX_SPREAD_COST_BPS:
         out.append("spread")
+    if row.spread_cost_bps < config.SCREEN_MIN_ROUNDTRIP_BPS:
+        out.append("roundtrip")
     if _too_jittery(row):
         out.append("jitter")
     floor = config.SCREEN_FILL_MIN_VOLUME_USD if min_volume is None else min_volume
@@ -446,6 +450,10 @@ def rank_rows_by_fillability(rows: list[ScreenerRow]) -> list[ScreenerRow]:
         and not _too_jittery(r)
         and not _bad_index(r)
         and not no_exit_room(r)
+        # Crossing the books must not cost more than a typical edge (the
+        # +100 'spread' cap is deliberately not applied here: blowouts can be
+        # worked).
+        and r.spread_cost_bps >= config.SCREEN_MIN_ROUNDTRIP_BPS
         # Enterable RIGHT NOW. Dwell says a name is reliably workable, but a
         # row you cannot act on today is a watchlist entry, not a candidate.
         and r.entry_bps_avg >= float(config.ENTRY_MIN_EDGE_FLOOR_BPS)

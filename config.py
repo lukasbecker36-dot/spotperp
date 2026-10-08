@@ -185,14 +185,23 @@ SCREEN_FILL_FLAG_LO_BPS = float(os.environ.get("SCREEN_FILL_FLAG_LO_BPS", "25"))
 SCREEN_FILL_MIN_FUNDING_BPS = float(
     os.environ.get("SCREEN_FILL_MIN_FUNDING_BPS", "0")
 )
-# A quoted basis is only believable if the two books are close enough together
-# to transact against. spread_cost_bps = entry_bps - close_bps is exactly what
-# crossing both books costs right now, so a huge value means the quotes are far
-# apart and NEITHER side is a real price: ARGUSUSDT printed a 250bps entry on a
-# $4 book. This is the "clear error" gate — a magnitude cap on the basis itself
-# would also throw away the genuinely rich names, which is the whole edge.
+# spread_cost_bps = entry_bps - close_bps is the INSTANT ROUND TRIP: enter
+# (perp ask vs spot ask) and exit (perp bid vs spot bid) on today's books,
+# before fees. It works out to perp spread - spot spread: the perp spread is
+# earned (maker on both sides), the spot spread paid (taker on both sides).
+#
+# Above SCREEN_MAX_SPREAD_COST_BPS the perp book is so wide the quote is
+# probably not real (ARGUSUSDT printed a 250bps entry on a $4 book) — though
+# some blowouts are tradeable, so this stays loose. Hidden as 'spread'.
 SCREEN_MAX_SPREAD_COST_BPS = float(
     os.environ.get("SCREEN_MAX_SPREAD_COST_BPS", "100")
+)
+# Below SCREEN_MIN_ROUNDTRIP_BPS crossing the books costs more than a typical
+# edge: the basis must converge that far just to break even. UPUSDT: entry
+# -24.0, exit +74.3, round trip -98 — a 108bps spot spread the +100 check can
+# never see, since a wide SPOT book makes the number negative. 'roundtrip'.
+SCREEN_MIN_ROUNDTRIP_BPS = float(
+    os.environ.get("SCREEN_MIN_ROUNDTRIP_BPS", "-50")
 )
 # Holding period the /funding score assumes. The carry is a stream and the
 # basis is a one-off, so they are only comparable over a stated horizon; 24h

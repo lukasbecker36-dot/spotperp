@@ -890,3 +890,19 @@ def test_depth_check_uses_five_levels_once_known(monkeypatch):
     deep_touch = _quote_row("Y", 40.0, 35.0, depth=500.0)
     deep_touch.mexc_ask_depth_usd = 30.0            # five levels can't hedge a clip
     assert screener.too_thin(deep_touch)
+
+
+def test_roundtrip_check_catches_a_wide_spot_book(monkeypatch):
+    """UPUSDT: entry -24.0, exit +74.3 -> instant round trip -98, from a
+    108bps spot spread the +100 cap can never see."""
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 0.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_SPREAD_COST_BPS", 100.0)
+    monkeypatch.setattr(config, "SCREEN_MIN_ROUNDTRIP_BPS", -50.0)
+    up = _quote_row("UP", -24.0, 74.3, depth=500.0)
+    assert up.spread_cost_bps < -98
+    assert screener.quote_reject_reason(up, min_volume=0) == "roundtrip"
+    assert "roundtrip" in screener.all_reject_reasons(up, min_volume=0)
+    normal = _quote_row("OK", 40.0, 30.0, depth=500.0)        # -> +10
+    assert screener.quote_reject_reason(normal, min_volume=0) is None
+    blowout = _quote_row("BLOW", 250.0, 60.0, depth=500.0)    # +190, kept as 'spread'
+    assert screener.quote_reject_reason(blowout, min_volume=0) == "spread"
