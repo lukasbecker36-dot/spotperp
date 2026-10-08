@@ -376,3 +376,11 @@ def test_funding_all_ranks_by_24h_funding_and_tags_hidden(tmp_path, monkeypatch)
     assert body[3].rstrip().endswith("vol") and body[4].rstrip().endswith("book")
     assert "hidden as unworkable" not in out
     assert "THINUSDT" not in control_bot.ControlBot._cmd_funding(_bot(), [])
+
+
+def test_bps_col_keeps_a_gap_and_caps_nonsense():
+    assert control_bot._bps_col(-105.7, 7) == " -105.7"
+    assert control_bot._bps_col(41928.7, 7) == "  >9999"
+    assert control_bot._bps_col(-1234.5, 7) == "  -1234"
+    assert control_bot._bps_col(12.3, 8, mark="?") == "     12?"
+    assert control_bot._bps_col(None, 6) == "     -"

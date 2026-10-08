@@ -335,6 +335,27 @@ def quote_reject_reason(
     return None
 
 
+def all_reject_reasons(
+    row: ScreenerRow, min_volume: float | None = None,
+) -> list[str]:
+    """EVERY check quote_reject_reason applies that this row fails, in the
+    same order — not just the first. /funding all shows them all, so a name
+    that is both thin and a discount does not read as merely thin."""
+    out = []
+    if _bad_index(row):
+        out.append("index")
+    if row.max_notional_usd < config.SCREEN_MIN_DEPTH_USD:
+        out.append("depth")
+    if row.spread_cost_bps > config.SCREEN_MAX_SPREAD_COST_BPS:
+        out.append("spread")
+    if _too_jittery(row):
+        out.append("jitter")
+    floor = config.SCREEN_FILL_MIN_VOLUME_USD if min_volume is None else min_volume
+    if row.perp_volume_24h and row.perp_volume_24h < floor:
+        out.append("volume")
+    return out
+
+
 def rank_rows_by_dislocation(rows: list[ScreenerRow]) -> list[ScreenerRow]:
     """Rank by how far the 5m entry basis sits ABOVE the pair's own 24h mean.
 

@@ -867,3 +867,13 @@ def test_quote_reject_takes_its_own_volume_floor(monkeypatch):
     r = _quote_row("X", 40.0, 35.0, depth=500.0, volume=200_000.0)
     assert screener.quote_reject_reason(r) == "volume"
     assert screener.quote_reject_reason(r, min_volume=150_000.0) is None
+
+
+def test_all_reject_reasons_lists_every_failure(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 5.0)
+    monkeypatch.setattr(config, "SCREEN_MAX_SPREAD_COST_BPS", 100.0)
+    r = _quote_row("ZCAT", 250.0, 60.0, depth=1.0, volume=20_000.0)
+    assert screener.all_reject_reasons(r, min_volume=150_000) == [
+        "depth", "spread", "volume",
+    ]
+    assert screener.quote_reject_reason(r, min_volume=150_000) == "depth"

@@ -142,6 +142,24 @@ def _exit_room_desc() -> str:
             f" {config.SCREEN_MIN_EXIT_ROOM_PCT:.0f}% of hi24 if larger)")
 
 
+def _bps_col(v: float | None, width: int, mark: str = "") -> str:
+    """A basis figure right-aligned in `width`, always leaving a gap before
+    it: one decimal normally, none from 1,000bps, and '>9999' / '<-9999'
+    beyond that — AIUSDT's 41,928 is a mis-mapped pair, not a number to read.
+    `mark` ('?' for thin history) drops the decimal to make room."""
+    if v is None:
+        return f"{'-':>{width}}"
+    if v >= 10_000:
+        s = ">9999"
+    elif v <= -10_000:
+        s = "<-9999"
+    elif mark or abs(v) >= 1_000:
+        s = f"{v:.0f}{mark}"
+    else:
+        s = f"{v:.1f}"
+    return f"{s:>{width}}"
+
+
 # /funding all: short tag for why the main board hides a row.
 _HIDDEN_TAG = {
     "volume": "vol", "discount": "disc", "exit": "exit", "depth": "depth",
@@ -902,7 +920,7 @@ class ControlBot:
         # makes the settlement interval stop mattering for comparison. 'next'
         # still says when the cash lands, and /book has the interval.
         hdr = (f"{'symbol':<11}{'score':>6}{'24h':>7}{'fund':>7}"
-               f"{'next':>5}{'entry':>6}{'lo24':>7}{'hi24':>7}{'jit':>5}"
+               f"{'next':>5}{'entry':>7}{'lo24':>8}{'hi24':>8}{'jit':>5}"
                f"{'vol':>6}{'depth$':>7}" + (f" {'hid':<5}" if all_mode else ""))
         sep = "-" * len(hdr)
         title = (
@@ -920,7 +938,7 @@ class ControlBot:
         floor = float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
         for r in rows:
             ev = avg(r, "entry_bps_avg", "entry_bps")
-            entry = f"{ev:>6.1f}" if ev is not None else f"{'-':>6}"
+            entry = _bps_col(ev, 7)
             jv = r.get("entry_bps_jitter")
             jit = (f"{jv:>5.1f}" if jv is not None and r.get("samples", 0) >= 3
                    else f"{'-':>5}")
@@ -937,12 +955,10 @@ class ControlBot:
             thin = hrs24 < config.SCREEN_DIFF_MIN_HOURS
 
             def rng(v, w):
-                if v is None:
-                    return f"{'-':>{w}}"
-                return f"{f'{v:.0f}?':>{w}}" if thin else f"{v:>{w}.1f}"
+                return _bps_col(v, w, mark="?" if thin else "")
 
-            lo24 = rng(r.get("basis_p10_24h"), 7)
-            hi24 = rng(r.get("basis_p90_24h"), 7)
+            lo24 = rng(r.get("basis_p10_24h"), 8)
+            hi24 = rng(r.get("basis_p90_24h"), 8)
             sc = r.get("score")
             # The score subtracts jit, but jit needs 3 samples to exist. After
             # a restart every row scores with a zero haircut, which flatters
@@ -958,8 +974,11 @@ class ControlBot:
                 f"{_hourly(r['avg_24h_8h_bps']):>7.2f}"
                 f"{_hourly(r['current_8h_bps']):>7.2f}{nxt}"
                 f"{entry}{lo24}{hi24}{jit}{volume}{depth}"
-                + (f" {_HIDDEN_TAG.get(r.get('hidden'), r.get('hidden') or ''):<5}"
-                   if all_mode else "")
+                + (" " + ",".join(
+                    _HIDDEN_TAG.get(h, h)
+                    for h in (r.get("hidden_all")
+                              or ([r["hidden"]] if r.get("hidden") else []))
+                ) if all_mode else "")
             )
         lines.append(sep)
         lines.append(
@@ -1021,8 +1040,12 @@ class ControlBot:
                 f" ${config.SCREEN_MIN_DEPTH_USD:.0f}, sprd = books"
                 f" >{config.SCREEN_MAX_SPREAD_COST_BPS:.0f}bps apart, index ="
                 " Aster index disagrees with MEXC (likely not the same asset),"
-                " jit = basis flickers, book = no live quote. Blank = it is on"
-                " /funding. Check /book before entering a hidden name."
+                " jit = basis flickers, book = no live quote. Every failing"
+                " check is listed (the board's counts use the first only)."
+                " Blank = it is on /funding. depth is the TOUCH: the smallest"
+                " of the four best-price sizes (Aster and MEXC, bid and ask) —"
+                " not the 5-level depth$. Check /book before entering a hidden"
+                " name."
             )
             return "\n".join(lines)
         hid = snap.get("hidden") or {}

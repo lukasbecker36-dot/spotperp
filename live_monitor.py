@@ -826,6 +826,21 @@ class Engine:
                 )
                 near[band] = near.get(band, 0) + 1
             reject = reject or later
+            # Every failing check, for /funding all (the counts above keep
+            # first-reason-only so they still add up to the names hidden).
+            if screen is None:
+                reasons = ["book"]
+            else:
+                reasons = screener.all_reject_reasons(
+                    screen, min_volume=config.FUNDING_MIN_VOLUME_USD
+                )
+                entry_now = (
+                    screen.entry_bps_avg if screen.samples else screen.entry_bps
+                )
+                if entry_now < config.FUNDING_MIN_ENTRY_BPS:
+                    reasons.append("discount")
+                if screener.no_exit_room(screen):
+                    reasons.append("exit")
             row = {
                 "symbol": sym,
                 "interval_hours": stat.interval_hours,
@@ -834,6 +849,7 @@ class Engine:
                 "realized_24h_bps": stat.realized_24h_bps,
                 "next_funding_h": next_funding_h,
                 "hidden": reject,
+                "hidden_all": reasons if reject else [],
             }
             if screen is not None:
                 row.update(self._funding_screen_fields(

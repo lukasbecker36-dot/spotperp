@@ -2747,3 +2747,24 @@ async def test_funding_all_lists_hidden_names_with_their_reason(
         ("BTCUSDT", "volume")
     ]
     assert snap["all_rows"][0]["entry_bps"] is not None    # full columns kept
+
+
+async def test_funding_all_carries_every_hidden_reason(engine, monkeypatch, tmp_path):
+    import funding as funding_mod
+    import json
+    monkeypatch.setattr(config, "FUNDING_SNAPSHOT_FILE", tmp_path / "fnd.json")
+    monkeypatch.setattr(config, "FUNDING_MIN_VOLUME_USD", 300_000.0)
+    engine._basis_avg = screener.RollingBasis(config.SCREEN_AVG_WINDOW_SECONDS)
+    engine._basis_24h = screener.DailyBasis()
+    engine.md.funding_stats["BTCUSDT"] = funding_mod.summarize(
+        "BTCUSDT", [], None, now_ms=0
+    )
+    # Perp below spot (discount) AND thin volume.
+    set_books(engine.md, "99.4", "99.5", "99.9", "100.0")
+    engine.md.perp_volume = {"BTCUSDT": {"quote_volume": 20_000, "trades": 90}}
+    engine._write_funding_snapshot()
+    snap = json.loads((tmp_path / "fnd.json").read_text())
+    row = snap["all_rows"][0]
+    assert row["hidden"] == "volume"
+    assert row["hidden_all"] == ["volume", "discount"]
+    assert snap["hidden"] == {"volume": 1}          # counts stay first-reason
