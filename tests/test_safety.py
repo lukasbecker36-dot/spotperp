@@ -98,6 +98,8 @@ def engine(tmp_path, monkeypatch):
     eng._depth_watch_fill = set()
     eng._depth_watch_funding = set()
     eng._depth_watch_candidates = set()
+    eng._depth_fetched_at = {}
+    eng._depth_paused_until = 0.0
     eng._board_rows = {}
     eng._last_score_record = 0.0
     eng._score_alerts = score_alerts.AlertState()
@@ -2792,3 +2794,37 @@ async def test_depth_only_failures_are_fetched_for_five_level_depth(engine, monk
     finally:
         (config.OUTPUT_DIR / "_t_snap.json").unlink(missing_ok=True)
     assert engine._depth_watch_candidates == {"BTCUSDT"}
+
+
+async def test_depth_sweep_paces_candidates_and_backs_off_on_403(engine, monkeypatch):
+    from exchange_client import ExchangeError
+    monkeypatch.setattr(config, "SCREEN_DEPTH_PAUSE_SECONDS", 0.0)
+    calls = []
+
+    async def depth(symbol, limit=20):
+        calls.append(symbol)
+        return {"asks": [["1", "10"]] * 5}
+    engine.mexc.depth = depth
+    engine._depth_watch_funding = {"BOARD"}
+    engine._depth_watch_candidates = {"CAND"}
+    await engine._refresh_ask_depth()
+    assert sorted(calls) == ["BOARD", "CAND"]
+    assert engine.md.mexc_ask_depth == {"BOARD": 50.0, "CAND": 50.0}
+
+    # Board names refresh on the short cadence, candidates on the long one.
+    monkeypatch.setattr(config, "SCREEN_DEPTH_BOARD_SECONDS", 0.0)
+    calls.clear()
+    await engine._refresh_ask_depth()
+    assert calls == ["BOARD"]
+
+    # A CDN 403 stops the sweep and pauses it; nothing is fetched meanwhile.
+    async def blocked(symbol, limit=20):
+        calls.append(symbol)
+        raise ExchangeError("mexc", "non-JSON response (HTTP 403): <HTML>")
+    engine.mexc.depth = blocked
+    await engine._refresh_ask_depth()
+    assert engine._depth_paused_until > 0
+    calls.clear()
+    await engine._refresh_ask_depth()
+    assert calls == []
+    assert engine.md.mexc_ask_depth["BOARD"] == 50.0      # last value kept

@@ -76,6 +76,22 @@ SCREEN_MIN_DEPTH5_USD = float(os.environ.get("SCREEN_MIN_DEPTH5_USD", "50"))
 # Most names fetched for 5-level depth per scan (one REST call each): the
 # boards' rows plus every name that passes the other checks, by volume.
 SCREEN_DEPTH_WATCH_MAX = int(os.environ.get("SCREEN_DEPTH_WATCH_MAX", "150"))
+# Pacing for that fetch, which runs in its own loop (never inside the 15s
+# scan). MEXC's CDN (Akamai) bans an IP for BURSTS well inside the documented
+# API limits, and a ban takes the whole MEXC leg down — balances, hedges,
+# exit sales. Board names refresh every SCREEN_DEPTH_BOARD_SECONDS, near-miss
+# candidates every SCREEN_DEPTH_CANDIDATE_SECONDS; requests go out
+# SCREEN_DEPTH_BATCH at a time with SCREEN_DEPTH_PAUSE_SECONDS between. A 403
+# (CDN block) stops the sweep for SCREEN_DEPTH_BACKOFF_SECONDS.
+SCREEN_DEPTH_BOARD_SECONDS = float(os.environ.get("SCREEN_DEPTH_BOARD_SECONDS", "15"))
+SCREEN_DEPTH_CANDIDATE_SECONDS = float(
+    os.environ.get("SCREEN_DEPTH_CANDIDATE_SECONDS", "90")
+)
+SCREEN_DEPTH_BATCH = int(os.environ.get("SCREEN_DEPTH_BATCH", "3"))
+SCREEN_DEPTH_PAUSE_SECONDS = float(os.environ.get("SCREEN_DEPTH_PAUSE_SECONDS", "0.5"))
+SCREEN_DEPTH_BACKOFF_SECONDS = float(
+    os.environ.get("SCREEN_DEPTH_BACKOFF_SECONDS", "900")
+)
 BASIS_LOG_SECONDS = 60.0                 # touch-basis CSV sampling cadence
 # /screen reports a time-windowed mean of entry/net basis (sampled once per
 # slow scan) so a persistent edge is distinguishable from a one-tick blip, and

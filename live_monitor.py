@@ -153,6 +153,8 @@ class Engine:
         # Names passing every check but depth: fetched so the depth check can
         # use their 5-level figure rather than the touch.
         self._depth_watch_candidates: set[str] = set()
+        self._depth_fetched_at: dict[str, float] = {}   # mexc symbol -> monotonic
+        self._depth_paused_until = 0.0
         # Each board's current rows in score_history shape, for recording and
         # the /alert check; and the alert episode state.
         self._board_rows: dict[str, list[dict]] = {}
@@ -265,6 +267,7 @@ class Engine:
             self._command_loop(),
             self._safety_loop(),
             self._funding_loop(),
+            self._depth_loop(),
         )
 
     async def _load_symbol_maps(self, *, initial: bool = False) -> tuple[list[str], list[str]]:
@@ -381,10 +384,6 @@ class Engine:
             await self._sample_equity()
         except Exception:
             log.exception("slow scan: equity snapshot failed")
-        try:
-            await self._refresh_ask_depth()
-        except Exception:
-            log.exception("slow scan: MEXC ask depth refresh failed")
         for label, fn in (
             ("screener snapshot", self._write_screener_snapshot),
             ("funding snapshot", self._write_funding_snapshot),
@@ -501,31 +500,79 @@ class Engine:
             eq.spot_coins_usd, eq.spot_usdt_usd, eq.total_usd,
         )
 
+    async def _depth_loop(self) -> None:
+        """Keep 5-level MEXC ask depth fresh, on its own cadence — so neither
+        the 15s scan nor the book refresh waits on ~100 REST calls."""
+        while True:
+            try:
+                await self._refresh_ask_depth()
+            except Exception:
+                log.exception("MEXC ask depth refresh failed")
+            await asyncio.sleep(1.0)
+
     async def _refresh_ask_depth(self) -> None:
         """Sum the first SCREEN_DEPTH_LEVELS MEXC asks for the names on the
-        last /screen fill and /funding boards. The touch alone understates a
-        book that is thin at the top but stacked a tick behind it. Symbols that
-        left the boards are dropped; a failed fetch keeps the previous value."""
-        watch = sorted(
-            self._depth_watch_fill | self._depth_watch_funding
-            | self._depth_watch_candidates
-        )
+        /screen fill and /funding boards (every SCREEN_DEPTH_BOARD_SECONDS)
+        and for near-miss candidates (every SCREEN_DEPTH_CANDIDATE_SECONDS),
+        paced in small batches. Symbols no longer watched are dropped; a
+        failed fetch keeps the previous value. A 403 is MEXC's CDN blocking
+        this IP: stop and back off rather than prolong the ban."""
+        now = time.monotonic()
+        if now < self._depth_paused_until:
+            return
+        board = self._depth_watch_fill | self._depth_watch_funding
+        cands = self._depth_watch_candidates - board
+        watch = board | cands
+        due = [
+            s for s in sorted(watch)
+            if now - self._depth_fetched_at.get(s, float("-inf")) >= (
+                config.SCREEN_DEPTH_BOARD_SECONDS if s in board
+                else config.SCREEN_DEPTH_CANDIDATE_SECONDS
+            )
+        ]
         levels = config.SCREEN_DEPTH_LEVELS
-        cache = {s: v for s, v in self.md.mexc_ask_depth.items() if s in watch}
-        batch = max(1, config.FUNDING_FETCH_BATCH)
-        for i in range(0, len(watch), batch):
-            chunk = watch[i : i + batch]
+        self.md.mexc_ask_depth = {
+            s: v for s, v in self.md.mexc_ask_depth.items() if s in watch
+        }
+        for s in [s for s in self._depth_fetched_at if s not in watch]:
+            del self._depth_fetched_at[s]
+        batch = max(1, config.SCREEN_DEPTH_BATCH)
+        for i in range(0, len(due), batch):
+            if i:
+                await asyncio.sleep(config.SCREEN_DEPTH_PAUSE_SECONDS)
+            chunk = due[i : i + batch]
             books = await asyncio.gather(
                 *(self.mexc.depth(s, limit=levels) for s in chunk),
                 return_exceptions=True,
             )
+            blocked = False
             for sym, book in zip(chunk, books):
-                if isinstance(book, Exception) or not isinstance(book, dict):
+                if isinstance(book, Exception):
+                    if "HTTP 403" in str(book):
+                        blocked = True
                     continue
-                cache[sym] = sum(
-                    float(p) * float(q) for p, q, *_ in (book.get("asks") or [])[:levels]
+                if not isinstance(book, dict):
+                    continue
+                self._depth_fetched_at[sym] = time.monotonic()
+                self.md.mexc_ask_depth[sym] = sum(
+                    float(p) * float(q)
+                    for p, q, *_ in (book.get("asks") or [])[:levels]
                 )
-        self.md.mexc_ask_depth = cache
+            if blocked:
+                self._depth_paused_until = (
+                    time.monotonic() + config.SCREEN_DEPTH_BACKOFF_SECONDS
+                )
+                log.warning(
+                    "MEXC returned 403 (CDN block) on depth — pausing the"
+                    " depth sweep for %.0fs", config.SCREEN_DEPTH_BACKOFF_SECONDS,
+                )
+                journal(
+                    self.conn,
+                    "MEXC 403 (CDN block) on depth sweep — paused for"
+                    f" {config.SCREEN_DEPTH_BACKOFF_SECONDS:.0f}s",
+                    "WARNING",
+                )
+                return
 
     async def _refresh_books(self) -> None:
         aster_books, mexc_books = await asyncio.gather(
