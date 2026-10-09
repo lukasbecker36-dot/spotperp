@@ -2675,7 +2675,7 @@ def _fill_board(engine, symbol="BTCUSDT", score=42.0):
     engine._board_rows = {"fill": [{
         "symbol": symbol, "score": score, "entry_bps": 50.0, "lo24_bps": 5.0,
         "hi24_bps": 80.0, "funding_8h_bps": 1.6, "volume_24h": 1_200_000,
-        "depth_usd": 900.0,
+        "depth_usd": 900.0, "jitter_bps": 3.0,
     }]}
 
 
@@ -2828,3 +2828,15 @@ async def test_depth_sweep_paces_candidates_and_backs_off_on_403(engine, monkeyp
     await engine._refresh_ask_depth()
     assert calls == []
     assert engine.md.mexc_ask_depth["BOARD"] == 50.0      # last value kept
+
+
+async def test_autoenter_skips_a_jumpy_basis(engine, monkeypatch):
+    monkeypatch.setattr(config, "AUTO_ENTER_MAX_JITTER_BPS", 10.0)
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    database.set_setting(engine.conn, "auto_enter", {"funding": 300})
+    out = engine._auto_enter("funding", "BTCUSDT", {"jitter_bps": 24.5})
+    assert "jit 24.5 > 10" in out and engine.positions.active() == []
+    out = engine._auto_enter("funding", "BTCUSDT", {"jitter_bps": None})
+    assert "not measurable" in out and engine.positions.active() == []
+    out = engine._auto_enter("funding", "BTCUSDT", {"jitter_bps": 5.1})
+    assert out.startswith("🤖 auto-entry #")

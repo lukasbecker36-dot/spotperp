@@ -428,12 +428,14 @@ class Engine:
                     ts, board, row["symbol"], float(row["score"]), float(level)
                 ):
                     msg = score_alerts.format_alert(board, row, float(level))
-                    entered = self._auto_enter(board, row["symbol"])
+                    entered = self._auto_enter(board, row["symbol"], row)
                     if entered:
                         msg += "\n" + entered
                     await self.notifier.alert(msg)
 
-    def _auto_enter(self, board: str, symbol: str) -> str | None:
+    def _auto_enter(
+        self, board: str, symbol: str, row: dict | None = None,
+    ) -> str | None:
         """Start an /autoenter entry for a name whose score alert just fired.
         Returns a line for the alert message, or None when auto-entry is off
         for this board. Every skip says why, so a quiet bot is explainable."""
@@ -445,6 +447,15 @@ class Engine:
         held = [p for p in self.positions.active() if p.symbol == symbol]
         if held:
             return f"🤖 auto-entry skipped: already holding #{held[0].id}"
+        cap = config.AUTO_ENTER_MAX_JITTER_BPS
+        if cap is not None and row is not None:
+            jit = row.get("jitter_bps")
+            if jit is None:
+                return ("🤖 auto-entry skipped: jit not measurable yet (too few"
+                        " samples)")
+            if jit > cap:
+                return (f"🤖 auto-entry skipped: jit {jit:.1f} > {cap:g} — basis"
+                        " too jumpy to work a resting order")
         open_auto = [p for p in self.positions.active() if p.auto_entered]
         if len(open_auto) >= config.AUTO_ENTER_MAX_OPEN:
             return (f"🤖 auto-entry skipped: {len(open_auto)} auto positions open"
@@ -743,6 +754,7 @@ class Engine:
         self._board_rows["fill"] = [
             {
                 "symbol": r.symbol, "score": screener.fill_score(r),
+                "jitter_bps": r.entry_bps_jitter if r.samples >= 3 else None,
                 "entry_bps": r.entry_bps_avg, "lo24_bps": r.basis_p10_24h,
                 "hi24_bps": r.basis_p90_24h, "funding_8h_bps": r.funding_8h_bps,
                 "volume_24h": r.perp_volume_24h,
@@ -944,6 +956,8 @@ class Engine:
         self._board_rows["funding"] = [
             {
                 "symbol": r["symbol"], "score": r["score"],
+                "jitter_bps": (r["entry_bps_jitter"] if r["samples"] >= 3
+                               else None),
                 "entry_bps": (r["entry_bps_avg"] if r["samples"]
                               else r["entry_bps"]),
                 "lo24_bps": r["basis_p10_24h"], "hi24_bps": r["basis_p90_24h"],

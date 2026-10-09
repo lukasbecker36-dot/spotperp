@@ -143,6 +143,6 @@ def format_alert(board: str, row: dict, level: float) -> str:
         f"  hi24 {num('hi24_bps', '.1f')}  fund"
         f" {num('funding_8h_bps', '+.2f', 1 / 8)}bps/h\n"
         f"vol {fmt_volume(vol) if vol else '-'}"
-        f"  depth$ {num('depth_usd', ',.0f')}\n"
+        f"  depth$ {num('depth_usd', ',.0f')}  jit {num('jitter_bps', '.1f')}\n"
         f"/book {row['symbol']} before entering"
     )

@@ -781,8 +781,10 @@ class ControlBot:
         fires for a name (one entry per alert episode), within the caps."""
         auto = dict(database.get_setting(self._conn, "auto_enter", {}) or {})
         alerts = database.get_setting(self._conn, "score_alert", {}) or {}
+        jcap = config.AUTO_ENTER_MAX_JITTER_BPS
         caps = (
-            f"limits: {config.AUTO_ENTER_MAX_OPEN} open auto positions,"
+            (f"only names with jit ≤ {jcap:g}; " if jcap is not None else "")
+            + f"limits: {config.AUTO_ENTER_MAX_OPEN} open auto positions,"
             f" {config.AUTO_ENTER_MAX_PER_DAY} entries per 24h,"
             f" {config.AUTO_ENTER_SYMBOL_COOLDOWN_HOURS:g}h per-symbol cooldown,"
             " never into a symbol already held."

@@ -158,6 +158,14 @@ SCORE_ALERT_LOOKBACK_DAYS = float(os.environ.get("SCORE_ALERT_LOOKBACK_DAYS", "7
 # alerts say: open auto-entered positions, auto entries per rolling 24h, and
 # a per-symbol cooldown since its last auto entry. A symbol already held is
 # never auto-entered (no auto size-ups).
+# Auto-entry only fires on a basis steady enough to work a resting order:
+# 5m jitter at or under this (the boards' own cap, SCREEN_MAX_BASIS_JITTER_BPS,
+# is looser so a human can still look at a flickery name). USUSDT auto-fired
+# at jit 24.5 — under the board's 25 but untradeable; names that fill well sit
+# in single digits. A name with too few samples to measure jit is skipped.
+# Empty/"off" disables the check.
+_aj = os.environ.get("AUTO_ENTER_MAX_JITTER_BPS", "10").strip().lower()
+AUTO_ENTER_MAX_JITTER_BPS = None if _aj in ("", "off", "none") else float(_aj)
 AUTO_ENTER_MAX_OPEN = int(os.environ.get("AUTO_ENTER_MAX_OPEN", "3"))
 AUTO_ENTER_MAX_PER_DAY = int(os.environ.get("AUTO_ENTER_MAX_PER_DAY", "6"))
 AUTO_ENTER_SYMBOL_COOLDOWN_HOURS = float(
