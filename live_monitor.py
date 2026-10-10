@@ -893,6 +893,9 @@ class Engine:
             # volume reject passed index/depth/spread/jitter; run the board's
             # own gates too, to know whether it is a genuine near miss.
             later = None
+            # /funding is the carry board: credit the funding expected over
+            # the score's hold to the exit-room check (see no_exit_room_of).
+            carry = screener.carry_over_hold_bps(stat.avg_24h_8h_bps, current_8h)
             if reject in (None, "volume"):
                 entry_now = (
                     screen.entry_bps_avg if screen.samples
@@ -902,7 +905,7 @@ class Engine:
                 # hidden for a number the reader cannot see.
                 if entry_now < config.FUNDING_MIN_ENTRY_BPS:
                     later = "discount"
-                elif screener.no_exit_room(screen):
+                elif screener.no_exit_room(screen, carry):
                     later = "exit"
             if reject == "volume" and later is None:
                 band = screener.volume_band(
@@ -923,7 +926,7 @@ class Engine:
                 )
                 if entry_now < config.FUNDING_MIN_ENTRY_BPS:
                     reasons.append("discount")
-                if screener.no_exit_room(screen):
+                if screener.no_exit_room(screen, carry):
                     reasons.append("exit")
             row = {
                 "symbol": sym,

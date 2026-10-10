@@ -906,3 +906,18 @@ def test_roundtrip_check_catches_a_wide_spot_book(monkeypatch):
     assert screener.quote_reject_reason(normal, min_volume=0) is None
     blowout = _quote_row("BLOW", 250.0, 60.0, depth=500.0)    # +190, kept as 'spread'
     assert screener.quote_reject_reason(blowout, min_volume=0) == "spread"
+
+
+def test_exit_room_credits_carry_on_the_funding_board(monkeypatch):
+    """USUSDT: best entry +36.0, best exit +25.1 — 10.9bps of basis room, but
+    ~34bps a day of funding to the short. Hidden on basis alone; shown once
+    the carry over the hold is counted."""
+    monkeypatch.setattr(config, "SCREEN_MIN_EXIT_ROOM_BPS", 25.0)
+    monkeypatch.setattr(config, "SCREEN_MIN_EXIT_ROOM_PCT", 10.0)
+    monkeypatch.setattr(config, "FUNDING_SCORE_HOLD_HOURS", 24.0)
+    us = _range_row(36.0, 25.1)
+    assert screener.no_exit_room(us)
+    carry = screener.carry_over_hold_bps(1.70 * 8, 1.41 * 8)   # min -> 1.41/h
+    assert abs(carry - 1.41 * 24) < 1e-9
+    assert not screener.no_exit_room(us, carry)
+    assert screener.no_exit_room(us, screener.carry_over_hold_bps(0.2 * 8, 0.2 * 8))

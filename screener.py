@@ -277,7 +277,7 @@ def _too_jittery(row: ScreenerRow) -> bool:
     )
 
 
-def no_exit_room(row: ScreenerRow) -> bool:
+def no_exit_room(row: ScreenerRow, carry_bps: float = 0.0) -> bool:
     """True when even the day's best exit barely beats the day's best entry:
     the 24h high of the entry basis is less than exit_room_needed() above the
     24h low of the exit basis.
@@ -289,7 +289,7 @@ def no_exit_room(row: ScreenerRow) -> bool:
     """
     if row.hours_24h < config.SCREEN_DIFF_MIN_HOURS or row.close_p10_24h is None:
         return False
-    return no_exit_room_of(row.close_p10_24h, row.basis_p90_24h)
+    return no_exit_room_of(row.close_p10_24h, row.basis_p90_24h, carry_bps)
 
 
 def exit_room_needed(entry_hi24_bps: float) -> float:
@@ -304,9 +304,24 @@ def exit_room_needed(entry_hi24_bps: float) -> float:
     return max(floor, abs(entry_hi24_bps) * config.SCREEN_MIN_EXIT_ROOM_PCT / 100.0)
 
 
-def no_exit_room_of(close_lo24_bps: float, entry_hi24_bps: float) -> bool:
-    """no_exit_room from plain numbers (history checks are the caller's)."""
-    return entry_hi24_bps - close_lo24_bps < exit_room_needed(entry_hi24_bps)
+def no_exit_room_of(
+    close_lo24_bps: float, entry_hi24_bps: float, carry_bps: float = 0.0,
+) -> bool:
+    """no_exit_room from plain numbers (history checks are the caller's).
+
+    carry_bps is funding expected over the hold, credited to the room: on
+    /funding a name whose spreads eat the basis round trip can still pay
+    through carry (USUSDT: 10.9bps of basis room + ~34bps/day of funding).
+    /screen fill passes 0 — it is about round trips, not carry."""
+    room = entry_hi24_bps - close_lo24_bps + carry_bps
+    return room < exit_room_needed(entry_hi24_bps)
+
+
+def carry_over_hold_bps(avg_8h_bps: float, current_8h_bps: float) -> float:
+    """Funding over FUNDING_SCORE_HOLD_HOURS at the conservative rate — the
+    lower of the 24h average and the latest — exactly as carry_score counts
+    it, so the board's score and its exit check agree."""
+    return min(avg_8h_bps, current_8h_bps) * config.FUNDING_SCORE_HOLD_HOURS / 8.0
 
 
 def quote_reject_reason(
