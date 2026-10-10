@@ -473,19 +473,26 @@ class Engine:
         if amount <= 0 or amount > config.MAX_NOTIONAL_PER_LEG_USD:
             return (f"🤖 auto-entry skipped: notional ${amount} outside"
                     f" (0, {config.MAX_NOTIONAL_PER_LEG_USD}]")
+        # /funding is the carry board: hold for the funding and leave the close
+        # to the operator (/exit, /auto). /screen fill is about round trips,
+        # so those auto-exit short of the 24h exit low.
+        kind = "carry" if board == "funding" else "convergence"
         pos = self.positions.create(
-            symbol, amount, paper=self.paper, trade_kind="convergence",
+            symbol, amount, paper=self.paper, trade_kind=kind,
         )
         self.positions.set_auto_entered(pos.id)
         self.executor.start_entry(self.positions.get(pos.id))
         journal(self.conn, f"position {pos.id}: AUTO-ENTER {symbol} ${amount}"
-                f" off the {board} score alert")
+                f" [{kind}] off the {board} score alert")
         mode = "PAPER" if self.paper else "LIVE"
         return (
             f"🤖 auto-entry #{pos.id} started ({mode}): ${amount} {symbol},"
             f" basis floor {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps;"
-            " auto-exits short of the 24h exit low (see /positions)."
-            f" /cancel {pos.id} to stop it"
+            + (f" CARRY — no auto-exit, close with /exit {pos.id} or arm"
+               f" /auto {pos.id}."
+               if kind == "carry" else
+               " auto-exits short of the 24h exit low (see /positions).")
+            + f" /cancel {pos.id} to stop it"
         )
 
     async def _sample_equity(self) -> None:

@@ -2857,3 +2857,18 @@ async def test_converged_never_crosses_taker_by_default(engine):
     pos = engine.positions.get(pos_id)
     assert pos.exit_mode == "passive"
     assert not any("taking profit" in m for m in engine.notifier.messages)
+
+
+async def test_funding_autoentry_opens_a_carry_trade(engine):
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    database.set_setting(engine.conn, "auto_enter", {"funding": 300, "fill": 200})
+    out = engine._auto_enter("funding", "BTCUSDT", {"jitter_bps": 3.0})
+    assert "CARRY — no auto-exit" in out
+    pos = engine.positions.active()[0]
+    assert pos.trade_kind == "carry" and pos.auto_entered
+    for p in engine.positions.active():
+        engine.positions.set_state(p.id, pm.CLOSED)
+    engine.md.pair_maps["ETHUSDT"] = engine.md.pair_maps["BTCUSDT"]
+    out = engine._auto_enter("fill", "ETHUSDT", {"jitter_bps": 3.0})
+    assert "auto-exits short of the 24h exit low" in out
+    assert [p.trade_kind for p in engine.positions.active()] == ["convergence"]

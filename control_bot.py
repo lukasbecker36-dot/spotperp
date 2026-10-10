@@ -792,9 +792,12 @@ class ControlBot:
         usage = (
             "usage: /autoenter fill 200 | /autoenter funding 150 |"
             " /autoenter fill off | /autoenter off\n"
-            "Starts a normal (non-carry) entry, same as /enter SYMBOL NOTIONAL,"
-            " when that board's /alert fires for a name. It auto-exits short of"
-            " the 24h exit low like any non-carry trade. " + caps
+            "Starts an entry when that board's /alert fires for a name."
+            " /screen fill entries are normal trades (same as /enter SYMBOL"
+            " NOTIONAL) that auto-exit short of the 24h exit low. /funding"
+            " entries are CARRY trades (as /enter SYMBOL NOTIONAL carry): no"
+            " auto-exit or max-hold, you close them with /exit or /auto. "
+            + caps
         )
         if args and args[0].lower() == "off" and len(args) == 1:
             database.set_setting(self._conn, "auto_enter", {})
