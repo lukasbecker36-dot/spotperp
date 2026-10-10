@@ -300,6 +300,15 @@ _low_pct = os.environ.get("CONVERGED_EXIT_LOW_PCT", "10").strip().lower()
 CONVERGED_EXIT_LOW_PCT: Decimal | None = (
     None if _low_pct in ("", "off", "none") else Decimal(_low_pct)
 )
+# Let the convergence auto-close CROSS both legs as taker when a taker close
+# looks profitable. OFF by default: the estimate prices the WHOLE position at
+# the touch with no margin, then sweeps both books in one go — USUSDT #274
+# estimated +$1.26, sold $1,108 at once, filled +7.7bps against -5.8 quoted
+# and realised -$3.34. Off, the auto-close always works the clipped passive
+# maker close at its target. "1" restores the old behaviour.
+CONVERGED_TAKER_TP = os.environ.get("CONVERGED_TAKER_TP", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 CONVERGED_PASSIVE_RESET_BPS = Decimal(
     os.environ.get("CONVERGED_PASSIVE_RESET_BPS", "5.0")
 )

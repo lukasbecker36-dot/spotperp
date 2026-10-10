@@ -1811,8 +1811,10 @@ class Engine:
         else:
             level = f"{float(config.CONVERGED_PASSIVE_BPS):.0f}bps"
         auto = (
-            f"auto-closes: passive maker at {level}, crosses if taker"
-            f" turns profitable, max-hold {config.MAX_HOLD_HOURS}h{adverse}"
+            f"auto-closes: passive maker at {level}"
+            + (", crosses if taker turns profitable" if config.CONVERGED_TAKER_TP
+               else "")
+            + f", max-hold {config.MAX_HOLD_HOURS}h{adverse}"
             if kind == "convergence"
             else f"CARRY: manual /exit only{adverse}"
         )
@@ -3274,7 +3276,11 @@ class Engine:
         target, low = self._convergence_target(pos)
         if (close is not None and close <= target
                 and pos.id not in self._liq_protect):
-            pnl = self._aggressive_close_pnl(pos)
+            # Taker-both-legs TP only when enabled (see CONVERGED_TAKER_TP).
+            pnl = (
+                self._aggressive_close_pnl(pos) if config.CONVERGED_TAKER_TP
+                else None
+            )
             if pnl is not None and pnl > 0:
                 # Taker-taker close is profitable now — but only cross once the
                 # condition has held for several sweeps, so a flickering quote
@@ -3321,8 +3327,9 @@ class Engine:
             await self.notifier.alert(
                 f"🎯 position {pos.id} {pos.symbol}: basis reached"
                 f" {float(close):.1f}bps — working a passive maker close at"
-                f" {float(target):+.1f}bps{why}; will cross if a taker close"
-                f" turns profitable)"
+                f" {float(target):+.1f}bps{why}"
+                + ("; will cross if a taker close turns profitable)"
+                   if config.CONVERGED_TAKER_TP else ")")
             )
             self._auto_passive.add(pos.id)
             # Exit requested before the cancel — see _ensure_stops.
@@ -3392,7 +3399,10 @@ class Engine:
                 f" {float(close):.1f}bps — passive close stood down, holding"
             )
             return
-        pnl = self._aggressive_close_pnl(pos)
+        pnl = (
+            self._aggressive_close_pnl(pos) if config.CONVERGED_TAKER_TP
+            else None
+        )
         if pnl is not None and pnl > 0:
             if not self._tp_confirmed(pos.id):
                 return          # same anti-flicker gate as the converged TP

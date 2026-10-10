@@ -161,7 +161,8 @@ async def test_no_stop_inside_widen_band(engine, monkeypatch):
     assert engine.notifier.messages[-1].startswith("✅")  # entry-open alert only
 
 
-async def test_converged_tp_fires_when_profitable(engine):
+async def test_converged_tp_fires_when_profitable(engine, monkeypatch):
+    monkeypatch.setattr(config, "CONVERGED_TAKER_TP", True)
     pos_id = await open_position(engine)
     # Basis inverted: aster 99.0/99.1 vs mexc 99.9/100.0 -> close ~-90bps.
     # Taker close: buy perp at 99.1 (entry 100.5), sell spot 99.9 (entry
@@ -178,9 +179,10 @@ async def test_converged_tp_fires_when_profitable(engine):
     assert any("taking profit" in m for m in engine.notifier.messages)
 
 
-async def test_converged_tp_not_fired_by_a_single_flicker(engine):
+async def test_converged_tp_not_fired_by_a_single_flicker(engine, monkeypatch):
     """A one-tick inverted quote surrounded by normal ones must NOT cross: the
     BULLA case fired on a -160bps print and filled at +27bps for a real loss."""
+    monkeypatch.setattr(config, "CONVERGED_TAKER_TP", True)
     pos_id = await open_position(engine)
     for _ in range(5):
         set_books(engine.md, "99.0", "99.1", "99.9", "100.0")   # flicker
@@ -195,6 +197,7 @@ async def test_converged_tp_waits_for_min_hold(engine, monkeypatch):
     """The convergence auto-close must not fire within the min-hold — right
     after entry a converged+profitable-looking basis is a spread artifact
     (CASHCAT). It fires once the position has been held long enough."""
+    monkeypatch.setattr(config, "CONVERGED_TAKER_TP", True)
     monkeypatch.setattr(config, "CONVERGENCE_MIN_HOLD_MINUTES", 15.0)
     pos_id = await open_position(engine)         # opened just now
     set_books(engine.md, "99.0", "99.1", "99.9", "100.0")  # converged + profitable
@@ -264,9 +267,10 @@ async def test_converged_starts_passive_when_taker_unprofitable(engine):
     assert any("passive maker close" in m for m in engine.notifier.messages)
 
 
-async def test_auto_passive_escalates_when_taker_turns_profitable(engine):
+async def test_auto_passive_escalates_when_taker_turns_profitable(engine, monkeypatch):
     """A convergence-auto passive exit crosses to a taker close once the basis
     runs negative enough that taker-taker is net positive."""
+    monkeypatch.setattr(config, "CONVERGED_TAKER_TP", True)
     pos_id = await open_position(engine)
     engine.positions.set_exit_request(pos_id, "passive", config.CONVERGED_PASSIVE_BPS)
     engine.positions.set_state(pos_id, pm.EXITING)
@@ -2840,3 +2844,16 @@ async def test_autoenter_skips_a_jumpy_basis(engine, monkeypatch):
     assert "not measurable" in out and engine.positions.active() == []
     out = engine._auto_enter("funding", "BTCUSDT", {"jitter_bps": 5.1})
     assert out.startswith("🤖 auto-entry #")
+
+async def test_converged_never_crosses_taker_by_default(engine):
+    """USUSDT #274: a touch-priced 'profitable' taker close swept $1,108 at
+    once and lost $3.34. By default the auto-close only works passive."""
+    assert config.CONVERGED_TAKER_TP is False
+    pos_id = await open_position(engine)
+    # Deeply inverted, tight book: the taker close WOULD estimate profitable.
+    set_books(engine.md, "99.0", "99.1", "99.9", "100.0")
+    for _ in range(config.CONVERGED_TP_CONFIRM_TICKS + 1):
+        await engine._check_safety(engine.positions.get(pos_id))
+    pos = engine.positions.get(pos_id)
+    assert pos.exit_mode == "passive"
+    assert not any("taking profit" in m for m in engine.notifier.messages)
