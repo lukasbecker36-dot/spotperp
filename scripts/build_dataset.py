@@ -246,9 +246,27 @@ def features_at(
         "carry_score": round(screener.carry_score_of(
             entry_avg, lo_entry, fund_avg, s.funding[i],
             float(trades) if trades != "" else 0.0), 2),
+        # Short-term mean reversion (/screen spike): the dislocation above the
+        # pair's own 24h norm, and what reverting to the norm exit is worth.
+        #   dataset_report.py dataset.csv --by spike_z --label norm
+        **_spike_cols(entry_avg, list(ent24), list(cls24)),
         # 1 when the board would hide it: the 24h exit low sits within
         # SCREEN_MIN_EXIT_ROOM_PCT of the 24h entry high.
         "no_exit_room": int(screener.no_exit_room_of(lo_close, hi_entry)),
+    }
+
+
+def _spike_cols(entry: float, ent24: list[float], cls24: list[float]) -> dict:
+    st = screener.spike_stats(entry, ent24, cls24)
+    if st is None:
+        return {k: "" for k in ("norm24_entry", "norm24_close", "spike_bps",
+                                "spike_z", "spike_edge_bps")}
+    return {
+        "norm24_entry": round(st["norm_entry_bps"], 2),
+        "norm24_close": round(st["norm_close_bps"], 2),
+        "spike_bps": round(st["spike_bps"], 2),
+        "spike_z": round(st["spike_z"], 2),
+        "spike_edge_bps": round(st["edge_bps"], 2),
     }
 
 
@@ -282,7 +300,9 @@ def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float,
     dq: deque[int] = deque()
     sustained = None
     funding_at_sustained = 0.0
-    hit_zero_ts = hit_target_ts = hit_profit_ts = None
+    hit_zero_ts = hit_target_ts = hit_profit_ts = hit_norm_ts = None
+    norm_close = feat.get("norm24_close")
+    norm_close = None if norm_close in ("", None) else float(norm_close)
     dwell_after = 0.0
     accrued = 0.0
     ts0 = s.ts[i]
@@ -313,6 +333,9 @@ def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float,
             hit_zero_ts = s.ts[k]
         if hit_target_ts is None and c <= target_close:
             hit_target_ts = s.ts[k]
+        # The spike exit: the close basis back at its 24h norm.
+        if hit_norm_ts is None and norm_close is not None and c <= norm_close:
+            hit_norm_ts = s.ts[k]
         # The label that matters: the first moment closing out actually pays,
         # basis plus funding, after costs. Unlike "reached lo24" it cannot be
         # satisfied trivially — a basis pinned at its own 24h low scores 100%
@@ -351,6 +374,8 @@ def outcomes(s: Series, i: int, feat: dict, horizons: list[int], floor: float,
             f"h{h}_reached_lo24": int(to_lo24 != ""),
             f"h{h}_hours_to_profit": to_profit,
             f"h{h}_reached_profit": int(to_profit != ""),
+            f"h{h}_hours_to_norm": _hours(hit_norm_ts, h),
+            f"h{h}_reached_norm": int(_hours(hit_norm_ts, h) != ""),
             f"h{h}_funding_bps": round(fund, 2),
             # What the round trip was worth if you had exited at the best
             # moment the horizon offered — an upper bound, nobody times that.

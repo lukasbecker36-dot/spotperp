@@ -71,10 +71,11 @@ def main() -> None:
                     help="which exit figure to report (default sustained: the"
                          " lowest level the basis actually HELD, rather than"
                          " its single lowest print)")
-    ap.add_argument("--label", choices=("profit", "lo24"), default="profit",
+    ap.add_argument("--label", choices=("profit", "lo24", "norm"), default="profit",
                     help="what counts as working: the trip became profitable"
-                         " after costs (default), or the close basis reached"
-                         " the lo24 target")
+                         " after costs (default), the close basis reached"
+                         " the lo24 target, or (norm) it reverted to its 24h"
+                         " norm — the /screen spike exit")
     args = ap.parse_args()
 
     rows = list(csv.DictReader(open(args.dataset)))
@@ -164,6 +165,13 @@ def main() -> None:
             " there. Use --label lo24 to score against the exit target"
             " instead — but note a basis pinned at its own 24h low satisfies"
             " that trivially while never being worth trading."
+        )
+    elif args.label == "norm":
+        print(
+            "reached = the close basis reverted to its own 24h norm (median of"
+            " the hourly exit basis) — the /screen spike exit. med hrs = how"
+            " long that took. Bucket by spike_z or spike_bps, and filter"
+            " --where spike_edge_bps=10: to rows the board would show."
         )
     else:
         print(

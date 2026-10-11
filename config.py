@@ -171,6 +171,24 @@ AUTO_ENTER_MAX_PER_DAY = int(os.environ.get("AUTO_ENTER_MAX_PER_DAY", "6"))
 AUTO_ENTER_SYMBOL_COOLDOWN_HOURS = float(
     os.environ.get("AUTO_ENTER_SYMBOL_COOLDOWN_HOURS", "24")
 )
+# ── /screen spike: short-term mean reversion ──
+# A name qualifies when its 5m entry basis sits well above its own 24h norm
+# (median of hourly means): at least SPIKE_MIN_BPS above it AND SPIKE_MIN_Z
+# robust deviations (MAD-scaled, the scale floored at SPIKE_MIN_SCALE_BPS),
+# and reverting to the norm EXIT basis is worth at least SPIKE_MIN_EDGE_BPS
+# after the cost floor. No dwell or funding requirement — a spike is brief by
+# nature; funding over the hold is charged as a cost in the score instead.
+# Calibrate from scripts/dataset_report.py --by spike_z --label norm.
+SPIKE_MIN_BPS = float(os.environ.get("SPIKE_MIN_BPS", "20"))
+SPIKE_MIN_Z = float(os.environ.get("SPIKE_MIN_Z", "2.5"))
+SPIKE_MIN_SCALE_BPS = float(os.environ.get("SPIKE_MIN_SCALE_BPS", "5"))
+SPIKE_MIN_EDGE_BPS = float(os.environ.get("SPIKE_MIN_EDGE_BPS", "10"))
+SPIKE_MIN_VOLUME_USD = float(os.environ.get("SPIKE_MIN_VOLUME_USD", "150000"))
+# Hours a spike trade is expected to take to revert — funding over it is
+# charged in the score — and the most it is held before a passive close at
+# any level is worked.
+SPIKE_HOLD_HOURS = float(os.environ.get("SPIKE_HOLD_HOURS", "6"))
+SPIKE_MAX_HOLD_HOURS = float(os.environ.get("SPIKE_MAX_HOLD_HOURS", "24"))
 SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
 # Reject a basis that jumps wildly tick to tick: a resting order can't be
 # worked against it, because the price you get is a lottery (BULLA printed

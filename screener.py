@@ -794,3 +794,51 @@ def volume_band(volume: float, floor: float) -> tuple[float, float]:
         if lo <= volume < hi:
             return lo, hi
     return edges[-2], edges[-1]
+
+
+# ── spike (short-term mean reversion) ──
+
+def median_mad(values: list[float]) -> tuple[float, float]:
+    """(median, median absolute deviation) — a norm and a spread that one
+    odd hour cannot drag around the way a mean and std can."""
+    if not values:
+        return 0.0, 0.0
+    med = _percentile(values, 50)
+    return med, _percentile([abs(v - med) for v in values], 50)
+
+
+def spike_stats(
+    entry_bps: float, entry_hourly: list[float], close_hourly: list[float],
+) -> dict | None:
+    """How far the entry basis sits above its own recent NORM, and what
+    reverting to that norm would be worth.
+
+      norm_entry   median of the hourly mean entry basis (24h)
+      spike_bps    entry - norm_entry: the dislocation
+      spike_z      spike_bps / (1.4826 x MAD): the same in units of how much
+                   this pair normally moves, so +30 on a steady name means
+                   more than +30 on a noisy one
+      norm_close   median of the hourly mean EXIT basis: where a reverting
+                   trade closes (the exit basis, not the entry one, so both
+                   books' spreads are in it)
+      edge_bps     entry - norm_close - cost floor: the reversion's worth
+
+    None with too little history for a norm.
+    """
+    if (len(entry_hourly) < config.SCREEN_DIFF_MIN_HOURS
+            or len(close_hourly) < config.SCREEN_DIFF_MIN_HOURS):
+        return None
+    norm_e, mad = median_mad(entry_hourly)
+    norm_c, _ = median_mad(close_hourly)
+    spike = entry_bps - norm_e
+    scale = 1.4826 * mad
+    return {
+        "norm_entry_bps": norm_e,
+        "norm_close_bps": norm_c,
+        "mad_bps": mad,
+        "spike_bps": spike,
+        # A pair whose hourly means barely move has a tiny MAD; floor the
+        # scale so a 3bps wobble on a dead-flat name can't read as z=10.
+        "spike_z": spike / max(scale, config.SPIKE_MIN_SCALE_BPS),
+        "edge_bps": entry_bps - norm_c - float(config.ENTRY_MIN_EDGE_FLOOR_BPS),
+    }

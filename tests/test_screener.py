@@ -921,3 +921,17 @@ def test_exit_room_credits_carry_on_the_funding_board(monkeypatch):
     assert abs(carry - 1.41 * 24) < 1e-9
     assert not screener.no_exit_room(us, carry)
     assert screener.no_exit_room(us, screener.carry_over_hold_bps(0.2 * 8, 0.2 * 8))
+
+
+def test_spike_stats_measures_dislocation_against_the_norm(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_DIFF_MIN_HOURS", 6)
+    monkeypatch.setattr(config, "SPIKE_MIN_SCALE_BPS", 5.0)
+    ent = [10, 12, 8, 11, 9, 10, 13]
+    cls = [5, 6, 4, 5, 3, 7, 5]
+    st = screener.spike_stats(60.0, ent, cls)
+    assert st["norm_entry_bps"] == 10 and st["norm_close_bps"] == 5
+    assert st["spike_bps"] == 50
+    # MAD 1 -> scale 1.48, floored at 5: z = 50 / 5
+    assert st["spike_z"] == 10
+    assert st["edge_bps"] == 60 - 5 - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+    assert screener.spike_stats(60.0, ent[:3], cls[:3]) is None   # thin history
