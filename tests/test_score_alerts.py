@@ -156,5 +156,6 @@ async def test_study_spike_runs_and_posts_a_report(tmp_path, monkeypatch):
     await bot._study_task
     assert sent and sent[0][0] == "42"
     report = sent[0][1]
-    assert "does the basis revert" in report and "spike_z" in report
+    assert "does a spike PAY" in report and "spike_z" in report
+    assert "roundtrip" not in report.split("\n")[0]
     assert "FAILED" not in report

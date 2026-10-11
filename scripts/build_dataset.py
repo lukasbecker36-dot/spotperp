@@ -201,6 +201,10 @@ def features_at(
         "ts_ms": ts,
         "entry_bps": round(entry_avg, 2),
         "close_bps": round(close_avg, 2),
+        # Instant round trip (entry - exit basis): the boards hide outside
+        # [-50, +100]. Above ~+25 a row 'profits' the moment it is entered,
+        # which is a wide or broken perp book, not a reversion.
+        "roundtrip_bps": round(entry_avg - close_avg, 2),
         "jit_bps": round(_jitter(recent_entry) or 0.0, 2),
         "lo24_entry": round(lo_entry, 2),
         "hi24_entry": round(hi_entry, 2),

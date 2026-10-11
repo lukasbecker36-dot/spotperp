@@ -932,27 +932,54 @@ class ControlBot:
                 text = ("🔬 spike study FAILED building the dataset:\n"
                         + "\n".join(err.strip().splitlines()[-12:]))
             else:
-                parts = ["🔬 spike study — does the basis revert to its 24h norm?"]
+                parts = ["🔬 spike study v2 — does a spike PAY once broken quotes"
+                         " are filtered out?"]
                 footer: list[str] = []
+                # The boards' quality checks the logs can replay: instant round
+                # trip within [-50, +100], jitter, touch depth, and a sanity
+                # cap that drops mis-mapped pairs (AIUSDT quoted 41,928bps).
+                # Without them broken quotes 'paid' at hour 0 for +290bps.
+                gates = [
+                    "--where", f"roundtrip_bps={config.SCREEN_MIN_ROUNDTRIP_BPS:g}"
+                    f":{config.SCREEN_MAX_SPREAD_COST_BPS:g}",
+                    "--where", f"jit_bps=:{config.SCREEN_MAX_BASIS_JITTER_BPS:g}",
+                    "--where", f"depth_usd={config.SCREEN_MIN_DEPTH_USD:g}:",
+                    "--where", "entry_bps=-1000:1000",
+                ]
+                board = ["--where", f"spike_edge_bps={config.SPIKE_MIN_EDGE_BPS:g}:"]
+                # Rows whose books give no free perp spread: an instant round
+                # trip under +10 cannot 'profit' without the basis moving.
+                normal = ["--where", f"roundtrip_bps={config.SCREEN_MIN_ROUNDTRIP_BPS:g}:10"]
                 for title, extra in (
-                    ("By z (how unusual the jump is for the pair), 6h:",
-                     ["--by", "spike_z", "--label", "norm", "--horizon", "6",
-                      "--buckets", "1,2,2.5,3,5"]),
-                    ("By spike size, rows the board would show (edge >= 10), 6h:",
-                     ["--by", "spike_bps", "--label", "norm", "--horizon", "6",
-                      "--where", "spike_edge_bps=10:",
-                      "--buckets", "10,20,30,50"]),
-                    ("Did it PAY (basis + funding after costs) within 24h, by z:",
-                     ["--by", "spike_z", "--label", "profit", "--horizon", "24",
-                      "--where", "spike_edge_bps=10:",
-                      "--buckets", "2,2.5,3,5"]),
+                    ("1) Did it PAY within 6h (basis + funding after costs), by z"
+                     " — all clean rows, so spikes can be compared with no spike:",
+                     ["--by", "spike_z", "--label", "profit", "--horizon", "6",
+                      "--buckets", "1,2,2.5,3,5", *gates]),
+                    ("2) The same for rows the board would show (edge >= "
+                     f"{config.SPIKE_MIN_EDGE_BPS:g}), by z:",
+                     ["--by", "spike_z", "--label", "profit", "--horizon", "6",
+                      "--buckets", "2,2.5,3,5", *gates, *board]),
+                    ("3) As 2, normal books only (instant round trip <= +10, so"
+                     " nothing pays until the basis actually reverts):",
+                     ["--by", "spike_z", "--label", "profit", "--horizon", "6",
+                      "--buckets", "2,2.5,3,5", *gates, *board, *normal]),
+                    ("4) As 3, by spike size:",
+                     ["--by", "spike_bps", "--label", "profit", "--horizon", "6",
+                      "--buckets", "20,30,50,100", *gates, *board, *normal]),
                 ):
                     rc, so, se = await run([
                         *py, "scripts/dataset_report.py", str(out),
                         "--min-rows", "10", *extra,
                     ])
                     table, notes = _split_report(so)
-                    where = [l for l in se.splitlines() if l.startswith("where ")]
+                    # One line for all the filters: rows before the first, after
+                    # the last ("where X in [a,b): 92,872 -> 18,776 rows").
+                    wl = [l for l in se.splitlines() if l.startswith("where ")]
+                    where = []
+                    if wl:
+                        before = wl[0].rsplit(": ", 1)[-1].split(" -> ")[0]
+                        after = wl[-1].rsplit(" -> ", 1)[-1]
+                        where = [f"filters kept {after} of {before}"]
                     body = "\n".join(table + where) or se.strip() or "(no output)"
                     parts.append(f"{title}\n{body}")
                     footer = footer or notes
