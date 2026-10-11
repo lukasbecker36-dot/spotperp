@@ -429,8 +429,12 @@ class Engine:
                 ):
                     msg = score_alerts.format_alert(board, row, float(level))
                     entered = self._auto_enter(board, row["symbol"], row)
-                    if entered:
+                    if entered and entered.startswith("🤖 auto-entry #"):
                         msg += "\n" + entered
+                    elif entered:
+                        # A skip is not news on the alert; keep the reason
+                        # in the journal (/log) for when it is wanted.
+                        journal(self.conn, f"{row['symbol']}: {entered}")
                     await self.notifier.alert(msg)
 
     def _auto_enter(

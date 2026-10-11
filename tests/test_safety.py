@@ -2710,7 +2710,11 @@ async def test_autoenter_off_or_held_does_not_enter(engine):
     database.set_setting(engine.conn, "score_alert", {"fill": 41.0})  # re-alert
     await engine._check_score_alerts()
     assert [p.id for p in engine.positions.active()] == [pos_id]
-    assert "already holding" in engine.notifier.messages[-1]
+    # A skip stays off the alert and goes to the journal instead.
+    assert "auto-entry" not in engine.notifier.messages[-1]
+    logged = [r["message"] for r in engine.conn.execute(
+        "SELECT message FROM journal").fetchall()]
+    assert any("already holding" in m for m in logged)
 
 
 async def test_autoenter_respects_caps_and_cooldown(engine, monkeypatch):
