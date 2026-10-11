@@ -616,8 +616,10 @@ class ControlBot:
                 " robust deviations above its own 24h norm, reverting to the"
                 f" norm exit worth >= {config.SPIKE_MIN_EDGE_BPS:.0f}bps after"
                 f" costs and {config.SPIKE_HOLD_HOURS:g}h of funding, perp volume"
-                f" >= ${config.SPIKE_MIN_VOLUME_USD:,.0f}, and the usual"
-                " depth / round-trip / jitter / index checks. Quiet is normal:"
+                f" >= ${config.SPIKE_MIN_VOLUME_USD:,.0f}, a normal book (instant"
+                f" round trip between {config.SCREEN_MIN_ROUNDTRIP_BPS:+g} and"
+                f" {config.SPIKE_MAX_ROUNDTRIP_BPS:+g}), and the usual depth /"
+                " jitter / index checks. Quiet is normal:"
                 " spikes are rare by definition."
             )
         hdr = (f"{'symbol':<11}{'score':>6}{'entry':>7}{'norm':>7}{'spike':>7}"
@@ -949,7 +951,8 @@ class ControlBot:
                 board = ["--where", f"spike_edge_bps={config.SPIKE_MIN_EDGE_BPS:g}:"]
                 # Rows whose books give no free perp spread: an instant round
                 # trip under +10 cannot 'profit' without the basis moving.
-                normal = ["--where", f"roundtrip_bps={config.SCREEN_MIN_ROUNDTRIP_BPS:g}:10"]
+                normal = ["--where", f"roundtrip_bps={config.SCREEN_MIN_ROUNDTRIP_BPS:g}"
+                          f":{config.SPIKE_MAX_ROUNDTRIP_BPS:g}"]
                 for title, extra in (
                     ("1) Did it PAY within 6h (basis + funding after costs), by z"
                      " — all clean rows, so spikes can be compared with no spike:",

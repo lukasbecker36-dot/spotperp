@@ -181,16 +181,27 @@ AUTO_ENTER_SYMBOL_COOLDOWN_HOURS = float(
 # after the cost floor. No dwell or funding requirement — a spike is brief by
 # nature; funding over the hold is charged as a cost in the score instead.
 # Calibrate from scripts/dataset_report.py --by spike_z --label norm.
-SPIKE_MIN_BPS = float(os.environ.get("SPIKE_MIN_BPS", "20"))
-SPIKE_MIN_Z = float(os.environ.get("SPIKE_MIN_Z", "2.5"))
+# Calibrated on /study spike v2 (normal books, 6h): paid-within-6h and the
+# worked-exit P&L rise with z — 79% / +1.6 at z<2, 86% / +18.7 at 3-5, 100% /
+# +26.8 at >=5 — while spike SIZE in bps predicted nothing. So z gates and
+# the bps floor is only a token.
+SPIKE_MIN_BPS = float(os.environ.get("SPIKE_MIN_BPS", "10"))
+SPIKE_MIN_Z = float(os.environ.get("SPIKE_MIN_Z", "3"))
 SPIKE_MIN_SCALE_BPS = float(os.environ.get("SPIKE_MIN_SCALE_BPS", "5"))
 SPIKE_MIN_EDGE_BPS = float(os.environ.get("SPIKE_MIN_EDGE_BPS", "10"))
 SPIKE_MIN_VOLUME_USD = float(os.environ.get("SPIKE_MIN_VOLUME_USD", "150000"))
+# Spikes only on NORMAL books: instant round trip (entry - exit basis) at or
+# under this. Above it the study's apparent profits came from assuming both
+# perp maker fills at once (ask in, bid out) — 'paid' at hour 0 — not from
+# the basis reverting.
+SPIKE_MAX_ROUNDTRIP_BPS = float(os.environ.get("SPIKE_MAX_ROUNDTRIP_BPS", "10"))
 # Hours a spike trade is expected to take to revert — funding over it is
 # charged in the score — and the most it is held before a passive close at
 # any level is worked.
-SPIKE_HOLD_HOURS = float(os.environ.get("SPIKE_HOLD_HOURS", "6"))
-SPIKE_MAX_HOLD_HOURS = float(os.environ.get("SPIKE_MAX_HOLD_HOURS", "24"))
+# Reversions that paid did so in ~0.2-0.6h, and holding a full 6h lost in
+# every bucket below z 5 — so a short expected hold and a short max hold.
+SPIKE_HOLD_HOURS = float(os.environ.get("SPIKE_HOLD_HOURS", "1"))
+SPIKE_MAX_HOLD_HOURS = float(os.environ.get("SPIKE_MAX_HOLD_HOURS", "2"))
 SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
 # Reject a basis that jumps wildly tick to tick: a resting order can't be
 # worked against it, because the price you get is a lottery (BULLA printed

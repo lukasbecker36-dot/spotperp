@@ -975,3 +975,12 @@ def test_daily_basis_annotates_spike_fields(monkeypatch):
     d.annotate(r)
     assert r.norm_entry_bps is not None and r.spike_bps > 50
     assert r.spike_edge_bps == 70.0 - r.norm_close_bps - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+
+
+def test_spike_board_only_takes_normal_books(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 0.0)
+    monkeypatch.setattr(config, "SPIKE_MAX_ROUNDTRIP_BPS", 10.0)
+    ok = _spike_row("OK", 80.0, 10.0, 5.0, z=8.0)          # round trip +5
+    wide = _spike_row("WIDE", 80.0, 10.0, 5.0, z=8.0)
+    wide.spread_cost_bps = 40.0                             # free perp spread
+    assert [r.symbol for r in screener.rank_rows_by_spike([ok, wide])] == ["OK"]

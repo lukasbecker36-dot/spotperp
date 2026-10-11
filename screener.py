@@ -894,7 +894,7 @@ def rank_rows_by_spike(rows: list[ScreenerRow]) -> list[ScreenerRow]:
             and not too_thin(r)
             and not _too_jittery(r)
             and config.SCREEN_MIN_ROUNDTRIP_BPS <= r.spread_cost_bps
-            <= config.SCREEN_MAX_SPREAD_COST_BPS
+            <= config.SPIKE_MAX_ROUNDTRIP_BPS
             and r.perp_volume_24h >= config.SPIKE_MIN_VOLUME_USD
             and r.spike_bps >= config.SPIKE_MIN_BPS
             and r.spike_z >= config.SPIKE_MIN_Z
