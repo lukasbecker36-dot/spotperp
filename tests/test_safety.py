@@ -2876,3 +2876,36 @@ async def test_funding_autoentry_opens_a_carry_trade(engine):
     out = engine._auto_enter("fill", "ETHUSDT", {"jitter_bps": 3.0})
     assert "auto-exits short of the 24h exit low" in out
     assert [p.trade_kind for p in engine.positions.active()] == ["convergence"]
+
+
+async def test_spike_position_exits_at_the_norm_and_times_out_passive(engine, monkeypatch):
+    pos = engine.positions.create("BTCUSDT", Decimal(1000), paper=True, trade_kind="spike")
+    engine.executor.start_entry(pos)
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    for _ in range(200):
+        if engine.positions.get(pos.id).state == pm.OPEN:
+            break
+        await asyncio.sleep(0.02)
+    pos = engine.positions.get(pos.id)
+    import time as _time
+    now = int(_time.time() * 1000)
+    for h in range(24):   # exit basis norm ~ +10
+        engine._basis_24h.add("BTCUSDT", now - h * 3_600_000, 20.0, 10.0)
+    target, norm = engine._convergence_target(pos)
+    assert norm == Decimal("10")
+    assert target == min(norm, pos.entry_basis_bps - config.ENTRY_MIN_EDGE_FLOOR_BPS).quantize(Decimal("0.1"))
+    # Not reverted within the spike max hold: passive close at any basis.
+    monkeypatch.setattr(config, "SPIKE_MAX_HOLD_HOURS", 0.0)
+    set_books(engine.md, "100.4", "101.5", "99.9", "100.0")       # still wide
+    await engine._check_safety(engine.positions.get(pos.id))
+    p = engine.positions.get(pos.id)
+    assert p.exit_mode == "passive" and p.exit_target_bps is None
+    assert any("spike not reverted" in m for m in engine.notifier.messages)
+
+
+async def test_spike_autoentry_opens_a_spike_trade(engine):
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    database.set_setting(engine.conn, "auto_enter", {"spike": 100})
+    out = engine._auto_enter("spike", "BTCUSDT", {"jitter_bps": 2.0})
+    assert "SPIKE — auto-exits at the 24h norm" in out
+    assert engine.positions.active()[0].trade_kind == "spike"

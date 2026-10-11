@@ -384,3 +384,22 @@ def test_bps_col_keeps_a_gap_and_caps_nonsense():
     assert control_bot._bps_col(-1234.5, 7) == "  -1234"
     assert control_bot._bps_col(12.3, 8, mark="?") == "     12?"
     assert control_bot._bps_col(None, 6) == "     -"
+
+
+def test_screen_spike_renders_and_explains_an_empty_board(tmp_path, monkeypatch):
+    import json as _json, time as _time
+    import config as _config
+    p = tmp_path / "snap.json"
+    row = {"symbol": "AAAUSDT", "entry_bps": 80.0, "entry_bps_avg": 80.0,
+           "norm_entry_bps": 10.0, "norm_close_bps": 5.0, "spike_bps": 70.0,
+           "spike_z": 8.0, "spike_edge_bps": 50.0, "funding_8h_bps": 1.0,
+           "entry_bps_jitter": 2.0, "samples": 5, "perp_volume_24h": 900_000,
+           "mexc_ask_depth_usd": 400.0, "max_notional_usd": 50.0, "score": 50.3}
+    p.write_text(_json.dumps({"ts_ms": int(_time.time() * 1000), "rows": [],
+                              "spike_rows": [row]}))
+    monkeypatch.setattr(_config, "SCREENER_SNAPSHOT_FILE", p)
+    out = control_bot.ControlBot._cmd_screen(_bot(), ["spike"])
+    assert "spike screen" in out and "AAAUSDT" in out and "+50.3" in out
+    p.write_text(_json.dumps({"ts_ms": int(_time.time() * 1000), "rows": [],
+                              "spike_rows": []}))
+    assert "no spikes" in control_bot.ControlBot._cmd_screen(_bot(), ["spike"])

@@ -935,3 +935,43 @@ def test_spike_stats_measures_dislocation_against_the_norm(monkeypatch):
     assert st["spike_z"] == 10
     assert st["edge_bps"] == 60 - 5 - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
     assert screener.spike_stats(60.0, ent[:3], cls[:3]) is None   # thin history
+
+
+def _spike_row(sym, entry, norm_e, norm_c, z, trades=1000.0, funding=0.0):
+    r = _quote_row(sym, entry, entry - 5.0, depth=500.0, volume=1_000_000.0)
+    r.perp_trades_24h = trades
+    r.funding_8h_bps = funding
+    r.norm_entry_bps, r.norm_close_bps = norm_e, norm_c
+    r.spike_bps = entry - norm_e
+    r.spike_z = z
+    r.spike_edge_bps = entry - norm_c - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)
+    return r
+
+
+def test_spike_board_ranks_reversion_edge_and_gates_noise(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_MIN_DEPTH_USD", 0.0)
+    monkeypatch.setattr(config, "SPIKE_MIN_BPS", 20.0)
+    monkeypatch.setattr(config, "SPIKE_MIN_Z", 2.5)
+    monkeypatch.setattr(config, "SPIKE_MIN_EDGE_BPS", 10.0)
+    big = _spike_row("BIG", 80.0, 10.0, 5.0, z=8.0)        # edge 50
+    small = _spike_row("SMALL", 45.0, 10.0, 5.0, z=4.0)    # edge 15
+    noisy = _spike_row("NOISY", 80.0, 10.0, 5.0, z=1.5)    # normal for it
+    thin = _spike_row("THIN", 42.0, 20.0, 15.0, z=5.0)     # edge 2 < 10
+    out = [r.symbol for r in screener.rank_rows_by_spike([small, noisy, thin, big])]
+    assert out == ["BIG", "SMALL"]
+    assert screener.spike_score(big) == 50.0
+    # Funding over the hold is a cost line, not a gate: negative carry lowers it.
+    neg = _spike_row("NEG", 80.0, 10.0, 5.0, z=8.0, funding=-8.0)
+    assert screener.spike_score(neg) < screener.spike_score(big)
+
+
+def test_daily_basis_annotates_spike_fields(monkeypatch):
+    monkeypatch.setattr(config, "SCREEN_DIFF_MIN_HOURS", 6)
+    d = screener.DailyBasis()
+    for h in range(24):
+        d.add("X", h * 3_600_000, 10.0 + (h % 3), 5.0 + (h % 2))
+    r = _quote_row("X", 70.0, 60.0, depth=500.0)
+    r.samples = 0
+    d.annotate(r)
+    assert r.norm_entry_bps is not None and r.spike_bps > 50
+    assert r.spike_edge_bps == 70.0 - r.norm_close_bps - float(config.ENTRY_MIN_EDGE_FLOOR_BPS)

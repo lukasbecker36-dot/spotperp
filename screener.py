@@ -112,6 +112,14 @@ class ScreenerRow:
     # USD value of the first SCREEN_DEPTH_LEVELS MEXC asks. None until the
     # depth sweep has reached this symbol (it only fetches displayed names).
     mexc_ask_depth_usd: float | None = None
+    # Short-term mean reversion (filled by DailyBasis.annotate via
+    # spike_stats): the dislocation above the pair's own 24h norm and what
+    # reverting to the norm exit basis is worth. None with thin history.
+    norm_entry_bps: float | None = None
+    norm_close_bps: float | None = None
+    spike_bps: float | None = None
+    spike_z: float | None = None
+    spike_edge_bps: float | None = None
 
 
 class RollingBasis:
@@ -600,6 +608,7 @@ def write_snapshot(
     diff_rows: list[ScreenerRow] | None = None,
     swing_rows: list[ScreenerRow] | None = None,
     fill_rows: list[ScreenerRow] | None = None,
+    spike_rows: list[ScreenerRow] | None = None,
 ) -> None:
     config.SCREENER_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -608,6 +617,9 @@ def write_snapshot(
         "diff_rows": [asdict(r) for r in (diff_rows or [])],
         "swing_rows": [asdict(r) for r in (swing_rows or [])],
         "fill_rows": [asdict(r) for r in (fill_rows or [])],
+        "spike_rows": [
+            {**asdict(r), "score": spike_score(r)} for r in (spike_rows or [])
+        ],
     }
     tmp = config.SCREENER_SNAPSHOT_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=1))
@@ -731,6 +743,17 @@ class DailyBasis:
         row.basis_p10_24h = row.entry_bps if lo is None else lo
         row.basis_p90_24h = row.entry_bps if hi is None else hi
         row.close_p10_24h, _ = self.percentiles(row.symbol, close=True)
+        entry = row.entry_bps_avg if row.samples else row.entry_bps
+        st = spike_stats(
+            entry, self.hourly_means(row.symbol),
+            self.hourly_means(row.symbol, close=True),
+        )
+        if st is not None:
+            row.norm_entry_bps = st["norm_entry_bps"]
+            row.norm_close_bps = st["norm_close_bps"]
+            row.spike_bps = st["spike_bps"]
+            row.spike_z = st["spike_z"]
+            row.spike_edge_bps = st["edge_bps"]
         return row
 
 
@@ -842,3 +865,41 @@ def spike_stats(
         "spike_z": spike / max(scale, config.SPIKE_MIN_SCALE_BPS),
         "edge_bps": entry_bps - norm_c - float(config.ENTRY_MIN_EDGE_FLOOR_BPS),
     }
+
+
+def spike_score(row: ScreenerRow) -> float | None:
+    """One number for a /screen spike row, in bps: the reversion's worth
+    after costs, plus (or minus) funding over SPIKE_HOLD_HOURS, scaled down
+    when there is too little perp flow to lift a resting order."""
+    if row.spike_edge_bps is None:
+        return None
+    carry = row.funding_8h_bps * config.SPIKE_HOLD_HOURS / 8.0
+    factor = min(
+        1.0, row.perp_trades_24h / max(config.SCREEN_FILL_TARGET_CHANCES, 1.0),
+    ) if row.perp_trades_24h else 1.0
+    return (row.spike_edge_bps + carry) * factor
+
+
+def rank_rows_by_spike(rows: list[ScreenerRow]) -> list[ScreenerRow]:
+    """/screen spike: names whose basis has jumped well above their OWN norm
+    and would pay to revert. No dwell or funding gate — a spike is brief, and
+    a short hold makes funding a cost line, not a requirement."""
+    eligible = []
+    for r in rows:
+        if r.spike_bps is None or r.spike_edge_bps is None:
+            continue
+        carry = r.funding_8h_bps * config.SPIKE_HOLD_HOURS / 8.0
+        if (
+            not _bad_index(r)
+            and not too_thin(r)
+            and not _too_jittery(r)
+            and config.SCREEN_MIN_ROUNDTRIP_BPS <= r.spread_cost_bps
+            <= config.SCREEN_MAX_SPREAD_COST_BPS
+            and r.perp_volume_24h >= config.SPIKE_MIN_VOLUME_USD
+            and r.spike_bps >= config.SPIKE_MIN_BPS
+            and r.spike_z >= config.SPIKE_MIN_Z
+            and r.spike_edge_bps + carry >= config.SPIKE_MIN_EDGE_BPS
+        ):
+            eligible.append(r)
+    eligible.sort(key=lambda r: spike_score(r) or 0.0, reverse=True)
+    return eligible[: config.SCREENER_TOP_N]

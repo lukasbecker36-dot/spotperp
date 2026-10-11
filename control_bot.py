@@ -40,11 +40,12 @@ HELP = """Commands:
 /screen [n] — top basis opportunities
 /screen diff [n] — pairs furthest ABOVE their own 24h avg basis (reversion candidates)
 /screen swing [n] — pairs that go wide then return to closeable (round-trip candidates)
+/screen spike [n] — basis jumped well above its OWN 24h norm and pays to revert (short-term mean reversion)
 /screen fill [n] — pairs with real perp volume + a persistently workable basis (you can actually get filled)
 /funding [n] — top funding carry (bps per hour)
 /funding all [n] — top 20 names by 24h avg funding, unfiltered (same columns + why /funding hides it)
-/alert [fill|funding LEVEL|auto|off] — message when a /screen fill or /funding score reaches LEVEL (no args: status)
-/autoenter [fill|funding NOTIONAL|off] — auto-start a normal entry when that board's /alert fires (needs the alert on; capped)
+/alert [fill|funding|spike LEVEL|auto|off] — message when a /screen fill or /funding score reaches LEVEL (no args: status)
+/autoenter [fill|funding|spike NOTIONAL|off] — auto-start a normal entry when that board's /alert fires (needs the alert on; capped)
 /scores [fill|funding] [days] — recorded score history: how many alerts a day each level would have sent
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
@@ -425,6 +426,8 @@ class ControlBot:
             return self._cmd_screen_swing(args[1:])
         if args and args[0].lower() in ("fill", "f"):
             return self._cmd_screen_fill(args[1:])
+        if args and args[0].lower() in ("spike", "sp", "revert"):
+            return self._cmd_screen_spike(args[1:])
         n = int(args[0]) if args else 10
         snap = screener.read_snapshot()
         age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
@@ -578,6 +581,75 @@ class ControlBot:
         )
         return "\n".join(lines)
 
+
+    def _cmd_screen_spike(self, args: list[str]) -> str:
+        """Short-term mean reversion: the basis has jumped well above the
+        pair's own norm, and reverting to the norm exit would pay."""
+        n = int(args[0]) if args else 10
+        snap = screener.read_snapshot()
+        age_s = (time.time() * 1000 - snap["ts_ms"]) / 1000 if snap["ts_ms"] else -1
+        rows = (snap.get("spike_rows") or [])[:n]
+        if not rows:
+            return (
+                "no spikes — needs the 5m entry basis at least"
+                f" {config.SPIKE_MIN_BPS:.0f}bps and {config.SPIKE_MIN_Z:g}"
+                " robust deviations above its own 24h norm, reverting to the"
+                f" norm exit worth >= {config.SPIKE_MIN_EDGE_BPS:.0f}bps after"
+                f" costs and {config.SPIKE_HOLD_HOURS:g}h of funding, perp volume"
+                f" >= ${config.SPIKE_MIN_VOLUME_USD:,.0f}, and the usual"
+                " depth / round-trip / jitter / index checks. Quiet is normal:"
+                " spikes are rare by definition."
+            )
+        hdr = (f"{'symbol':<11}{'score':>6}{'entry':>7}{'norm':>7}{'spike':>7}"
+               f"{'z':>5}{'exitN':>7}{'edge':>6}{'fund':>6}{'jit':>5}"
+               f"{'vol':>6}{'depth$':>7}")
+        sep = "-" * len(hdr)
+        lines = [f"spike screen ({age_s:.0f}s old)", hdr, sep]
+        for r in rows:
+            jv = r.get("entry_bps_jitter")
+            jit = (f"{jv:>5.1f}" if jv is not None and r.get("samples", 0) >= 3
+                   else f"{'-':>5}")
+            vol = r.get("perp_volume_24h") or 0
+            dv = _depth_usd(r)
+            lines.append(
+                f"{_pad(r['symbol'], 11)}{(r.get('score') or 0):>+6.1f}"
+                f"{_bps_col(r.get('entry_bps_avg', r['entry_bps']), 7)}"
+                f"{_bps_col(r.get('norm_entry_bps'), 7)}"
+                f"{_bps_col(r.get('spike_bps'), 7)}"
+                f"{(r.get('spike_z') or 0):>5.1f}"
+                f"{_bps_col(r.get('norm_close_bps'), 7)}"
+                f"{(r.get('spike_edge_bps') or 0):>+6.1f}"
+                f"{_hourly(r.get('funding_8h_bps')):>+6.2f}{jit}"
+                f"{(_vol(vol) if vol else '-'):>6}"
+                f"{(f'{dv:,.0f}' if dv else '-'):>7}"
+            )
+        lines.append(sep)
+        lines.append(
+            "entry = 5m avg basis; norm = median of its hourly entry basis over"
+            " 24h; spike = entry - norm; z = spike in robust deviations (MAD,"
+            f" floored at {config.SPIKE_MIN_SCALE_BPS:g}bps) — how unusual this"
+            " jump is FOR THIS PAIR. exitN = the norm of the EXIT basis (maker"
+            " buy-back, taker spot sell): where a reverting trade closes."
+            f" edge = entry - exitN - {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps"
+            " cost."
+        )
+        lines.append(
+            f"score = (edge + {config.SPIKE_HOLD_HOURS:g}h of funding) x flow"
+            " factor (scaled down below"
+            f" {config.SCREEN_FILL_TARGET_CHANCES:.0f} perp trades/24h). No dwell"
+            " or funding requirement: a spike is brief, and over a short hold"
+            " funding is a cost line, not the trade."
+        )
+        lines.append(
+            "Enter with /enter SYMBOL NOTIONAL spike: it auto-closes passive at"
+            " the norm exit basis (capped at entry - cost), and works a passive"
+            f" close at any basis after {config.SPIKE_MAX_HOLD_HOURS:g}h if it"
+            " has not reverted. /alert spike LEVEL and /autoenter spike"
+            " NOTIONAL work as on the other boards. Check whether reversion"
+            " actually holds on history first: scripts/dataset_report.py"
+            " --by spike_z --label norm."
+        )
+        return "\n".join(lines)
 
     def _cmd_screen_fill(self, args: list[str]) -> str:
         """Names you can realistically get FILLED on.
@@ -791,13 +863,16 @@ class ControlBot:
         )
         usage = (
             "usage: /autoenter fill 200 | /autoenter funding 150 |"
+            " /autoenter spike 100 |"
             " /autoenter fill off | /autoenter off\n"
             "Starts an entry when that board's /alert fires for a name."
             " /screen fill entries are normal trades (same as /enter SYMBOL"
             " NOTIONAL) that auto-exit short of the 24h exit low. /funding"
             " entries are CARRY trades (as /enter SYMBOL NOTIONAL carry): no"
-            " auto-exit or max-hold, you close them with /exit or /auto. "
-            + caps
+            " auto-exit or max-hold, you close them with /exit or /auto."
+            " /screen spike entries are SPIKE trades: auto-close passive at"
+            " the 24h norm exit basis, passive at any basis after"
+            f" {config.SPIKE_MAX_HOLD_HOURS:g}h. " + caps
         )
         if args and args[0].lower() == "off" and len(args) == 1:
             database.set_setting(self._conn, "auto_enter", {})
@@ -1143,6 +1218,8 @@ class ControlBot:
             kind_tag = " ⚓carry" if p.trade_kind == "carry" else ""
             if p.auto_exit:
                 kind_tag += " 🤖auto"
+            if p.trade_kind == "spike":
+                kind_tag += " ↩spike"
             if p.auto_entered:
                 kind_tag += " ⚡auto-in"
             base = p.symbol[:-4] if p.symbol.endswith("USDT") else p.symbol
@@ -1173,7 +1250,8 @@ class ControlBot:
                 if m.get("auto_exit_bps") is not None:
                     lo = m.get("exit_low_bps")
                     auto = (f"  auto-exit ≤{m['auto_exit_bps']:+.1f}"
-                            + (f" (24h exit low {lo:+.1f})" if lo is not None
+                            + (f" ({m.get('exit_ref', '24h exit low')} {lo:+.1f})"
+                               if lo is not None
                                else " (fixed)"))
                 tail = [
                     f"  basis  entry {ob}  now {now_basis:+.1f}"
@@ -1473,6 +1551,8 @@ class ControlBot:
             low = tok.lower()
             if low in ("carry", "funding"):
                 payload["kind"] = "carry"
+            elif low in ("spike", "revert"):
+                payload["kind"] = "spike"
             elif low in ("conv", "converge", "convergence"):
                 payload["kind"] = "convergence"
             else:

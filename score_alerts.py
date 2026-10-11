@@ -11,8 +11,10 @@ from collections.abc import Iterable
 
 import config
 
-BOARDS = ("fill", "funding")
-BOARD_LABEL = {"fill": "/screen fill", "funding": "/funding"}
+BOARDS = ("fill", "funding", "spike")
+BOARD_LABEL = {
+    "fill": "/screen fill", "funding": "/funding", "spike": "/screen spike",
+}
 DAY_MS = 86_400_000
 
 
@@ -144,5 +146,10 @@ def format_alert(board: str, row: dict, level: float) -> str:
         f" {num('funding_8h_bps', '+.2f', 1 / 8)}bps/h\n"
         f"vol {fmt_volume(vol) if vol else '-'}"
         f"  depth$ {num('depth_usd', ',.0f')}  jit {num('jitter_bps', '.1f')}\n"
-        f"/book {row['symbol']} before entering"
+        + (
+            f"spike {num('spike_bps', '+.1f')} (z {num('spike_z', '.1f')}) over"
+            f" its norm; exits at the norm exit {num('norm_close_bps', '+.1f')}\n"
+            if row.get("spike_bps") is not None else ""
+        )
+        + f"/book {row['symbol']} before entering"
     )

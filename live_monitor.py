@@ -480,7 +480,7 @@ class Engine:
         # /funding is the carry board: hold for the funding and leave the close
         # to the operator (/exit, /auto). /screen fill is about round trips,
         # so those auto-exit short of the 24h exit low.
-        kind = "carry" if board == "funding" else "convergence"
+        kind = {"funding": "carry", "spike": "spike"}.get(board, "convergence")
         pos = self.positions.create(
             symbol, amount, paper=self.paper, trade_kind=kind,
         )
@@ -495,6 +495,9 @@ class Engine:
             + (f" CARRY — no auto-exit, close with /exit {pos.id} or arm"
                f" /auto {pos.id}."
                if kind == "carry" else
+               " SPIKE — auto-exits at the 24h norm exit basis, passive at any"
+               f" basis after {config.SPIKE_MAX_HOLD_HOURS:g}h."
+               if kind == "spike" else
                " auto-exits short of the 24h exit low (see /positions).")
             + f" /cancel {pos.id} to stop it"
         )
@@ -747,6 +750,22 @@ class Engine:
                 row.mexc_ask_depth_usd = self.md.mexc_ask_depth.get(pair.mexc_symbol)
                 rows.append(row)
         fill_rows = screener.rank_rows_by_fillability(rows)
+        spike_rows = screener.rank_rows_by_spike(rows)
+        self._board_rows["spike"] = [
+            {
+                "symbol": r.symbol, "score": screener.spike_score(r),
+                "jitter_bps": r.entry_bps_jitter if r.samples >= 3 else None,
+                "entry_bps": r.entry_bps_avg, "lo24_bps": r.basis_p10_24h,
+                "hi24_bps": r.basis_p90_24h, "funding_8h_bps": r.funding_8h_bps,
+                "volume_24h": r.perp_volume_24h,
+                "depth_usd": (r.mexc_ask_depth_usd
+                              if r.mexc_ask_depth_usd is not None
+                              else r.max_notional_usd),
+                "spike_bps": r.spike_bps, "spike_z": r.spike_z,
+                "norm_close_bps": r.norm_close_bps,
+            }
+            for r in spike_rows
+        ]
         # Names whose only failing check could be depth: fetch their 5-level
         # depth so the check judges them on it (touch until then). Highest
         # volume first, capped, so a slow scan stays a handful of calls.
@@ -777,13 +796,14 @@ class Engine:
         ]
         self._depth_watch_fill = {
             self.md.pair_maps[r.symbol].mexc_symbol
-            for r in fill_rows if r.symbol in self.md.pair_maps
+            for r in fill_rows + spike_rows if r.symbol in self.md.pair_maps
         }
         screener.write_snapshot(
             screener.rank_rows(rows),
             screener.rank_rows_by_dislocation(rows),
             screener.rank_rows_by_swing(rows),
             fill_rows,
+            spike_rows,
         )
         self._log_basis_rows(rows)
 
@@ -1102,6 +1122,10 @@ class Engine:
                 target, low = self._convergence_target(pos)
                 mark["auto_exit_bps"] = float(target)
                 mark["exit_low_bps"] = float(low) if low is not None else None
+                mark["exit_ref"] = (
+                    "24h norm exit" if pos.trade_kind == "spike"
+                    else "24h exit low"
+                )
             marks[str(pos.id)] = mark
         return marks
 
@@ -1761,7 +1785,9 @@ class Engine:
         min_bps = (
             Decimal(str(args["min_bps"])) if args.get("min_bps") is not None else None
         )
-        kind = "carry" if str(args.get("kind", "")).lower() == "carry" else "convergence"
+        kind = str(args.get("kind", "")).lower()
+        if kind not in ("carry", "spike"):
+            kind = "convergence"
 
         # Size up an existing position rather than rejecting it.
         existing = [
@@ -1830,6 +1856,12 @@ class Engine:
                else "")
             + f", max-hold {config.MAX_HOLD_HOURS}h{adverse}"
             if kind == "convergence"
+            else (
+                "SPIKE: auto-closes passive at the 24h norm exit basis (capped"
+                f" at entry - {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps),"
+                f" passive at any basis after {config.SPIKE_MAX_HOLD_HOURS:g}h"
+                f"{adverse}"
+            ) if kind == "spike"
             else f"CARRY: manual /exit only{adverse}"
         )
         return (
@@ -3328,11 +3360,7 @@ class Engine:
             # Converged but a taker close isn't worth it yet: work it passively
             # at the convergence target (maker perp buy-back, 0 perp fee).
             self._tp_confirm.pop(pos.id, None)
-            why = (
-                f" ({float(config.CONVERGED_EXIT_LOW_PCT):g}% short of the 24h"
-                f" exit low {float(low):+.1f}bps"
-                if low is not None else " (fixed target"
-            )
+            why = f" ({self._target_desc(pos, low)}"
             journal(
                 self.conn,
                 f"position {pos.id}: CONVERGED basis={close:.1f}bps -> passive"
@@ -3354,7 +3382,10 @@ class Engine:
         self._tp_confirm.pop(pos.id, None)   # still in premium: streak broken
         if pos.opened_ms is not None:
             hold_hours = (time.time() * 1000 - pos.opened_ms) / 3_600_000
-            if hold_hours > config.MAX_HOLD_HOURS:
+            if pos.trade_kind == "spike":
+                if hold_hours > config.SPIKE_MAX_HOLD_HOURS:
+                    await self._spike_timeout(pos)
+            elif hold_hours > config.MAX_HOLD_HOURS:
                 await self._force_close_timeout(pos)
 
     def _convergence_target(
@@ -3364,6 +3395,8 @@ class Engine:
         exit low it was derived from — None when the fixed fallback applies).
         See config.CONVERGED_EXIT_LOW_PCT."""
         base = config.CONVERGED_PASSIVE_BPS
+        if pos.trade_kind == "spike":
+            return self._spike_target(pos)
         pct = config.CONVERGED_EXIT_LOW_PCT
         if pct is None or pos.entry_basis_bps is None:
             return base, None
@@ -3376,6 +3409,46 @@ class Engine:
         target = low + (entry - low) * pct / Decimal(100)
         target = min(target, entry - config.ENTRY_MIN_EDGE_FLOOR_BPS)
         return target.quantize(Decimal("0.1")), low
+
+    def _spike_target(
+        self, pos: pm.Position,
+    ) -> tuple[Decimal, Decimal | None]:
+        """A spike trade closes when the exit basis is back at its 24h NORM
+        (median of hourly means) — the level it is betting on reverting to —
+        capped at entry - the cost floor. Fixed fallback on thin history."""
+        base = config.CONVERGED_PASSIVE_BPS
+        if pos.entry_basis_bps is None:
+            return base, None
+        means = self._basis_24h.hourly_means(pos.symbol, close=True)
+        if len(means) < config.SCREEN_DIFF_MIN_HOURS:
+            return base, None
+        norm, _ = screener.median_mad(means)
+        norm_d = Decimal(str(round(norm, 2)))
+        target = min(norm_d, pos.entry_basis_bps - config.ENTRY_MIN_EDGE_FLOOR_BPS)
+        return target.quantize(Decimal("0.1")), norm_d
+
+    def _target_desc(self, pos: pm.Position, ref: Decimal | None) -> str:
+        """Words for where an auto-exit level came from."""
+        if ref is None:
+            return "fixed target"
+        if pos.trade_kind == "spike":
+            return f"24h norm exit {float(ref):+.1f}bps"
+        return (f"{float(config.CONVERGED_EXIT_LOW_PCT):g}% short of the 24h"
+                f" exit low {float(ref):+.1f}bps")
+
+    async def _spike_timeout(self, pos: pm.Position) -> None:
+        """A spike that has not reverted within SPIKE_MAX_HOLD_HOURS is no
+        longer the trade it was entered as: work a passive close at ANY basis
+        (maker buy-back, clipped) rather than crossing both books."""
+        await self.notifier.alert(
+            f"⏰ position {pos.id} {pos.symbol}: spike not reverted within"
+            f" {config.SPIKE_MAX_HOLD_HOURS:g}h — working a passive close at any"
+            f" basis (/exit {pos.id} now to cross instead, /cancel {pos.id} to"
+            " keep holding)"
+        )
+        self.positions.set_exit_request(pos.id, "passive", None)
+        await self._cancel_stops_for(pos)
+        await self.executor.start_exit(self.positions.get(pos.id))
 
     async def _check_auto_passive(self, pos: pm.Position) -> None:
         """Manage a convergence-auto passive exit while it works: escalate to a
