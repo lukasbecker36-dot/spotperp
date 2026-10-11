@@ -14,10 +14,13 @@ import asyncio
 import html
 import json
 import logging
+import shutil
 import subprocess
+import sys
 import time
 import unicodedata
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 import aiohttp
 
@@ -46,6 +49,7 @@ HELP = """Commands:
 /funding all [n] — top 20 names by 24h avg funding, unfiltered (same columns + why /funding hides it)
 /alert [fill|funding|spike LEVEL|auto|off] — message when a /screen fill or /funding score reaches LEVEL (no args: status)
 /autoenter [fill|funding|spike NOTIONAL|off] — auto-start a normal entry when that board's /alert fires (needs the alert on; capped)
+/study spike [days] — run the mean-reversion study on the server's own basis logs (default 7 days); the report arrives when done
 /scores [fill|funding] [days] — recorded score history: how many alerts a day each level would have sent
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
@@ -88,7 +92,8 @@ BOT_COMMANDS = [
     {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
     {"command": "alert", "description": "Score alert: fill|funding LEVEL|auto|off"},
     {"command": "scores", "description": "Score history: alerts/day per level"},
-    {"command": "autoenter", "description": "Auto-enter on alerts: fill|funding NOTIONAL|off"},
+    {"command": "autoenter", "description": "Auto-enter on alerts: fill|funding|spike NOTIONAL|off"},
+    {"command": "study", "description": "Spike reversion study on the logs: spike [days]"},
     {"command": "positions", "description": "Open positions, P&L + liq proximity"},
     {"command": "orders", "description": "Working entries/exits vs level + 24h range"},
     {"command": "recon", "description": "Live venue P&L, funding rate + liq"},
@@ -135,6 +140,17 @@ def _hourly(bps_8h: float | None) -> float:
 
 
 _vol = score_alerts.fmt_volume
+
+
+def _split_report(text: str) -> tuple[list[str], list[str]]:
+    """dataset_report output -> (the table, through its closing rule; the
+    explanation lines after it), so a multi-report message states the
+    explanation once instead of under every table."""
+    lines = text.strip().splitlines()
+    rules = [i for i, l in enumerate(lines) if l.startswith("---")]
+    if len(rules) < 2:
+        return lines, []
+    return lines[: rules[1] + 1], lines[rules[1] + 1:]
 
 
 def _exit_room_desc() -> str:
@@ -285,6 +301,8 @@ class ControlBot:
         parts = text.split()
         command = parts[0].lstrip("/").split("@")[0].lower()
         args = parts[1:]
+        # Long-running commands (/study) reply again later, to this chat.
+        self._reply_chat = chat_id
         try:
             reply = await self._dispatch(command, args)
         except Exception as exc:
@@ -309,6 +327,8 @@ class ControlBot:
             return self._cmd_scores(args)
         if command == "autoenter":
             return self._cmd_autoenter(args)
+        if command == "study":
+            return self._cmd_study(args)
         if command == "status":
             return await self._cmd_status()
         if command == "review":
@@ -845,6 +865,104 @@ class ControlBot:
             lines.append(f"  {score_alerts.BOARD_LABEL[board]}: {state}")
         lines.append(usage)
         return "\n".join(lines)
+
+    def _cmd_study(self, args: list[str]) -> str:
+        """Run the spike (mean-reversion) study on this server's basis logs in
+        the background and post the report here when it finishes — for when
+        there is no shell to run scripts/build_dataset.py by hand."""
+        if not args or args[0].lower() != "spike":
+            return ("usage: /study spike [days] — does the basis actually revert"
+                    " to its norm after a spike? Uses the last DAYS (default 7,"
+                    " max 30) of output/basis_log_*.csv.")
+        try:
+            days = min(30, max(2, int(args[1]))) if len(args) > 1 else 7
+        except ValueError:
+            return "usage: /study spike [days]"
+        task = getattr(self, "_study_task", None)
+        if task is not None and not task.done():
+            return "a study is already running — its report will arrive here"
+        now = time.time()
+        files = []
+        for back in range(days, -1, -1):
+            day = time.strftime("%Y%m%d", time.gmtime(now - back * 86400))
+            for suffix in (".csv", ".csv.gz"):
+                path = config.OUTPUT_DIR / f"basis_log_{day}{suffix}"
+                if path.exists():
+                    files.append(str(path))
+        if not files:
+            return f"no basis logs found in {config.OUTPUT_DIR}"
+        chat = getattr(self, "_reply_chat", None)
+        self._study_task = asyncio.create_task(self._run_study(files, chat))
+        return (
+            f"🔬 spike study started on {len(files)} log file(s), last {days}"
+            " days. It runs at low priority beside the engine and can take"
+            " several minutes; the report will arrive here."
+        )
+
+    async def _run_study(self, files: list[str], chat: str | None) -> None:
+        root = Path(__file__).resolve().parent
+        out = config.OUTPUT_DIR / "spike_study.csv"
+        nice = ["nice", "-n", "15"] if shutil.which("nice") else []
+        py = [*nice, sys.executable]
+
+        async def run(cmd: list[str]) -> tuple[int, str, str]:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=str(root),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                so, se = await asyncio.wait_for(
+                    proc.communicate(), config.STUDY_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                return -1, "", "timed out"
+            return (proc.returncode, so.decode(errors="replace"),
+                    se.decode(errors="replace"))
+
+        try:
+            out.unlink(missing_ok=True)
+            rc, _, err = await run([
+                *py, "scripts/build_dataset.py", *files, "-o", str(out),
+                "--stride-hours", "0.25", "--horizons", "2,6,24",
+                "--min-entry", "-100000", "--min-spike-bps", "5",
+                "--every", "2",
+            ])
+            if rc != 0 or not out.exists():
+                text = ("🔬 spike study FAILED building the dataset:\n"
+                        + "\n".join(err.strip().splitlines()[-12:]))
+            else:
+                parts = ["🔬 spike study — does the basis revert to its 24h norm?"]
+                footer: list[str] = []
+                for title, extra in (
+                    ("By z (how unusual the jump is for the pair), 6h:",
+                     ["--by", "spike_z", "--label", "norm", "--horizon", "6",
+                      "--buckets", "1,2,2.5,3,5"]),
+                    ("By spike size, rows the board would show (edge >= 10), 6h:",
+                     ["--by", "spike_bps", "--label", "norm", "--horizon", "6",
+                      "--where", "spike_edge_bps=10:",
+                      "--buckets", "10,20,30,50"]),
+                    ("Did it PAY (basis + funding after costs) within 24h, by z:",
+                     ["--by", "spike_z", "--label", "profit", "--horizon", "24",
+                      "--where", "spike_edge_bps=10:",
+                      "--buckets", "2,2.5,3,5"]),
+                ):
+                    rc, so, se = await run([
+                        *py, "scripts/dataset_report.py", str(out),
+                        "--min-rows", "10", *extra,
+                    ])
+                    table, notes = _split_report(so)
+                    where = [l for l in se.splitlines() if l.startswith("where ")]
+                    body = "\n".join(table + where) or se.strip() or "(no output)"
+                    parts.append(f"{title}\n{body}")
+                    footer = footer or notes
+                parts.append("\n".join(footer))
+                text = "\n\n".join(p for p in parts if p)
+        except Exception as exc:
+            log.exception("spike study failed")
+            text = f"🔬 spike study failed: {exc}"
+        if chat:
+            await self._send(chat, text)
 
     def _cmd_autoenter(self, args: list[str]) -> str:
         """Turn auto-entry on a board's score alert on or off.

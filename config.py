@@ -148,6 +148,8 @@ SCREEN_MIN_EXIT_ROOM_PCT = float(os.environ.get("SCREEN_MIN_EXIT_ROOM_PCT", "10"
 # level for SCORE_ALERT_REARM_MINUTES; `/alert <board> auto` picks the lowest
 # level that would have fired at most SCORE_ALERT_AUTO_PER_DAY times a day
 # over the last SCORE_ALERT_LOOKBACK_DAYS.
+# /study: longest a background study (build_dataset + report) may run.
+STUDY_TIMEOUT_SECONDS = float(os.environ.get("STUDY_TIMEOUT_SECONDS", "1800"))
 SCORE_HISTORY_SECONDS = float(os.environ.get("SCORE_HISTORY_SECONDS", "120"))
 SCORE_HISTORY_DAYS = int(os.environ.get("SCORE_HISTORY_DAYS", "30"))
 SCORE_ALERT_REARM_MINUTES = float(os.environ.get("SCORE_ALERT_REARM_MINUTES", "30"))

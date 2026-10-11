@@ -123,3 +123,38 @@ def test_autoenter_command(tmp_path):
     assert database.get_setting(bot._conn, "auto_enter") == {"funding": 150.0}
     bot._cmd_autoenter(["off"])
     assert database.get_setting(bot._conn, "auto_enter") == {}
+
+
+async def test_study_spike_runs_and_posts_a_report(tmp_path, monkeypatch):
+    import csv as _csv, math as _math, random as _random
+    _random.seed(3)
+    monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path)
+    now = time.time()
+    for back in range(3, -1, -1):
+        day = time.strftime("%Y%m%d", time.gmtime(now - back * 86400))
+        t0 = int((now - back * 86400) // 86400 * 86400 * 1000)
+        with open(tmp_path / f"basis_log_{day}.csv", "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["ts_ms", "symbol", "entry_bps", "close_bps",
+                        "funding_8h_bps", "max_notional_usd", "perp_trades_24h"])
+            for m in range(0, 1440):
+                e = 15 + _random.gauss(0, 3)
+                if m % 300 < 30:
+                    e += 60 * (1 - (m % 300) / 30)
+                w.writerow([t0 + m * 60000, "AAAUSDT", f"{e:.2f}",
+                            f"{e - 8:.2f}", "1.0", "500", "20000"])
+    bot = _bot_with_db(tmp_path)
+    sent = []
+
+    async def fake_send(chat, text):
+        sent.append((chat, text))
+    bot._send = fake_send
+    bot._reply_chat = "42"
+    reply = bot._cmd_study(["spike", "3"])
+    assert "spike study started" in reply
+    assert "already running" in bot._cmd_study(["spike"])
+    await bot._study_task
+    assert sent and sent[0][0] == "42"
+    report = sent[0][1]
+    assert "does the basis revert" in report and "spike_z" in report
+    assert "FAILED" not in report

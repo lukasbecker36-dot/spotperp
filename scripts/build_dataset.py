@@ -69,6 +69,7 @@ _DROP_HELP = {
     ),
     "min_depth": "Every candidate was below --min-depth.",
     "min_entry": "Every candidate's entry basis was below --min-entry.",
+    "min_spike": "Every candidate's spike was below --min-spike-bps.",
     "no_outcome_window": (
         "Features computed fine but no row had the longest horizon of data"
         " behind it — use shorter --horizons."
@@ -403,7 +404,7 @@ def build(
     series: dict[str, Series], *, stride_h: float, horizons: list[int],
     floor: float, min_depth: float, min_entry: float,
     window: int, window_max_h: float, sustain: int, baseline_h: int,
-    drops: dict,
+    drops: dict, min_spike_bps: float | None = None,
 ) -> list[dict]:
     rows: list[dict] = []
     done = 0
@@ -435,6 +436,14 @@ def build(
             if feat is None:
                 continue
             last_emit = s.ts[i]
+            # Spike studies only need rows that are dislocated at all; the
+            # outcome walk is the expensive part, so skip the rest before it.
+            if min_spike_bps is not None and (
+                feat.get("spike_bps") in ("", None)
+                or feat["spike_bps"] < min_spike_bps
+            ):
+                drops["min_spike"] = drops.get("min_spike", 0) + 1
+                continue
             out = outcomes(s, i, feat, horizons, floor, sustain)
             if out:
                 rows.append({"symbol": symbol, **feat, **out})
@@ -464,6 +473,10 @@ def main() -> None:
     ap.add_argument("--min-depth", type=float, default=config.SCREEN_MIN_DEPTH_USD)
     ap.add_argument("--min-entry", type=float, default=0.0,
                     help="only emit rows whose entry basis is at least this")
+    ap.add_argument("--min-spike-bps", type=float, default=None,
+                    help="only emit rows whose entry sits at least this far"
+                         " above its 24h norm (spike studies: skips the"
+                         " outcome walk for undislocated rows)")
     ap.add_argument("--every", type=int, default=1,
                     help="downsample the log 1-in-N while loading (memory)")
     ap.add_argument("--symbols", default="", help="comma-separated filter")
@@ -510,6 +523,7 @@ def main() -> None:
         floor=args.floor, min_depth=args.min_depth, min_entry=args.min_entry,
         window=args.window, window_max_h=args.window_max_hours,
         sustain=args.sustain, baseline_h=args.baseline_hours, drops=drops,
+        min_spike_bps=args.min_spike_bps,
     )
     if not rows:
         # Say WHICH constraint bit. "No rows" with a 168h horizon over a 5h log
