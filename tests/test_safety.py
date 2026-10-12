@@ -2938,3 +2938,19 @@ async def test_autoadd_respects_the_per_leg_cap(engine, monkeypatch):
     database.set_setting(engine.conn, "auto_enter", {"fill": 300})
     out = engine._auto_enter("fill", "BTCUSDT", {"jitter_bps": 2.0})
     assert "per-leg cap" in out and not engine.executor.has_task(pos_id)
+
+
+async def test_position_marks_carry_ranges_and_hourly_funding(engine):
+    """The /review advisor reads only the heartbeat, so each mark must say
+    where the basis sits in its own history and what funding pays now."""
+    pos_id = await open_position(engine)
+    import time as _time
+    now = int(_time.time() * 1000)
+    for h in range(24):
+        engine._basis_24h.add("BTCUSDT", now - h * 3_600_000, 40.0 + h, 30.0 + h)
+    engine.md.funding["BTCUSDT"] = {"funding_rate": Decimal("0.0008")}   # 8bps / 8h
+    m = engine._position_marks()[str(pos_id)]
+    assert m["entry_range_24h"][0] < m["entry_range_24h"][1]
+    assert m["exit_range_24h"] is not None
+    assert m["funding_now_bps_per_h"] == 1.0
+    assert m["entry_bps_now"] is not None and m["exit_taker_bps_now"] is not None

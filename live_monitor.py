@@ -1187,8 +1187,45 @@ class Engine:
                     "24h norm exit" if pos.trade_kind == "spike"
                     else "24h exit low"
                 )
+            mark.update(self._mark_context(pos, pair, aster, mexc))
             marks[str(pos.id)] = mark
         return marks
+
+    def _mark_context(self, pos: pm.Position, pair, aster, mexc) -> dict:
+        """Where a position's basis sits in its own history, and its live
+        funding — so a reader (the /review advisor) can tell an outlier from
+        the pair's normal level without the engine's in-memory state."""
+        mult = pair.qty_multiplier
+        out: dict = {
+            # Same definitions as /book: entry ask/ask, taker exit ask/bid.
+            "entry_bps_now": float(
+                (aster.ask / mult - mexc.ask) / mexc.ask * Decimal(10000)
+            ) if aster.ask > 0 and mexc.ask > 0 else None,
+            "exit_taker_bps_now": float(
+                (aster.ask / mult - mexc.bid) / mexc.bid * Decimal(10000)
+            ) if aster.ask > 0 and mexc.bid > 0 else None,
+        }
+        for label, daily in (("24h", self._basis_24h), ("72h", self._basis_base)):
+            e_lo, e_hi = daily.percentiles(pos.symbol)
+            x_lo, x_hi = daily.percentiles(pos.symbol, close=True)
+            out[f"entry_range_{label}"] = (
+                [round(e_lo, 1), round(e_hi, 1)] if e_lo is not None else None
+            )
+            out[f"exit_range_{label}"] = (
+                [round(x_lo, 1), round(x_hi, 1)] if x_lo is not None else None
+            )
+        fund = self.md.funding.get(pair.aster_symbol) or {}
+        stat = self.md.funding_stats.get(pair.aster_symbol)
+        rate = fund.get("funding_rate")
+        interval = stat.interval_hours if stat else 8
+        out["funding_now_bps_per_h"] = (
+            float(rate * Decimal(10000) / Decimal(interval))
+            if rate is not None and interval else None
+        )
+        out["funding_24h_bps_per_h"] = (
+            stat.avg_24h_8h_bps / 8.0 if stat is not None else None
+        )
+        return out
 
     def _liq_stats(self, pos: pm.Position) -> tuple[float, float] | None:
         """(liquidation_price, distance_pct) for a position's short perp, or

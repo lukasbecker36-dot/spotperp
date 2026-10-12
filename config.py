@@ -592,8 +592,10 @@ FUNDING_INTERVAL_HOURS = 8
 # SENDS MESSAGES — it cannot place, size or close orders. Trigger on demand with
 # /review, or on a schedule via deploy/basis-trade-advisor.timer.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-opus-4-8")
-ADVISOR_MAX_TOKENS = int(os.environ.get("ADVISOR_MAX_TOKENS", "1200"))
+ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-sonnet-5-5")
+# Thinking depth for the review (low|medium|high|xhigh|max).
+ADVISOR_EFFORT = os.environ.get("ADVISOR_EFFORT", "medium")
+ADVISOR_MAX_TOKENS = int(os.environ.get("ADVISOR_MAX_TOKENS", "16000"))
 # How many top funding-carry opportunities to show the advisor as alternatives.
 ADVISOR_TOP_OPPORTUNITIES = int(os.environ.get("ADVISOR_TOP_OPPORTUNITIES", "12"))
 # Scheduled runs only fire when the local hour (ADVISOR_TIMEZONE) is one of
