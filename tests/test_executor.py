@@ -1296,3 +1296,22 @@ async def test_cancelled_passive_exit_still_sells_a_filled_clip(env):
     final = positions.get(pos_id)
     assert final.spot_qty == final.perp_qty        # hedged again, not long
     assert final.perp_qty == mid.perp_qty          # nothing further bought back
+
+
+async def test_cancelled_exit_leaves_spot_dust_without_alerting(env):
+    """UPUSDT #267: re-issuing /exit cancelled the old exit, whose cleanup
+    tried to sell 4.78 coins (~$0.93) against MEXC's $1 minimum and raised a
+    'naked spot' alarm. Dust below the venue minimum is left, not sold."""
+    md, positions, executor, notifier, conn = env
+    pos_id = await open_position(md, positions, executor)
+    # 0.02 extra spot @ ~100 = $2, under the test venue's $5 minimum.
+    positions.record_fill(pos_id, "mexc", "entry", "BUY", Decimal("0.02"),
+                          Decimal("100"), Decimal(0))
+    set_books(md, "100.4", "100.5", "99.9", "100.0")       # target 5 gates it
+    positions.set_exit_request(pos_id, "passive", Decimal(5))
+    await executor.start_exit(positions.get(pos_id))
+    await asyncio.sleep(0.1)
+    await executor._cancel_task(pos_id)
+    assert not any("sale incomplete" in m for m in notifier.messages)
+    logged = [r["message"] for r in conn.execute("SELECT message FROM journal")]
+    assert any("spot dust" in m for m in logged)

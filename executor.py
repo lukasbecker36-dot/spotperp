@@ -1548,6 +1548,18 @@ class Executor:
             if not force and to_sell * ref < config.MIN_HEDGE_NOTIONAL_USD:
                 return
             qty = min(to_sell, self._positions.get(position.id).spot_qty)
+            # Below MEXC's minimum order notional no sale can ever go through
+            # (UPUSDT #267: 4.78 coins ~ $0.93 vs a $1 minimum). Drop it here,
+            # as _finalize_close already writes such dust off, instead of
+            # alerting a "naked" position over a dollar — or wedging the final
+            # step of an exit retrying an order MEXC will always refuse.
+            if book is not None and self._is_dust(mexc_info, qty, book.bid):
+                journal(self._conn, f"position {position.id}: spot dust {qty}"
+                        f" (~${float(qty * book.bid):.2f}) below the MEXC minimum"
+                        " — left, not sold")
+                to_sell = Decimal(0)
+                pend_perp_qty = pend_perp_cost = Decimal(0)
+                return
             try:
                 perp_vwap = (
                     pend_perp_cost / pend_perp_qty if pend_perp_qty > 0 else None
@@ -1603,14 +1615,15 @@ class Executor:
                     return
                 last_sale_alert = now_m
                 reason = f" — MEXC: {err}" if err else " (no fill / thin book)"
-                # The perp is already bought back by now, so this is not a
-                # stalled exit — it is a naked long. Say so.
+                # The perp behind this spot is already bought back, so this is
+                # not a stalled exit — it is a naked long. Say so.
                 extra = (
                     " — no resting order of ours is locking it, so the venue"
-                    " holds less than the DB thinks. The perp is already closed:"
-                    " you are NAKED LONG this spot until it sells. Check MEXC"
+                    " holds less than the DB thinks. Its perp is already bought"
+                    " back: you are NAKED LONG this spot until it sells. Check MEXC"
                     if sale_blocked else
-                    " — the perp is already closed, so this spot is unhedged"
+                    " — its perp is already bought back, so this spot is"
+                    " unhedged until it sells"
                 )
                 await self._notifier.alert(
                     f"🚨 position {position.id} {symbol}: spot exit sale incomplete,"
