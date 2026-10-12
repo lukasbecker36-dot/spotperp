@@ -161,6 +161,7 @@ class Engine:
         self._last_score_record = 0.0
         self._score_alerts = score_alerts.AlertState()
         self._score_alert_levels: dict[str, float | None] = {}
+        self._auto_acted: set[str] = set()   # auto-entered/added this scan
         # A second, longer window. Hourly aggregates only, so a few hundred
         # floats per symbol — the cost is nil and it answers a question the
         # 24h band cannot: whether TODAY is the anomaly.
@@ -414,6 +415,7 @@ class Engine:
         per episode (see score_alerts.AlertState)."""
         levels = database.get_setting(self.conn, "score_alert", {}) or {}
         ts = int(time.time() * 1000)
+        self._auto_acted = set()   # symbols auto-entered/added this scan
         for board in score_alerts.BOARDS:
             level = levels.get(board)
             if level != self._score_alert_levels.get(board):
@@ -429,13 +431,31 @@ class Engine:
                 ):
                     msg = score_alerts.format_alert(board, row, float(level))
                     entered = self._auto_enter(board, row["symbol"], row)
-                    if entered and entered.startswith("🤖 auto-entry #"):
+                    if entered and entered.startswith("🤖 auto-entry #"):  # started or adding
                         msg += "\n" + entered
                     elif entered:
                         # A skip is not news on the alert; keep the reason
                         # in the journal (/log) for when it is wanted.
                         journal(self.conn, f"{row['symbol']}: {entered}")
                     await self.notifier.alert(msg)
+
+    def _auto_actions_since(self, since_ms: int, symbol: str | None = None) -> int:
+        """Auto entries AND adds since `since_ms` (optionally on one symbol),
+        from the persisted action log — adds create no position row, so the
+        caps and cooldown cannot be counted from positions alone."""
+        log_ = database.get_setting(self.conn, "auto_actions", []) or []
+        return sum(1 for ts, sym in log_
+                   if ts >= since_ms and (symbol is None or sym == symbol))
+
+    def _record_auto_action(self, symbol: str, ts_ms: int) -> None:
+        keep = ts_ms - 2 * 86_400_000
+        log_ = [
+            [ts, sym] for ts, sym in
+            (database.get_setting(self.conn, "auto_actions", []) or [])
+            if ts >= keep
+        ]
+        log_.append([ts_ms, symbol])
+        database.set_setting(self.conn, "auto_actions", log_)
 
     def _auto_enter(
         self, board: str, symbol: str, row: dict | None = None,
@@ -448,9 +468,24 @@ class Engine:
             return None
         if symbol not in self.md.pair_maps:
             return "🤖 auto-entry skipped: not cross-listed"
-        held = [p for p in self.positions.active() if p.symbol == symbol]
-        if held:
-            return f"🤖 auto-entry skipped: already holding #{held[0].id}"
+        # One auto action per symbol per scan: /funding and /screen spike can
+        # alert on the same coin in the same scan.
+        if symbol in self._auto_acted:
+            return f"🤖 auto-entry skipped: {symbol} already acted on this scan"
+        held = [
+            p for p in self.positions.active()
+            if p.symbol == symbol and p.state != pm.UNWINDING
+        ]
+        if len(held) > 1:
+            return (f"🤖 auto-entry skipped: {len(held)} positions in {symbol}"
+                    " — manage them by ID")
+        add_to = held[0] if held else None
+        if add_to is not None and (
+            add_to.state != pm.OPEN or self.executor.has_task(add_to.id)
+            or add_to.exit_mode is not None
+        ):
+            return (f"🤖 auto-entry skipped: #{add_to.id} is {add_to.state}"
+                    " (still working) — not adding to it")
         cap = config.AUTO_ENTER_MAX_JITTER_BPS
         if cap is not None and row is not None:
             jit = row.get("jitter_bps")
@@ -461,22 +496,48 @@ class Engine:
                 return (f"🤖 auto-entry skipped: jit {jit:.1f} > {cap:g} — basis"
                         " too jumpy to work a resting order")
         open_auto = [p for p in self.positions.active() if p.auto_entered]
-        if len(open_auto) >= config.AUTO_ENTER_MAX_OPEN:
+        if add_to is None and len(open_auto) >= config.AUTO_ENTER_MAX_OPEN:
             return (f"🤖 auto-entry skipped: {len(open_auto)} auto positions open"
                     f" (max {config.AUTO_ENTER_MAX_OPEN})")
         now_ms = int(time.time() * 1000)
-        today = self.positions.auto_entries_since(now_ms - 86_400_000)
+        today = self._auto_actions_since(now_ms - 86_400_000)
         if today >= config.AUTO_ENTER_MAX_PER_DAY:
             return (f"🤖 auto-entry skipped: {today} auto entries in 24h"
                     f" (max {config.AUTO_ENTER_MAX_PER_DAY})")
         cool_ms = int(config.AUTO_ENTER_SYMBOL_COOLDOWN_HOURS * 3_600_000)
-        if self.positions.auto_entries_since(now_ms - cool_ms, symbol):
+        if self._auto_actions_since(now_ms - cool_ms, symbol):
             return (f"🤖 auto-entry skipped: {symbol} auto-entered within"
                     f" {config.AUTO_ENTER_SYMBOL_COOLDOWN_HOURS:g}h")
         amount = Decimal(str(notional))
         if amount <= 0 or amount > config.MAX_NOTIONAL_PER_LEG_USD:
             return (f"🤖 auto-entry skipped: notional ${amount} outside"
                     f" (0, {config.MAX_NOTIONAL_PER_LEG_USD}]")
+        mode = "PAPER" if self.paper else "LIVE"
+        if add_to is not None:
+            # Size up what is already held, as /enter does for a held symbol:
+            # the position keeps its own kind and exit rules.
+            pair = self.md.pair_maps[symbol]
+            aster = self.md.aster_books.get(pair.aster_symbol)
+            cur = (
+                add_to.perp_qty * aster.bid if aster and aster.bid > 0
+                else add_to.target_notional
+            )
+            if cur + amount > config.MAX_NOTIONAL_PER_LEG_USD:
+                return (f"🤖 auto-entry skipped: adding ${amount} would take"
+                        f" #{add_to.id} to ~${float(cur + amount):,.0f}, over the"
+                        f" ${config.MAX_NOTIONAL_PER_LEG_USD} per-leg cap")
+            self._auto_acted.add(symbol)
+            self._record_auto_action(symbol, now_ms)
+            self.executor.start_add(add_to, amount)
+            journal(self.conn, f"position {add_to.id}: AUTO-ADD {symbol} ${amount}"
+                    f" off the {board} score alert")
+            return (
+                f"🤖 auto-entry #{add_to.id} adding ({mode}): +${amount} to"
+                f" ~${float(cur):,.0f} {symbol} [{add_to.trade_kind}] — keeps"
+                f" its own exit rules. /cancel {add_to.id} stops the add"
+            )
+        self._auto_acted.add(symbol)
+        self._record_auto_action(symbol, now_ms)
         # /funding is the carry board: hold for the funding and leave the close
         # to the operator (/exit, /auto). /screen fill is about round trips,
         # so those auto-exit short of the 24h exit low.

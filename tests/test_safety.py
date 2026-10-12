@@ -104,6 +104,7 @@ def engine(tmp_path, monkeypatch):
     eng._last_score_record = 0.0
     eng._score_alerts = score_alerts.AlertState()
     eng._score_alert_levels = {}
+    eng._auto_acted = set()
 
     class _NoOrders:
         """Venue stub for command handlers that list resting orders."""
@@ -2698,7 +2699,7 @@ async def test_autoenter_starts_a_convergence_entry_on_the_alert(engine):
     assert f"auto-entry #{pos.id} started (PAPER)" in msg
 
 
-async def test_autoenter_off_or_held_does_not_enter(engine):
+async def test_autoenter_off_does_not_enter_and_held_is_added_to(engine):
     set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
     _fill_board(engine)
     database.set_setting(engine.conn, "score_alert", {"fill": 40.0})
@@ -2706,15 +2707,17 @@ async def test_autoenter_off_or_held_does_not_enter(engine):
     assert engine.positions.active() == []
 
     pos_id = await open_position(engine)                # now held by hand
+    before = engine.positions.get(pos_id).perp_qty
     database.set_setting(engine.conn, "auto_enter", {"fill": 300})
     database.set_setting(engine.conn, "score_alert", {"fill": 41.0})  # re-alert
     await engine._check_score_alerts()
-    assert [p.id for p in engine.positions.active()] == [pos_id]
-    # A skip stays off the alert and goes to the journal instead.
-    assert "auto-entry" not in engine.notifier.messages[-1]
-    logged = [r["message"] for r in engine.conn.execute(
-        "SELECT message FROM journal").fetchall()]
-    assert any("already holding" in m for m in logged)
+    assert [p.id for p in engine.positions.active()] == [pos_id]   # no 2nd position
+    assert f"auto-entry #{pos_id} adding" in engine.notifier.messages[-1]
+    for _ in range(200):
+        if not engine.executor.has_task(pos_id):
+            break
+        await asyncio.sleep(0.02)
+    assert engine.positions.get(pos_id).perp_qty > before          # sized up
 
 
 async def test_autoenter_respects_caps_and_cooldown(engine, monkeypatch):
@@ -2724,6 +2727,7 @@ async def test_autoenter_respects_caps_and_cooldown(engine, monkeypatch):
     # Cooldown: close it out, the same symbol may not be re-entered within 24h.
     for p in engine.positions.active():
         engine.positions.set_state(p.id, pm.CLOSED)
+    engine._auto_acted.clear()                     # a later scan
     assert "within 24h" in engine._auto_enter("fill", "BTCUSDT")
     # Daily cap.
     monkeypatch.setattr(config, "AUTO_ENTER_SYMBOL_COOLDOWN_HOURS", 0.0)
@@ -2909,3 +2913,28 @@ async def test_spike_autoentry_opens_a_spike_trade(engine):
     out = engine._auto_enter("spike", "BTCUSDT", {"jitter_bps": 2.0})
     assert "SPIKE — auto-exits at the 24h norm" in out
     assert engine.positions.active()[0].trade_kind == "spike"
+
+
+
+async def test_two_boards_alerting_one_coin_act_once(engine):
+    """/funding and /screen spike can alert on the same coin in one scan."""
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    row = {"symbol": "BTCUSDT", "score": 99.0, "entry_bps": 50.0,
+           "lo24_bps": 5.0, "hi24_bps": 80.0, "funding_8h_bps": 1.6,
+           "volume_24h": 1_200_000, "depth_usd": 900.0, "jitter_bps": 2.0}
+    engine._board_rows = {"funding": [dict(row)], "spike": [dict(row)]}
+    database.set_setting(engine.conn, "score_alert", {"funding": 40.0, "spike": 40.0})
+    database.set_setting(engine.conn, "auto_enter", {"funding": 300, "spike": 100})
+    database.set_setting(engine.conn, "auto_enter", {"funding": 300, "spike": 100})
+    await engine._check_score_alerts()
+    assert len(engine.positions.active()) == 1
+    started = [m for m in engine.notifier.messages if "auto-entry #" in m]
+    assert len(started) == 1
+
+
+async def test_autoadd_respects_the_per_leg_cap(engine, monkeypatch):
+    pos_id = await open_position(engine)
+    monkeypatch.setattr(config, "MAX_NOTIONAL_PER_LEG_USD", Decimal(1200))
+    database.set_setting(engine.conn, "auto_enter", {"fill": 300})
+    out = engine._auto_enter("fill", "BTCUSDT", {"jitter_bps": 2.0})
+    assert "per-leg cap" in out and not engine.executor.has_task(pos_id)

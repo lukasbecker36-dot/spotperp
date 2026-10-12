@@ -158,8 +158,11 @@ SCORE_ALERT_LOOKBACK_DAYS = float(os.environ.get("SCORE_ALERT_LOOKBACK_DAYS", "7
 # /autoenter: when a board's score alert fires for a name, start a normal
 # (non-carry) entry at the operator's notional. Hard limits, whatever the
 # alerts say: open auto-entered positions, auto entries per rolling 24h, and
-# a per-symbol cooldown since its last auto entry. A symbol already held is
-# never auto-entered (no auto size-ups).
+# a per-symbol cooldown since its last auto entry or add. A symbol already
+# held is ADDED to when that position is OPEN and idle (it keeps its own kind
+# and exit rules); adds count toward the daily cap and cooldown. One coin is
+# acted on at most once per scan, so /funding and /screen spike alerting on it
+# together cannot double up.
 # Auto-entry only fires on a basis steady enough to work a resting order:
 # 5m jitter at or under this (the boards' own cap, SCREEN_MAX_BASIS_JITTER_BPS,
 # is looser so a human can still look at a flickery name). USUSDT auto-fired

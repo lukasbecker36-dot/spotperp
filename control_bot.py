@@ -1007,7 +1007,9 @@ class ControlBot:
             + f"limits: {config.AUTO_ENTER_MAX_OPEN} open auto positions,"
             f" {config.AUTO_ENTER_MAX_PER_DAY} entries per 24h,"
             f" {config.AUTO_ENTER_SYMBOL_COOLDOWN_HOURS:g}h per-symbol cooldown,"
-            " never into a symbol already held."
+            " a held symbol is ADDED to (if OPEN and idle, within the per-leg"
+            " cap, keeping its own exit rules), and one coin is acted on once"
+            " per scan even if two boards alert on it."
         )
         usage = (
             "usage: /autoenter fill 200 | /autoenter funding 150 |"
