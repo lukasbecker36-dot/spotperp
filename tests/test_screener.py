@@ -984,3 +984,17 @@ def test_spike_board_only_takes_normal_books(monkeypatch):
     wide = _spike_row("WIDE", 80.0, 10.0, 5.0, z=8.0)
     wide.spread_cost_bps = 40.0                             # free perp spread
     assert [r.symbol for r in screener.rank_rows_by_spike([ok, wide])] == ["OK"]
+
+
+def test_carry_score_does_not_count_a_spike(monkeypatch):
+    """IOUSDT: +164 on the carry board from a 181bps 5m entry against a 24h
+    range of -5..+8. A spiking entry is scored at the pair's 24h high."""
+    monkeypatch.setattr(config, "SPIKE_MIN_Z", 3.0)
+    r = _quote_row("IO", 181.0, 170.0, depth=500.0)
+    r.basis_p10_24h, r.basis_p90_24h = -5.3, 7.6
+    r.spike_z = 9.0
+    assert screener.carry_entry_bps(r) == 7.6
+    spiky = screener.carry_score(r, 1.0, 1.0)
+    r.spike_z = 1.0                                   # a normal day
+    assert screener.carry_entry_bps(r) == 181.0
+    assert screener.carry_score(r, 1.0, 1.0) > spiky

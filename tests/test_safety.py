@@ -2954,3 +2954,28 @@ async def test_position_marks_carry_ranges_and_hourly_funding(engine):
     assert m["exit_range_24h"] is not None
     assert m["funding_now_bps_per_h"] == 1.0
     assert m["entry_bps_now"] is not None and m["exit_taker_bps_now"] is not None
+
+
+async def test_alert_waits_for_five_level_depth(engine):
+    """IOUSDT alerted on 'depth$ 7' — the touch fallback of a just-listed row
+    whose five-level depth had not been fetched yet."""
+    _fill_board(engine)
+    engine._board_rows["fill"][0]["depth5_known"] = False
+    database.set_setting(engine.conn, "score_alert", {"fill": 40.0})
+    await engine._check_score_alerts()
+    assert not [m for m in engine.notifier.messages if "🔔" in m]
+    engine._board_rows["fill"][0]["depth5_known"] = True      # fetched
+    await engine._check_score_alerts()
+    assert len([m for m in engine.notifier.messages if "🔔" in m]) == 1
+
+
+async def test_funding_autoentry_skips_a_spike(engine):
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    database.set_setting(engine.conn, "auto_enter", {"funding": 300})
+    out = engine._auto_enter("funding", "BTCUSDT",
+                             {"jitter_bps": 2.0, "spike_z": 9.0})
+    assert "a spike (z 9.0) not a carry" in out
+    assert engine.positions.active() == []
+    out = engine._auto_enter("funding", "BTCUSDT",
+                             {"jitter_bps": 2.0, "spike_z": 1.0})
+    assert out.startswith("🤖 auto-entry #")

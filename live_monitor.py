@@ -426,6 +426,13 @@ class Engine:
             if level is None:
                 continue
             for row in self._board_rows.get(board) or []:
+                # Judge a name on its real five-level depth, not the touch
+                # fallback a just-listed row carries until its book is
+                # fetched (IOUSDT alerted on "depth$ 7"). Not observed, so it
+                # alerts on the next scan that has the figure if it still
+                # qualifies.
+                if not row.get("depth5_known", True):
+                    continue
                 if self._score_alerts.observe(
                     ts, board, row["symbol"], float(row["score"]), float(level)
                 ):
@@ -486,6 +493,15 @@ class Engine:
         ):
             return (f"🤖 auto-entry skipped: #{add_to.id} is {add_to.state}"
                     " (still working) — not adding to it")
+        # /funding auto-entries open CARRY trades (no auto-exit). A row whose
+        # basis has jumped far above its own 24h norm is a spike, not a carry
+        # — IOUSDT scored +164 on a 181bps 5m entry against a 24h range of
+        # -5..+8 with 0.12bps/h of funding. Leave those to /screen spike,
+        # whose trades exit back at the norm.
+        z = (row or {}).get("spike_z")
+        if board == "funding" and z is not None and z >= config.SPIKE_MIN_Z:
+            return (f"🤖 auto-entry skipped: a spike (z {z:.1f}) not a carry —"
+                    " left to /screen spike")
         cap = config.AUTO_ENTER_MAX_JITTER_BPS
         if cap is not None and row is not None:
             jit = row.get("jitter_bps")
@@ -822,6 +838,7 @@ class Engine:
                 "depth_usd": (r.mexc_ask_depth_usd
                               if r.mexc_ask_depth_usd is not None
                               else r.max_notional_usd),
+                "depth5_known": r.mexc_ask_depth_usd is not None,
                 "spike_bps": r.spike_bps, "spike_z": r.spike_z,
                 "norm_close_bps": r.norm_close_bps,
             }
@@ -852,6 +869,7 @@ class Engine:
                 "depth_usd": (r.mexc_ask_depth_usd
                               if r.mexc_ask_depth_usd is not None
                               else r.max_notional_usd),
+                "depth5_known": r.mexc_ask_depth_usd is not None,
             }
             for r in fill_rows
         ]
@@ -1061,6 +1079,8 @@ class Engine:
                 "depth_usd": (r["mexc_ask_depth_usd"]
                               if r["mexc_ask_depth_usd"] is not None
                               else r["max_notional_usd"]),
+                "depth5_known": r["mexc_ask_depth_usd"] is not None,
+                "spike_z": r.get("spike_z"),
             }
             for r in rows
         ]
@@ -1103,6 +1123,7 @@ class Engine:
             "basis_p90_24h": screen.basis_p90_24h,
             "close_p10_24h": screen.close_p10_24h,
             "hours_24h": screen.hours_24h,
+            "spike_z": screen.spike_z,
             # The board's one number: basis one-off + carry stream over a
             # fixed horizon. Sorting on this replaces ranking by raw carry,
             # which put a collapsed 61bps average on a $5 book on top.

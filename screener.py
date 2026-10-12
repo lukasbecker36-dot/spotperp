@@ -583,9 +583,20 @@ def carry_score(
     with no takers is not an edge.
     """
     return carry_score_of(
-        row.entry_bps_avg, row.basis_p10_24h, avg_8h_bps, current_8h_bps,
+        carry_entry_bps(row), row.basis_p10_24h, avg_8h_bps, current_8h_bps,
         row.perp_trades_24h,
     )
+
+
+def carry_entry_bps(row: ScreenerRow) -> float:
+    """The entry the carry score counts. When the basis is SPIKING far above
+    the pair's own norm (spike_z >= SPIKE_MIN_Z), cap it at the 24h high: a
+    one-off jump is a reversion trade for /screen spike, and must not carry a
+    name to the top of the CARRY board (IOUSDT: +164 from a 181bps 5m entry
+    against a 24h range of -5..+8)."""
+    if row.spike_z is not None and row.spike_z >= config.SPIKE_MIN_Z:
+        return min(row.entry_bps_avg, row.basis_p90_24h)
+    return row.entry_bps_avg
 
 
 def carry_score_of(

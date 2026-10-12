@@ -1225,7 +1225,10 @@ class ControlBot:
             f" (entry - lo24 - {floor:.0f}bps cost) + carry/h x"
             f" {config.FUNDING_SCORE_HOLD_HOURS:.0f}. The basis is a"
             " ONE-OFF you capture once; funding is a STREAM. This is the whole"
-            " board in one number — read the columns only to see WHY."
+            " board in one number — read the columns only to see WHY. A basis"
+            " SPIKING far above its own 24h norm (z >="
+            f" {config.SPIKE_MIN_Z:g}) is scored at its hi24, not the spike:"
+            " that jump is a /screen spike trade, not carry."
         )
         lines.append(
             "carry is the LOWER of 24h and fund, so a collapsed carry cannot"
