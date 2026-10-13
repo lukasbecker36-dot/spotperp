@@ -138,18 +138,36 @@ def format_alert(board: str, row: dict, level: float) -> str:
         v = row.get(key)
         return format(v * scale, fmt) if v is not None else "-"
     vol = row.get("volume_24h")
-    return (
+    head = (
         f"🔔 {BOARD_LABEL[board]} {row['symbol']}: score {row['score']:+.1f}"
         f" ≥ {level:g}\n"
-        f"entry {num('entry_bps', '.1f')}  lo24 {num('lo24_bps', '.1f')}"
-        f"  hi24 {num('hi24_bps', '.1f')}  fund"
-        f" {num('funding_8h_bps', '+.2f', 1 / 8)}bps/h\n"
-        f"vol {fmt_volume(vol) if vol else '-'}"
+    )
+    flow = (
+        f"fund {num('funding_8h_bps', '+.2f', 1 / 8)}bps/h"
+        f"  vol {fmt_volume(vol) if vol else '-'}"
         f"  depth$ {num('depth_usd', ',.0f')}  jit {num('jitter_bps', '.1f')}\n"
-        + (
-            f"spike {num('spike_bps', '+.1f')} (z {num('spike_z', '.1f')}) over"
-            f" its norm; exits at the norm exit {num('norm_close_bps', '+.1f')}\n"
-            if row.get("spike_bps") is not None else ""
+    )
+    if row.get("spike_bps") is not None:
+        # A spike trades between two SIDES of the book: in on the entry
+        # basis, out on the exit basis. Show each against its own norm and
+        # range — mixing the entry range with the exit norm read as if the
+        # norm came from another window.
+        return (
+            head
+            + f"entry {num('entry_bps', '+.1f')} vs norm entry"
+            f" {num('norm_entry_bps', '+.1f')} → spike {num('spike_bps', '+.1f')}"
+            f" (z {num('spike_z', '.1f')}); 24h entry range"
+            f" {num('lo24_bps', '+.1f')} to {num('hi24_bps', '+.1f')}\n"
+            + f"exits at the norm exit {num('norm_close_bps', '+.1f')} (24h exit"
+            f" range {num('exit_lo24_bps', '+.1f')} to"
+            f" {num('exit_hi24_bps', '+.1f')})\n"
+            + flow
+            + f"/book {row['symbol']} before entering"
         )
+    return (
+        head
+        + f"entry {num('entry_bps', '.1f')}  lo24 {num('lo24_bps', '.1f')}"
+        f"  hi24 {num('hi24_bps', '.1f')}\n"
+        + flow
         + f"/book {row['symbol']} before entering"
     )

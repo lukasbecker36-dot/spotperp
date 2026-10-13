@@ -159,3 +159,14 @@ async def test_study_spike_runs_and_posts_a_report(tmp_path, monkeypatch):
     assert "does a spike PAY" in report and "spike_z" in report
     assert "roundtrip" not in report.split("\n")[0]
     assert "FAILED" not in report
+
+
+def test_spike_alert_shows_each_side_against_its_own_norm():
+    msg = score_alerts.format_alert("spike", {
+        "symbol": "IOUSDT", "score": 33.4, "entry_bps": 40.7, "lo24_bps": -11.7,
+        "hi24_bps": 35.0, "funding_8h_bps": 0.56, "volume_24h": 155_000,
+        "depth_usd": 4561, "jitter_bps": 8.3, "spike_bps": 45.5, "spike_z": 6.4,
+        "norm_close_bps": -22.0, "norm_entry_bps": -4.8,
+        "exit_lo24_bps": -30.1, "exit_hi24_bps": -8.4}, 20)
+    assert "vs norm entry -4.8 → spike +45.5 (z 6.4)" in msg
+    assert "norm exit -22.0 (24h exit range -30.1 to -8.4)" in msg

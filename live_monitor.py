@@ -876,6 +876,9 @@ class Engine:
                 "depth5_known": r.mexc_ask_depth_usd is not None,
                 "spike_bps": r.spike_bps, "spike_z": r.spike_z,
                 "norm_close_bps": r.norm_close_bps,
+                "norm_entry_bps": r.norm_entry_bps,
+                "exit_lo24_bps": r.close_p10_24h,
+                "exit_hi24_bps": r.close_p90_24h,
             }
             for r in spike_rows
         ]

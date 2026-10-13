@@ -99,6 +99,7 @@ class ScreenerRow:
     # while its exit basis never comes down, and no_exit_room gates on this.
     # None when the window holds no close samples.
     close_p10_24h: float | None = None
+    close_p90_24h: float | None = None   # ...and its p90: the EXIT-side range
     # Can this actually be TRADED? Depth is resting size; these are flow.
     perp_volume_24h: float = 0.0    # Aster perp 24h quote volume (USDT)
     perp_trades_24h: float = 0.0    # ...and how many trades made it up
@@ -753,7 +754,9 @@ class DailyBasis:
         lo, hi = self.percentiles(row.symbol)
         row.basis_p10_24h = row.entry_bps if lo is None else lo
         row.basis_p90_24h = row.entry_bps if hi is None else hi
-        row.close_p10_24h, _ = self.percentiles(row.symbol, close=True)
+        row.close_p10_24h, row.close_p90_24h = self.percentiles(
+            row.symbol, close=True
+        )
         entry = row.entry_bps_avg if row.samples else row.entry_bps
         st = spike_stats(
             entry, self.hourly_means(row.symbol),
