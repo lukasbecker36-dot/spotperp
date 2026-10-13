@@ -51,8 +51,9 @@ cost_floor_bps (fees + measured slippage).
 - Position kinds: "carry" = held for funding, NO automatic exit, the operator \
 closes it; "convergence" = auto-closes passively at auto_exit_bps (derived \
 from the pair's 24h exit low); "spike" = short-term mean reversion, \
-auto-closes passively at auto_exit_bps (the 24h norm exit basis) and works a \
-passive close at any basis after spike_max_hold_h. Liquidation stops (stops: \
+auto-closes passively at auto_exit_bps (the 24h norm exit basis); if \
+spike_max_hold_h is set it also works a passive close at any basis after that \
+many hours, otherwise there is no time stop. Liquidation stops (stops: \
 true) sit ~1% below liq and fire on their own.
 - entry_range / exit_range are p10..p90 of the pair's hourly basis over 24h \
 and 72h: use them to say whether the CURRENT basis is unusual for THIS pair \

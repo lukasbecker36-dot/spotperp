@@ -607,8 +607,10 @@ class Engine:
             + (f" CARRY — no auto-exit, close with /exit {pos.id} or arm"
                f" /auto {pos.id}."
                if kind == "carry" else
-               " SPIKE — auto-exits at the 24h norm exit basis, passive at any"
-               f" basis after {config.SPIKE_MAX_HOLD_HOURS:g}h."
+               " SPIKE — auto-exits at the 24h norm exit basis"
+               + (f", passive at any basis after {config.SPIKE_MAX_HOLD_HOURS:g}h."
+                  if config.SPIKE_MAX_HOLD_HOURS is not None else
+                  "; no time stop.")
                if kind == "spike" else
                " auto-exits short of the 24h exit low (see /positions).")
             + f" /cancel {pos.id} to stop it"
@@ -2015,9 +2017,11 @@ class Engine:
             if kind == "convergence"
             else (
                 "SPIKE: auto-closes passive at the 24h norm exit basis (capped"
-                f" at entry - {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps),"
-                f" passive at any basis after {config.SPIKE_MAX_HOLD_HOURS:g}h"
-                f"{adverse}"
+                f" at entry - {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps)"
+                + (f", passive at any basis after {config.SPIKE_MAX_HOLD_HOURS:g}h"
+                   if config.SPIKE_MAX_HOLD_HOURS is not None else
+                   ", no time stop")
+                + f"{adverse}"
             ) if kind == "spike"
             else f"CARRY: manual /exit only{adverse}"
         )
@@ -3540,7 +3544,9 @@ class Engine:
         if pos.opened_ms is not None:
             hold_hours = (time.time() * 1000 - pos.opened_ms) / 3_600_000
             if pos.trade_kind == "spike":
-                if hold_hours > config.SPIKE_MAX_HOLD_HOURS:
+                # No generic max-hold for spikes; only the optional time stop.
+                if (config.SPIKE_MAX_HOLD_HOURS is not None
+                        and hold_hours > config.SPIKE_MAX_HOLD_HOURS):
                     await self._spike_timeout(pos)
             elif hold_hours > config.MAX_HOLD_HOURS:
                 await self._force_close_timeout(pos)

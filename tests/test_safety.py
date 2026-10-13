@@ -2898,7 +2898,12 @@ async def test_spike_position_exits_at_the_norm_and_times_out_passive(engine, mo
     target, norm = engine._convergence_target(pos)
     assert norm == Decimal("10")
     assert target == min(norm, pos.entry_basis_bps - config.ENTRY_MIN_EDGE_FLOOR_BPS).quantize(Decimal("0.1"))
-    # Not reverted within the spike max hold: passive close at any basis.
+    # Off by default: an unreverted spike just keeps holding.
+    assert config.SPIKE_MAX_HOLD_HOURS is None
+    set_books(engine.md, "100.4", "101.5", "99.9", "100.0")
+    await engine._check_safety(engine.positions.get(pos.id))
+    assert engine.positions.get(pos.id).exit_mode is None
+    # With the optional time stop on: passive close at any basis.
     monkeypatch.setattr(config, "SPIKE_MAX_HOLD_HOURS", 0.0)
     set_books(engine.md, "100.4", "101.5", "99.9", "100.0")       # still wide
     await engine._check_safety(engine.positions.get(pos.id))

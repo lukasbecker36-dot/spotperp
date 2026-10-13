@@ -664,9 +664,13 @@ class ControlBot:
         )
         lines.append(
             "Enter with /enter SYMBOL NOTIONAL spike: it auto-closes passive at"
-            " the norm exit basis (capped at entry - cost), and works a passive"
-            f" close at any basis after {config.SPIKE_MAX_HOLD_HOURS:g}h if it"
-            " has not reverted. /alert spike LEVEL and /autoenter spike"
+            " the norm exit basis (capped at entry - cost)"
+            + (f", and works a passive close at any basis after"
+               f" {config.SPIKE_MAX_HOLD_HOURS:g}h if it has not reverted"
+               if config.SPIKE_MAX_HOLD_HOURS is not None else
+               "; there is no time stop, so close it yourself if it never"
+               " reverts")
+            + ". /alert spike LEVEL and /autoenter spike"
             " NOTIONAL work as on the other boards. Check whether reversion"
             " actually holds on history first: scripts/dataset_report.py"
             " --by spike_z --label norm."
@@ -1021,8 +1025,11 @@ class ControlBot:
             " entries are CARRY trades (as /enter SYMBOL NOTIONAL carry): no"
             " auto-exit or max-hold, you close them with /exit or /auto."
             " /screen spike entries are SPIKE trades: auto-close passive at"
-            " the 24h norm exit basis, passive at any basis after"
-            f" {config.SPIKE_MAX_HOLD_HOURS:g}h. " + caps
+            " the 24h norm exit basis"
+            + (f", passive at any basis after {config.SPIKE_MAX_HOLD_HOURS:g}h. "
+               if config.SPIKE_MAX_HOLD_HOURS is not None else
+               ", no time stop. ")
+            + caps
         )
         if args and args[0].lower() == "off" and len(args) == 1:
             database.set_setting(self._conn, "auto_enter", {})

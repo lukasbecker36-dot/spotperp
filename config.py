@@ -199,12 +199,16 @@ SPIKE_MIN_VOLUME_USD = float(os.environ.get("SPIKE_MIN_VOLUME_USD", "150000"))
 # the basis reverting.
 SPIKE_MAX_ROUNDTRIP_BPS = float(os.environ.get("SPIKE_MAX_ROUNDTRIP_BPS", "10"))
 # Hours a spike trade is expected to take to revert — funding over it is
-# charged in the score — and the most it is held before a passive close at
-# any level is worked.
-# Reversions that paid did so in ~0.2-0.6h, and holding a full 6h lost in
-# every bucket below z 5 — so a short expected hold and a short max hold.
+# charged in the score. (Reversions that paid did so in ~0.2-0.6h.)
 SPIKE_HOLD_HOURS = float(os.environ.get("SPIKE_HOLD_HOURS", "1"))
-SPIKE_MAX_HOLD_HOURS = float(os.environ.get("SPIKE_MAX_HOLD_HOURS", "2"))
+# Optional time stop: after this many hours an unreverted spike works a
+# passive close at ANY basis. OFF by default (operator decision) — a spike
+# trade holds until its norm-exit auto-close, or you close it. Set hours to
+# enable.
+_smh = os.environ.get("SPIKE_MAX_HOLD_HOURS", "").strip().lower()
+SPIKE_MAX_HOLD_HOURS: float | None = (
+    None if _smh in ("", "off", "none") else float(_smh)
+)
 SCREEN_FILL_MIN_HOURS = float(os.environ.get("SCREEN_FILL_MIN_HOURS", "4"))
 # Reject a basis that jumps wildly tick to tick: a resting order can't be
 # worked against it, because the price you get is a lottery (BULLA printed
