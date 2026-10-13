@@ -1011,7 +1011,10 @@ class ControlBot:
             + f"limits: {config.AUTO_ENTER_MAX_OPEN} open auto positions,"
             f" {config.AUTO_ENTER_MAX_PER_DAY} entries per 24h,"
             f" {config.AUTO_ENTER_SYMBOL_COOLDOWN_HOURS:g}h per-symbol cooldown,"
-            " a held symbol is ADDED to (if OPEN and idle, within the per-leg"
+            " While auto-entry is ON for a board, that board's alerts arrive"
+            " ONLY when an entry or add starts; a name it declines (jitter,"
+            " floor, cooldown, caps) is not alerted — the reason is in /log."
+            " A held symbol is ADDED to (if OPEN and idle, within the per-leg"
             " cap, keeping its own exit rules), and one coin is acted on once"
             " per scan even if two boards alert on it."
         )

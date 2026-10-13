@@ -3008,3 +3008,33 @@ async def test_autoentry_floor_follows_what_the_trade_bets_on(engine, monkeypatc
     floor, _ = engine._auto_entry_floor("fill", {"lo24_bps": -40.0})
     assert floor == cost                                  # never below the default
     assert engine._auto_entry_floor("funding", {"lo24_bps": 20.0}) == (None, "")
+
+
+async def test_declined_autoentry_suppresses_the_alert(engine, monkeypatch):
+    """With auto-entry ON for a board an alert means 'I acted': a name it
+    declines (here: jit over the cap) is journalled, not alerted."""
+    monkeypatch.setattr(config, "AUTO_ENTER_MAX_JITTER_BPS", 10.0)
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    _fill_board(engine)
+    engine._board_rows["fill"][0]["jitter_bps"] = 10.3
+    database.set_setting(engine.conn, "score_alert", {"fill": 40.0})
+    database.set_setting(engine.conn, "auto_enter", {"fill": 300})
+    await engine._check_score_alerts()
+    assert not [m for m in engine.notifier.messages if "🔔" in m]
+    logged = [r["message"] for r in engine.conn.execute("SELECT message FROM journal")]
+    assert any("jit 10.3 > 10" in m and "alert suppressed" in m for m in logged)
+    # Auto-entry off for the board: plain alerts as before.
+    database.set_setting(engine.conn, "auto_enter", {})
+    database.set_setting(engine.conn, "score_alert", {"fill": 41.0})
+    await engine._check_score_alerts()
+    assert len([m for m in engine.notifier.messages if "🔔" in m]) == 1
+
+
+async def test_autoentry_skips_an_entry_already_below_its_floor(engine):
+    """LUMIAUSDT: entry 0.0 against the 25bps carry floor would never fill."""
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    database.set_setting(engine.conn, "auto_enter", {"funding": 300})
+    out = engine._auto_enter("funding", "BTCUSDT",
+                             {"jitter_bps": 2.0, "entry_bps": 0.0})
+    assert "below its +25.0bps floor" in out
+    assert engine.positions.active() == []

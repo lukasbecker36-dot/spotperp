@@ -441,9 +441,15 @@ class Engine:
                     if entered and entered.startswith("🤖 auto-entry #"):  # started or adding
                         msg += "\n" + entered
                     elif entered:
-                        # A skip is not news on the alert; keep the reason
-                        # in the journal (/log) for when it is wanted.
-                        journal(self.conn, f"{row['symbol']}: {entered}")
+                        # Auto-entry is ON for this board and declined the
+                        # name for a reason (jitter, floor, cooldown, caps...):
+                        # with auto-entry on, an alert means "I acted", so a
+                        # declined name is not alerted. The reason goes to the
+                        # journal (/log). The episode still counts, so it is
+                        # not re-tried every scan.
+                        journal(self.conn, f"{row['symbol']}: {entered}"
+                                " (alert suppressed)")
+                        continue
                     await self.notifier.alert(msg)
 
     def _auto_actions_since(self, since_ms: int, symbol: str | None = None) -> int:
@@ -561,6 +567,14 @@ class Engine:
             f"basis floor {float(floor):+.1f}bps ({floor_why})" if floor is not None
             else f"basis floor {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps"
         )
+        # The entry rests only while the basis is at or above its floor. An
+        # entry already below it would sit unfilled (LUMIAUSDT: entry 0.0
+        # against the 25bps default), so don't start one.
+        eff_floor = floor if floor is not None else config.ENTRY_MIN_EDGE_FLOOR_BPS
+        entry_now = (row or {}).get("entry_bps")
+        if entry_now is not None and Decimal(str(entry_now)) < eff_floor:
+            return (f"🤖 auto-entry skipped: entry {entry_now:+.1f} is below its"
+                    f" {float(eff_floor):+.1f}bps floor — it would not fill")
         if add_to is not None:
             # Size up what is already held, as /enter does for a held symbol:
             # the position keeps its own kind and exit rules.
