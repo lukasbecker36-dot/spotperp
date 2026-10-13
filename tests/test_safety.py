@@ -2979,3 +2979,27 @@ async def test_funding_autoentry_skips_a_spike(engine):
     out = engine._auto_enter("funding", "BTCUSDT",
                              {"jitter_bps": 2.0, "spike_z": 1.0})
     assert out.startswith("🤖 auto-entry #")
+
+
+async def test_autoentry_floor_follows_what_the_trade_bets_on(engine, monkeypatch):
+    """A fixed 25bps floor assumes an exit near zero. A spike exits at its
+    norm, so its floor is norm exit + cost + edge — high on a pair whose norm
+    sits high, low (even negative) on one whose norm sits low."""
+    monkeypatch.setattr(config, "SPIKE_MIN_EDGE_BPS", 10.0)
+    monkeypatch.setattr(config, "SCREEN_FILL_MIN_NET_SWING_BPS", 5.0)
+    cost = config.ENTRY_MIN_EDGE_FLOOR_BPS
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    database.set_setting(engine.conn, "auto_enter", {"spike": 100, "fill": 100,
+                                                     "funding": 100})
+    out = engine._auto_enter("spike", "BTCUSDT",
+                             {"jitter_bps": 2.0, "norm_close_bps": 30.0})
+    pos = engine.positions.active()[0]
+    assert pos.min_entry_bps == Decimal("30.0") + cost + Decimal(10)
+    assert "norm exit +30.0" in out
+    floor, _ = engine._auto_entry_floor("spike", {"norm_close_bps": -10.0})
+    assert floor == Decimal("-10.0") + cost + Decimal(10)
+    floor, _ = engine._auto_entry_floor("fill", {"lo24_bps": 20.0})
+    assert floor == Decimal("20.0") + cost + Decimal(5)
+    floor, _ = engine._auto_entry_floor("fill", {"lo24_bps": -40.0})
+    assert floor == cost                                  # never below the default
+    assert engine._auto_entry_floor("funding", {"lo24_bps": 20.0}) == (None, "")

@@ -464,6 +464,33 @@ class Engine:
         log_.append([ts_ms, symbol])
         database.set_setting(self.conn, "auto_actions", log_)
 
+    def _auto_entry_floor(
+        self, board: str, row: dict | None,
+    ) -> tuple[Decimal | None, str]:
+        """The entry floor an auto-entry rests behind: what the trade is
+        betting on, plus costs and the board's own minimum edge.
+
+        The default floor (ENTRY_MIN_EDGE_FLOOR_BPS) assumes an exit near
+        zero. A spike exits at its NORM and a fill trade near its 24h low, so
+        a fixed 25 lets a fading spike fill at a loss on a pair whose norm sits
+        high (norm exit +30: a fill at 25 loses ~30bps). Carry keeps the
+        default — its profit is the funding, not the convergence. Returns
+        (None, "") for the default."""
+        cost = config.ENTRY_MIN_EDGE_FLOOR_BPS
+        row = row or {}
+        if board == "spike" and row.get("norm_close_bps") is not None:
+            norm = Decimal(str(round(row["norm_close_bps"], 1)))
+            floor = norm + cost + Decimal(str(config.SPIKE_MIN_EDGE_BPS))
+            return floor, (f"norm exit {float(norm):+.1f} + {float(cost):.0f} cost"
+                           f" + {config.SPIKE_MIN_EDGE_BPS:g} edge")
+        if board == "fill" and row.get("lo24_bps") is not None:
+            lo = Decimal(str(round(row["lo24_bps"], 1)))
+            edge = Decimal(str(config.SCREEN_FILL_MIN_NET_SWING_BPS))
+            floor = max(lo + cost + edge, cost)
+            return floor, (f"lo24 {float(lo):+.1f} + {float(cost):.0f} cost"
+                           f" + {float(edge):g} edge")
+        return None, ""
+
     def _auto_enter(
         self, board: str, symbol: str, row: dict | None = None,
     ) -> str | None:
@@ -529,6 +556,11 @@ class Engine:
             return (f"🤖 auto-entry skipped: notional ${amount} outside"
                     f" (0, {config.MAX_NOTIONAL_PER_LEG_USD}]")
         mode = "PAPER" if self.paper else "LIVE"
+        floor, floor_why = self._auto_entry_floor(board, row)
+        floor_txt = (
+            f"basis floor {float(floor):+.1f}bps ({floor_why})" if floor is not None
+            else f"basis floor {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps"
+        )
         if add_to is not None:
             # Size up what is already held, as /enter does for a held symbol:
             # the position keeps its own kind and exit rules.
@@ -544,13 +576,15 @@ class Engine:
                         f" ${config.MAX_NOTIONAL_PER_LEG_USD} per-leg cap")
             self._auto_acted.add(symbol)
             self._record_auto_action(symbol, now_ms)
-            self.executor.start_add(add_to, amount)
+            if floor is not None:
+                self.positions.set_min_entry_bps(add_to.id, floor)
+            self.executor.start_add(self.positions.get(add_to.id), amount)
             journal(self.conn, f"position {add_to.id}: AUTO-ADD {symbol} ${amount}"
                     f" off the {board} score alert")
             return (
                 f"🤖 auto-entry #{add_to.id} adding ({mode}): +${amount} to"
-                f" ~${float(cur):,.0f} {symbol} [{add_to.trade_kind}] — keeps"
-                f" its own exit rules. /cancel {add_to.id} stops the add"
+                f" ~${float(cur):,.0f} {symbol} [{add_to.trade_kind}], {floor_txt}"
+                f" — keeps its own exit rules. /cancel {add_to.id} stops the add"
             )
         self._auto_acted.add(symbol)
         self._record_auto_action(symbol, now_ms)
@@ -560,6 +594,7 @@ class Engine:
         kind = {"funding": "carry", "spike": "spike"}.get(board, "convergence")
         pos = self.positions.create(
             symbol, amount, paper=self.paper, trade_kind=kind,
+            min_entry_bps=floor,
         )
         self.positions.set_auto_entered(pos.id)
         self.executor.start_entry(self.positions.get(pos.id))
@@ -568,7 +603,7 @@ class Engine:
         mode = "PAPER" if self.paper else "LIVE"
         return (
             f"🤖 auto-entry #{pos.id} started ({mode}): ${amount} {symbol},"
-            f" basis floor {float(config.ENTRY_MIN_EDGE_FLOOR_BPS):.0f}bps;"
+            f" {floor_txt};"
             + (f" CARRY — no auto-exit, close with /exit {pos.id} or arm"
                f" /auto {pos.id}."
                if kind == "carry" else
