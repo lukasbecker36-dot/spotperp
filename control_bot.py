@@ -1162,7 +1162,28 @@ class ControlBot:
                     " next scan after /update")
         rows = (snap.get("all_rows") if all_mode else snap["rows"])[:n]
         if not rows:
-            return "no funding data yet"
+            hid = snap.get("hidden") or {}
+            if all_mode or not hid:
+                return "no funding data yet"
+            # The snapshot is fresh but every name failed a check — say which,
+            # not "no data" (the data is there: /funding all shows it).
+            out = [
+                f"no names pass /funding's checks right now ({age_s:.0f}s old) —"
+                f" {sum(hid.values())} hidden: "
+                + ", ".join(f"{v} {k}" for k, v in
+                            sorted(hid.items(), key=lambda kv: -kv[1]))
+            ]
+            near = snap.get("volume_near_miss") or []
+            if near:
+                out.append(
+                    "hidden ONLY for volume: "
+                    + ", ".join(
+                        f"{c} at ${_vol(lo)}-{_vol(hi)}" if lo > 0
+                        else f"{c} under ${_vol(hi)}" for lo, hi, c in near
+                    )
+                )
+            out.append("/funding all shows every name with the reason it is hidden.")
+            return "\n".join(out)
         win_m = config.SCREEN_AVG_WINDOW_SECONDS / 60.0
         # No interval column: normalising to a per-hour rate is precisely what
         # makes the settlement interval stop mattering for comparison. 'next'

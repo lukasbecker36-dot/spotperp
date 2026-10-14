@@ -403,3 +403,20 @@ def test_screen_spike_renders_and_explains_an_empty_board(tmp_path, monkeypatch)
     p.write_text(_json.dumps({"ts_ms": int(_time.time() * 1000), "rows": [],
                               "spike_rows": []}))
     assert "no spikes" in control_bot.ControlBot._cmd_screen(_bot(), ["spike"])
+
+
+def test_funding_with_everything_hidden_says_why(tmp_path, monkeypatch):
+    import json as _json, time as _time
+    import config as _config
+    p = tmp_path / "fnd.json"
+    p.write_text(_json.dumps({
+        "ts_ms": int(_time.time() * 1000), "rows": [],
+        "all_rows": [{"symbol": "X", "avg_24h_8h_bps": 1.0, "current_8h_bps": 1.0}],
+        "hidden": {"volume": 200, "exit": 12, "discount": 30},
+        "volume_near_miss": [[100_000, 150_000, 4]],
+    }))
+    monkeypatch.setattr(_config, "FUNDING_SNAPSHOT_FILE", p)
+    out = control_bot.ControlBot._cmd_funding(_bot(), [])
+    assert "no funding data" not in out
+    assert "242 hidden: 200 volume, 30 discount, 12 exit" in out
+    assert "4 at $100k-150k" in out and "/funding all" in out
