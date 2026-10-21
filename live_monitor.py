@@ -3184,6 +3184,25 @@ class Engine:
             )
         except ExchangeError:
             log.exception("recon: income_history(%s) failed", pair.aster_symbol)
+        # Aster books a reduction (the bot's unwind buy-backs) at the position's
+        # AVERAGE entry and re-prices what is left, so positionRisk's entryPrice
+        # only means anything together with the P&L those reductions already
+        # realised. JCTUSDT #310: entryPrice 0.004271 against the bot's own
+        # 0.004327, with +$5.32 realised on Aster — /recon showed -6.55 for a
+        # position actually at about -1.2. Start a little before the first
+        # matched spot buy: the perp sell that opened the clip comes first.
+        perp_realized = Decimal(0)
+        if earliest_ms:
+            try:
+                realized = await self.aster.income_history(
+                    pair.aster_symbol, "REALIZED_PNL", earliest_ms - 120_000, now_ms
+                )
+                perp_realized = sum(
+                    (Decimal(str(i.get("income", "0"))) for i in realized),
+                    Decimal(0),
+                )
+            except ExchangeError:
+                log.exception("recon: realised P&L for %s failed", pair.aster_symbol)
 
         return recon.PairRecon(
             symbol=symbol,
@@ -3203,6 +3222,7 @@ class Engine:
             perp_liq=perp_liq,
             funding_now_8h_bps=funding_now,
             funding_avg_8h_bps=funding_avg,
+            perp_realized_usd=perp_realized,
         )
 
     async def _check_exit_opportunity(self, pos: pm.Position) -> None:

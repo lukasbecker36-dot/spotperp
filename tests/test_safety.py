@@ -3038,3 +3038,30 @@ async def test_autoentry_skips_an_entry_already_below_its_floor(engine):
                              {"jitter_bps": 2.0, "entry_bps": 0.0})
     assert "below its +25.0bps floor" in out
     assert engine.positions.active() == []
+
+
+async def test_recon_adds_pnl_aster_realised_on_the_position(engine):
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    opened = 1_700_000_000_000
+
+    class Mexc:
+        async def my_trades(self, symbol, limit=200):
+            return [{"isBuyer": True, "qty": "10", "price": "100", "time": opened}]
+
+    class Aster:
+        def __init__(self):
+            self.calls = []
+
+        async def income_history(self, symbol, income_type, start_ms, end_ms):
+            self.calls.append((income_type, start_ms))
+            return [{"income": "5.32" if income_type == "REALIZED_PNL" else "0.38"}]
+
+    engine.mexc, engine.aster = Mexc(), Aster()
+    row = {"symbol": "BTCUSDT", "positionAmt": "-10", "entryPrice": "101",
+           "markPrice": "100.45", "liquidationPrice": "150"}
+    p = await engine._recon_pair(row, {"BTC": Decimal(10)}, opened + 3_600_000)
+    assert p.perp_realized_usd == Decimal("5.32")
+    assert p.perp_pnl == (Decimal(101) - Decimal("100.4")) * 10 + Decimal("5.32")
+    # Fetched from just before the first matched spot buy (the perp sell
+    # that opened the clip comes first), not from some later point.
+    assert ("REALIZED_PNL", opened - 120_000) in engine.aster.calls

@@ -144,3 +144,27 @@ def test_format_report_liq_na_when_missing(monkeypatch):
 
 def test_format_report_empty():
     assert "no matched" in recon.format_report([], [])
+
+
+def test_perp_pnl_includes_pnl_aster_already_realised(monkeypatch):
+    """JCTUSDT #310: Aster re-priced entryPrice to 0.004271 as the bot's unwind
+    buy-backs closed at the AVERAGE entry, booking +5.32 realised. Without it
+    /recon showed -6.55 for a position at about -1.2."""
+    monkeypatch.setattr(config, "ASTER_MAKER_FEE", Decimal("0.0"))
+    monkeypatch.setattr(config, "MEXC_TAKER_FEE", Decimal("0.0"))
+    kw = dict(
+        symbol="JCTUSDT", base_asset="JCT",
+        perp_qty=Decimal(103013), perp_entry=Decimal("0.004271"),
+        perp_exit=Decimal("0.00416"), spot_qty=Decimal(103013),
+        spot_entry=Decimal("0.004325"), spot_exit=Decimal("0.00415"),
+        spot_entry_est=False, funding_usd=Decimal("0.38"),
+        held_hours=Decimal(20), spot_balance=Decimal(103013),
+        perp_base=Decimal(103013),
+    )
+    without = recon.PairRecon(**kw)
+    fixed = recon.PairRecon(**kw, perp_realized_usd=Decimal("5.32"))
+    assert fixed.perp_pnl == without.perp_pnl + Decimal("5.32")
+    assert -2 < fixed.net_pnl < 0           # ~ -1 before fees, as the bot books it
+    assert without.net_pnl < -6
+    out = recon.format_report([fixed], [])
+    assert "incl. +5.32 realised on Aster" in out

@@ -9,7 +9,10 @@ assumes — maker on Aster, taker on MEXC, both legs, entry and exit:
           - aster_maker_fees(entry+exit) - mexc_taker_fees(entry+exit)
 
 Perp entry comes from Aster positionRisk (entryPrice); the exit is marked
-at the Aster best bid (where a maker buy-back would rest). Spot entry is
+at the Aster best bid (where a maker buy-back would rest). Aster re-prices
+entryPrice when part of a position is bought back (average cost), booking
+the difference as realised P&L, so the perp leg also adds the REALIZED_PNL
+income on the symbol since the position opened. Spot entry is
 reconstructed from MEXC myTrades (qty-weighted average of the buys that
 built the current holding); the exit is marked at the MEXC best bid (a
 taker sell). Funding is the realised FUNDING_FEE income summed from the
@@ -91,6 +94,10 @@ class PairRecon:
     perp_liq: Decimal = Decimal(0)    # Aster liquidation price (0 = none/unknown)
     funding_now_8h_bps: float = 0.0   # current funding rate, projected to 8h
     funding_avg_8h_bps: float = 0.0   # realised 24h funding, re-expressed per 8h
+    # P&L Aster already REALISED on this position — reductions (the bot's
+    # unwind buy-backs) close at the AVERAGE entry and re-price the rest, so
+    # entryPrice alone misstates the trade. Part of perp P&L, not a cost.
+    perp_realized_usd: Decimal = Decimal(0)
 
     @property
     def liq_distance_pct(self) -> Decimal | None:
@@ -108,7 +115,12 @@ class PairRecon:
 
     @property
     def perp_pnl(self) -> Decimal:
-        return (self.perp_entry - self.perp_exit) * self.perp_qty
+        """Open leg at Aster's entryPrice, plus what Aster has already
+        realised on the same position."""
+        return (
+            (self.perp_entry - self.perp_exit) * self.perp_qty
+            + self.perp_realized_usd
+        )
 
     @property
     def spot_pnl(self) -> Decimal:
@@ -154,6 +166,8 @@ def format_report(pairs: list[PairRecon], notes: list[str]) -> str:
         lines.append(
             f"  perp {_p(p.perp_entry)}->{_p(p.perp_exit)}"
             f"  {float(p.perp_pnl):+.2f}"
+            + (f"  (incl. {float(p.perp_realized_usd):+.2f} realised on Aster)"
+               if p.perp_realized_usd else "")
         )
         lines.append(
             f"  spot {est}{_p(p.spot_entry)}->{_p(p.spot_exit)}"
