@@ -355,11 +355,16 @@ class Engine:
                     last_symbol_refresh = now_mono
                     added, _removed = await self._load_symbol_maps()
                     if added:
+                        await self._on_new_pairs(added)
                         names = ", ".join(s[:-4] for s in added[:20])
                         more = " …" if len(added) > 20 else ""
                         await self.notifier.alert(
                             f"🆕 {len(added)} new cross-listed pair(s) now"
-                            f" tradeable: {names}{more}"
+                            f" tradeable: {names}{more}\n"
+                            "on /funding from the next scan; /screen spike needs"
+                            f" {config.SCREEN_DIFF_MIN_HOURS:g}h of history for a"
+                            " norm, /screen fill"
+                            f" {config.SCREEN_FILL_MIN_HOURS:g}h workable"
                         )
             except Exception:
                 log.exception("market loop error")
@@ -816,10 +821,11 @@ class Engine:
             )
             self.positions.set_funding(pos.id, total)
 
-    async def _refresh_funding_stats(self) -> None:
-        """Sweep funding-rate history for every pair in rate-limited batches,
-        derive each symbol's interval and 24h-average carry, write a snapshot."""
-        symbols = list(self.md.pair_maps)
+    async def _refresh_funding_stats(self, only: list[str] | None = None) -> None:
+        """Sweep funding-rate history for every pair (or just `only`) in
+        rate-limited batches, derive each symbol's interval and 24h-average
+        carry, write a snapshot."""
+        symbols = list(only) if only is not None else list(self.md.pair_maps)
         now = int(time.time() * 1000)
         batch = max(1, config.FUNDING_FETCH_BATCH)
         for i in range(0, len(symbols), batch):
@@ -2364,11 +2370,25 @@ class Engine:
         lines.append(f"combined    {float(total):>10,.2f}")
         return "\n".join(lines)
 
+    async def _on_new_pairs(self, added: list[str]) -> None:
+        """Make a just-listed pair visible on /funding at the next scan rather
+        than after the next 15-minute funding sweep: /funding only lists pairs
+        with funding stats, and the volume gates read the 24h ticker — both
+        otherwise refreshed on that slow cadence. A pair's first hours are
+        often its widest basis. (/screen spike still needs hours of history
+        before a norm exists; that is the definition, not a lag.)"""
+        try:
+            await self._refresh_funding_stats(only=added)
+        except Exception:
+            log.exception("funding stats for new pairs failed")
+
     async def _cmd_refresh(self) -> str:
         """Re-fetch both venues' exchangeInfo and rebuild the tradeable universe
         on demand, so a freshly-listed coin becomes available without waiting
         for the periodic refresh or restarting the engine."""
         added, removed = await self._load_symbol_maps()
+        if added:
+            await self._on_new_pairs(added)
         lines = [f"universe refreshed: {len(self.md.pair_maps)} cross-listed pairs"]
         if added:
             lines.append(f"+{len(added)}: " + ", ".join(s[:-4] for s in added[:30]))

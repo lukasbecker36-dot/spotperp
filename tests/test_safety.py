@@ -3065,3 +3065,22 @@ async def test_recon_adds_pnl_aster_realised_on_the_position(engine):
     # Fetched from just before the first matched spot buy (the perp sell
     # that opened the clip comes first), not from some later point.
     assert ("REALIZED_PNL", opened - 120_000) in engine.aster.calls
+
+
+async def test_new_pairs_get_funding_stats_and_volume_at_once(engine):
+    """/funding lists only pairs with funding stats, refreshed every 15 min:
+    a new listing is swept immediately, and only it."""
+    asked = []
+
+    class Aster:
+        async def funding_rate_history(self, symbol, limit):
+            asked.append(symbol)
+            return []
+
+        async def ticker_24hr(self):
+            return {"NEWUSDT": {"quote_volume": 2_000_000, "trades": 5000}}
+    engine.aster = Aster()
+    await engine._on_new_pairs(["NEWUSDT"])
+    assert asked == ["NEWUSDT"]
+    assert "NEWUSDT" in engine.md.funding_stats
+    assert engine.md.perp_volume["NEWUSDT"]["quote_volume"] == 2_000_000
