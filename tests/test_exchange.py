@@ -28,3 +28,20 @@ async def test_mexc_time_sync_failure_keeps_prior_offset(monkeypatch):
     c._request = boom
 
     assert await c.sync_time() == 42          # unchanged on failure
+
+
+async def test_mexc_my_trades_since_pages_forward_without_gaps_or_repeats():
+    from exchange_client import MexcClient
+    fills = [{"id": i, "time": 1000 + i // 2, "qty": "1", "price": "1",
+              "isBuyer": True} for i in range(250)]   # pairs share a millisecond
+    client = MexcClient.__new__(MexcClient)
+
+    async def my_trades(symbol, limit=100, start_ms=None, end_ms=None):
+        rows = [t for t in fills if start_ms <= t["time"] <= end_ms]
+        return rows[:limit]
+    client.my_trades = my_trades
+    got, complete = await client.my_trades_since("X", 1000, 2000, page=100)
+    assert complete and [t["id"] for t in got] == list(range(250))
+    got, complete = await client.my_trades_since("X", 1000, 2000, page=100,
+                                                 max_pages=1)
+    assert not complete

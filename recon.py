@@ -75,6 +75,36 @@ def reconstruct_spot_entry(
     return cost / used, earliest, covered
 
 
+def average_cost_spot(
+    trades: list[dict],
+) -> tuple[Decimal, Decimal, Decimal] | None:
+    """Replay spot fills oldest-first at AVERAGE cost, as Aster books the perp:
+    a sale realises (price - average) and leaves the average unchanged.
+    Returns (held_qty, average_cost_of_held, realised_usd), or None if a sale
+    exceeds what the window bought — the history does not start at the
+    position's open, so its numbers would be invented."""
+    held = cost = realised = Decimal(0)
+    for t in trades:
+        qty = _dec(t.get("qty"))
+        price = _dec(t.get("price"))
+        if qty <= 0:
+            continue
+        if t.get("isBuyer"):
+            held += qty
+            cost += qty * price
+            continue
+        if qty > held * (1 + _QTY_TOL):
+            return None
+        qty = min(qty, held)
+        avg = cost / held if held > 0 else Decimal(0)
+        realised += qty * (price - avg)
+        cost -= qty * avg
+        held -= qty
+    if held <= 0:
+        return held, Decimal(0), realised
+    return held, cost / held, realised
+
+
 @dataclass
 class PairRecon:
     symbol: str
@@ -98,6 +128,12 @@ class PairRecon:
     # unwind buy-backs) close at the AVERAGE entry and re-price the rest, so
     # entryPrice alone misstates the trade. Part of perp P&L, not a cost.
     perp_realized_usd: Decimal = Decimal(0)
+    # ...and the same for spot: coins already SOLD since the position opened
+    # (scaling out), at average cost. Always set together with
+    # perp_realized_usd — counting one leg's closed part without the other's
+    # invents P&L (JCTUSDT scaled out: +635 perp realised, spot side ignored,
+    # /recon NET +625).
+    spot_realized_usd: Decimal = Decimal(0)
 
     @property
     def liq_distance_pct(self) -> Decimal | None:
@@ -124,7 +160,10 @@ class PairRecon:
 
     @property
     def spot_pnl(self) -> Decimal:
-        return (self.spot_exit - self.spot_entry) * self.spot_qty
+        return (
+            (self.spot_exit - self.spot_entry) * self.spot_qty
+            + self.spot_realized_usd
+        )
 
     @property
     def perp_fees(self) -> Decimal:
@@ -172,6 +211,8 @@ def format_report(pairs: list[PairRecon], notes: list[str]) -> str:
         lines.append(
             f"  spot {est}{_p(p.spot_entry)}->{_p(p.spot_exit)}"
             f"  {float(p.spot_pnl):+.2f}"
+            + (f"  (incl. {float(p.spot_realized_usd):+.2f} realised on MEXC)"
+               if p.spot_realized_usd else "")
         )
         # Liquidation proximity for the short perp: mark now vs liq price above.
         dist = p.liq_distance_pct

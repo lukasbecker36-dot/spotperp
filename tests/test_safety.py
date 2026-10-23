@@ -3040,31 +3040,48 @@ async def test_autoentry_skips_an_entry_already_below_its_floor(engine):
     assert engine.positions.active() == []
 
 
-async def test_recon_adds_pnl_aster_realised_on_the_position(engine):
-    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
-    opened = 1_700_000_000_000
+async def test_recon_counts_realised_pnl_on_both_legs_or_neither(engine):
+    """JCTUSDT scaled out while the price fell ~35%: Aster realised +635 on
+    the closed perp, MEXC the mirror-image loss on the coins sold. Counting
+    only the perp side showed NET +625. Both legs' closed parts are replayed
+    over the same window (the position's open), at average cost."""
+    set_books(engine.md, "60.4", "60.5", "59.9", "60.0")
+    pos = engine.positions.create("BTCUSDT", Decimal(1000), paper=False)
+    engine.positions.set_state(pos.id, pm.OPEN)
+    opened = engine.positions.get(pos.id).created_ms
+    now = opened + 3_600_000
 
     class Mexc:
-        async def my_trades(self, symbol, limit=200):
-            return [{"isBuyer": True, "qty": "10", "price": "100", "time": opened}]
+        async def my_trades_since(self, symbol, start_ms, end_ms):
+            assert start_ms == opened - 120_000
+            return ([
+                {"isBuyer": True, "qty": "20", "price": "100", "time": opened + 1},
+                {"isBuyer": False, "qty": "10", "price": "60", "time": opened + 9},
+            ], True)
+
+        async def my_trades(self, symbol, limit=100):
+            return []
 
     class Aster:
-        def __init__(self):
-            self.calls = []
-
         async def income_history(self, symbol, income_type, start_ms, end_ms):
-            self.calls.append((income_type, start_ms))
-            return [{"income": "5.32" if income_type == "REALIZED_PNL" else "0.38"}]
+            return [{"income": "400" if income_type == "REALIZED_PNL" else "0"}]
 
     engine.mexc, engine.aster = Mexc(), Aster()
     row = {"symbol": "BTCUSDT", "positionAmt": "-10", "entryPrice": "101",
-           "markPrice": "100.45", "liquidationPrice": "150"}
-    p = await engine._recon_pair(row, {"BTC": Decimal(10)}, opened + 3_600_000)
-    assert p.perp_realized_usd == Decimal("5.32")
-    assert p.perp_pnl == (Decimal(101) - Decimal("100.4")) * 10 + Decimal("5.32")
-    # Fetched from just before the first matched spot buy (the perp sell
-    # that opened the clip comes first), not from some later point.
-    assert ("REALIZED_PNL", opened - 120_000) in engine.aster.calls
+           "markPrice": "60.45", "liquidationPrice": "150"}
+    p = await engine._recon_pair(row, {"BTC": Decimal(10)}, now)
+    assert p.spot_entry == Decimal(100)                 # average cost of the 10 held
+    assert p.spot_realized_usd == Decimal(-400)         # 10 sold at 60 vs 100
+    assert p.perp_realized_usd == Decimal(400)
+    # The closed halves cancel, as they did on the venues.
+    assert p.perp_pnl + p.spot_pnl == (
+        (Decimal(101) - Decimal("60.4")) * 10 + (Decimal("59.9") - 100) * 10
+    )
+
+    # Not a bot position: open legs only, no realised P&L on either side.
+    engine.positions.set_state(pos.id, pm.CLOSED)
+    p = await engine._recon_pair(row, {"BTC": Decimal(10)}, now)
+    assert p.perp_realized_usd == 0 and p.spot_realized_usd == 0
 
 
 async def test_new_pairs_get_funding_stats_and_volume_at_once(engine):

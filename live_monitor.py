@@ -3173,21 +3173,70 @@ class Engine:
         if spot_qty <= 0:
             return f"{symbol}: short perp but no {base} spot held"
 
-        try:
-            trades = await self.mexc.my_trades(pair.mexc_symbol, limit=200)
-        except ExchangeError:
-            log.exception("recon: myTrades(%s) failed", pair.mexc_symbol)
-            trades = []
-        recon_entry = recon.reconstruct_spot_entry(trades, spot_qty)
-        if recon_entry is not None:
-            spot_entry, earliest_ms, covered = recon_entry
-            spot_entry_est = not covered
-        else:
-            # No visible buys: assume spot entered near the perp entry price
-            # (zero-basis proxy), normalised to MEXC base units.
-            spot_entry = perp_entry / pair.qty_multiplier
-            earliest_ms = None
-            spot_entry_est = True
+        # Both legs' realised P&L is counted over ONE window, or neither is.
+        # Aster closes perp reductions at average cost and re-prices the rest
+        # (JCTUSDT #310 unwinds: entryPrice 0.004271 vs the bot's 0.004327,
+        # +5.32 realised), so its entryPrice needs its realised P&L — but the
+        # spot coins sold over the same span realised the mirror image
+        # (JCTUSDT scaling out: +635 perp realised, spot side ignored, NET
+        # +625). For a bot-managed position the window is its open time:
+        # replay every MEXC fill since then at average cost, like Aster, and
+        # use it only if it explains the coins actually held.
+        managed = [p for p in self.positions.active() if p.symbol == symbol]
+        opened_ms = (
+            (managed[0].opened_ms or managed[0].created_ms) if managed else None
+        )
+        perp_realized = spot_realized = Decimal(0)
+        replay = None
+        if opened_ms:
+            try:
+                fills, complete = await self.mexc.my_trades_since(
+                    pair.mexc_symbol, opened_ms - 120_000, now_ms
+                )
+                replay = recon.average_cost_spot(fills) if complete else None
+            except ExchangeError:
+                log.exception("recon: myTrades since open (%s) failed",
+                              pair.mexc_symbol)
+            if replay is not None:
+                held, avg_cost, sold_pnl = replay
+                if held <= 0 or abs(held - spot_balance) > spot_balance * recon._QTY_TOL:
+                    replay = None      # the fills don't explain the holding
+        if replay is not None:
+            _, spot_entry, spot_realized = replay
+            spot_entry_est = False
+            earliest_ms = opened_ms
+            try:
+                realized = await self.aster.income_history(
+                    pair.aster_symbol, "REALIZED_PNL", opened_ms - 120_000, now_ms
+                )
+                perp_realized = sum(
+                    (Decimal(str(i.get("income", "0"))) for i in realized),
+                    Decimal(0),
+                )
+            except ExchangeError:
+                # Without the perp half, the spot half would be one-sided too.
+                log.exception("recon: realised P&L for %s failed", pair.aster_symbol)
+                spot_realized = Decimal(0)
+                replay = None
+        if replay is None:
+            # Not managed, or the history can't explain the holding: value the
+            # open legs only (newest buys covering the holding), no realised
+            # P&L on either side.
+            try:
+                trades = await self.mexc.my_trades(pair.mexc_symbol, limit=100)
+            except ExchangeError:
+                log.exception("recon: myTrades(%s) failed", pair.mexc_symbol)
+                trades = []
+            recon_entry = recon.reconstruct_spot_entry(trades, spot_qty)
+            if recon_entry is not None:
+                spot_entry, earliest_ms, covered = recon_entry
+                spot_entry_est = not covered
+            else:
+                # No visible buys: assume spot entered near the perp entry
+                # price (zero-basis proxy), normalised to MEXC base units.
+                spot_entry = perp_entry / pair.qty_multiplier
+                earliest_ms = None
+                spot_entry_est = True
 
         start_ms = earliest_ms or (now_ms - config.MAX_HOLD_HOURS * 3_600_000)
         held_hours = (
@@ -3204,25 +3253,6 @@ class Engine:
             )
         except ExchangeError:
             log.exception("recon: income_history(%s) failed", pair.aster_symbol)
-        # Aster books a reduction (the bot's unwind buy-backs) at the position's
-        # AVERAGE entry and re-prices what is left, so positionRisk's entryPrice
-        # only means anything together with the P&L those reductions already
-        # realised. JCTUSDT #310: entryPrice 0.004271 against the bot's own
-        # 0.004327, with +$5.32 realised on Aster — /recon showed -6.55 for a
-        # position actually at about -1.2. Start a little before the first
-        # matched spot buy: the perp sell that opened the clip comes first.
-        perp_realized = Decimal(0)
-        if earliest_ms:
-            try:
-                realized = await self.aster.income_history(
-                    pair.aster_symbol, "REALIZED_PNL", earliest_ms - 120_000, now_ms
-                )
-                perp_realized = sum(
-                    (Decimal(str(i.get("income", "0"))) for i in realized),
-                    Decimal(0),
-                )
-            except ExchangeError:
-                log.exception("recon: realised P&L for %s failed", pair.aster_symbol)
 
         return recon.PairRecon(
             symbol=symbol,
@@ -3243,6 +3273,7 @@ class Engine:
             funding_now_8h_bps=funding_now,
             funding_avg_8h_bps=funding_avg,
             perp_realized_usd=perp_realized,
+            spot_realized_usd=spot_realized,
         )
 
     async def _check_exit_opportunity(self, pos: pm.Position) -> None:

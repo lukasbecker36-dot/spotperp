@@ -739,11 +739,45 @@ class MexcClient(_BaseClient):
             venue=self.VENUE,
         )
 
-    async def my_trades(self, symbol: str, limit: int = 100) -> list[dict[str, Any]]:
-        query = self._signed_query({"symbol": symbol, "limit": str(limit)})
+    async def my_trades(
+        self, symbol: str, limit: int = 100,
+        start_ms: int | None = None, end_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params = {"symbol": symbol, "limit": str(limit)}
+        if start_ms is not None:
+            params["startTime"] = str(int(start_ms))
+        if end_ms is not None:
+            params["endTime"] = str(int(end_ms))
+        query = self._signed_query(params)
         return await self._request(
             "GET",
             f"/api/v3/myTrades?{query}",
             headers=self._auth_headers(),
             venue=self.VENUE,
         )
+
+    async def my_trades_since(
+        self, symbol: str, start_ms: int, end_ms: int, page: int = 100,
+        max_pages: int = 20,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Every fill in [start_ms, end_ms], paging forward by time (a single
+        call returns at most `page` rows). Returns (trades oldest-first,
+        complete) — complete is False if max_pages ran out first."""
+        out: list[dict[str, Any]] = []
+        seen: set = set()
+        cursor = int(start_ms)
+        for _ in range(max_pages):
+            rows = await self.my_trades(symbol, limit=page, start_ms=cursor,
+                                        end_ms=end_ms)
+            rows = sorted(rows or [], key=lambda t: int(t.get("time", 0)))
+            fresh = [t for t in rows if (t.get("id"), t.get("time")) not in seen]
+            for t in fresh:
+                seen.add((t.get("id"), t.get("time")))
+            out.extend(fresh)
+            if len(rows) < page:
+                return sorted(out, key=lambda t: int(t.get("time", 0))), True
+            last = int(rows[-1].get("time", cursor))
+            # Re-ask from the last fill's own millisecond: fills sharing it
+            # would otherwise be skipped; `seen` drops the repeats.
+            cursor = last if last > cursor else cursor + 1
+        return sorted(out, key=lambda t: int(t.get("time", 0))), False

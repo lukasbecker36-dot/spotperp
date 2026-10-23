@@ -168,3 +168,15 @@ def test_perp_pnl_includes_pnl_aster_already_realised(monkeypatch):
     assert without.net_pnl < -6
     out = recon.format_report([fixed], [])
     assert "incl. +5.32 realised on Aster" in out
+
+
+def test_average_cost_spot_replay():
+    trades = [
+        {"isBuyer": True, "qty": "10", "price": "100"},
+        {"isBuyer": True, "qty": "10", "price": "120"},     # avg 110
+        {"isBuyer": False, "qty": "5", "price": "90"},      # realise 5 x -20
+    ]
+    held, avg, realised = recon.average_cost_spot(trades)
+    assert held == 15 and avg == 110 and realised == -100
+    # A sale bigger than the window bought: history starts too late.
+    assert recon.average_cost_spot([{"isBuyer": False, "qty": "5", "price": "1"}]) is None
