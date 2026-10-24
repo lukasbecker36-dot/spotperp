@@ -6,21 +6,30 @@ forces the shorts to buy back while the insiders sell into it. The screen
 scores each coin perp on the published warning signs, plus the one this
 system's own data found most predictive (a recent +50% day):
 
-    check                     warning (+1)        danger (+2)
-    Aster OI / market cap     > 0.5               > 1.0
-    perp / spot 24h volume    > 15x               > 40x (or no spot volume)
-    |funding| annualised      > 100%              > 300%
-    perp listing age          < 180 days          < 60 days
-    market cap                < $100M             < $30M (+1 if unknown)
-    circulating / total       < 20%  (+1)
-    a +50% day in last 30d    +1
+    check                          warning             danger
+    Aster OI / market cap          > 0.5      +1       > 1.0     +2
+    perp / spot 24h volume         > 15x      +1       > 40x (or no spot volume) +2
+    funding, 24h avg, POSITIVE     > +100%/yr +2       > +300%   +3
+    funding, 24h avg, negative     < -100%/yr +1       < -300%   +2
+    perp listing age               < 180 days +1       < 60 days +2
+    market cap                     < $100M    +1       < $30M    +2 (+1 if unknown)
+    circulating / total            < 20%      +1
+    a +50% day in last 30d         +1
+    already ran (>=3x off its 45d low and >=30% below its 45d high)   +1
+    a +50% day in 30d AND longs paying > +100%/yr ("another leg")    +1
 
 Read-only and advisory: public endpoints only, and nothing here trades.
 Sources for the thresholds: HackerNoon "That 300% Funding APR Is Not Free
 Money" (OI/mcap, perp/spot, funding, age, mcap), CryptoSlate on RAVE/SIREN/
-ARIA (concentration, turnover), Odaily (low initial float). On a replay of
-this universe, a +50% day in the prior 30 days carried 2.8-4.4x the base rate
-of another one.
+ARIA (concentration, turnover), Odaily (low initial float). Replays of this
+universe (185 days, ~400 coins) set the rest:
+  - a +50% day in the prior 30 days: 2.8-4.4x the base rate of another;
+  - funding is asymmetric: a 24h average above +10bp/8h preceded a +50% week
+    4.7x as often as normal funding, below -20bp/8h only 2.8x — leveraged
+    longs still paying is more spike fuel than crowded shorts;
+  - coins that already ran: 53% saw +50% and 41% halved within 30 days,
+    against 24% and 4% for the rest;
+  - spiked recently with strong positive funding: 29% saw +50% within 7 days.
 """
 from __future__ import annotations
 
@@ -57,6 +66,9 @@ class Metrics:
     age_days: float | None = None
     max_day_gain_30d: float | None = None  # 0.5 = a +50% day
     mark: float | None = None
+    funding_apr_24h: float | None = None   # average over the last 24h of prints
+    low_45d: float | None = None
+    high_45d: float | None = None
     # Resting USD within +-2/5/10% of mid per side, per venue, and how far the
     # fetched levels reach (a reach under the band means the band is a floor).
     depth: dict[str, float] = field(default_factory=dict)
@@ -130,12 +142,18 @@ def score(m: Metrics, have_mcap_data: bool) -> Scored:
             pts += 2; why.append(label)
         elif r > config.SCAM_PERP_SPOT_WARN:
             pts += 1; why.append(label)
-    if m.funding_apr is not None:
-        a = abs(m.funding_apr)
-        if a > config.SCAM_FUNDING_APR_DANGER:
-            pts += 2; why.append(f"funding {m.funding_apr:+.0%} APR")
-        elif a > config.SCAM_FUNDING_APR_WARN:
-            pts += 1; why.append(f"funding {m.funding_apr:+.0%} APR")
+    fund = funding_basis(m)
+    longs_paying = fund is not None and fund > config.SCAM_FUNDING_POS_WARN
+    if fund is not None:
+        label = f"funding {fund:+.0%} APR"
+        if fund > config.SCAM_FUNDING_POS_DANGER:
+            pts += 3; why.append(label + " (longs paying)")
+        elif longs_paying:
+            pts += 2; why.append(label + " (longs paying)")
+        elif fund < -config.SCAM_FUNDING_APR_DANGER:
+            pts += 2; why.append(label)
+        elif fund < -config.SCAM_FUNDING_APR_WARN:
+            pts += 1; why.append(label)
     if m.age_days is not None:
         if m.age_days < config.SCAM_AGE_DANGER_DAYS:
             pts += 2; why.append(f"listed {m.age_days:.0f}d ago")
@@ -150,10 +168,46 @@ def score(m: Metrics, have_mcap_data: bool) -> Scored:
             pts += 1; why.append(f"mcap {_usd(mcap)}")
     if m.float_ratio is not None and m.float_ratio < config.SCAM_FLOAT_WARN:
         pts += 1; why.append(f"float {m.float_ratio:.0%}")
-    if m.max_day_gain_30d is not None and m.max_day_gain_30d >= config.SCAM_PUMP_DAY_GAIN:
+    pumped = (m.max_day_gain_30d is not None
+              and m.max_day_gain_30d >= config.SCAM_PUMP_DAY_GAIN)
+    if pumped:
         gain = f"+{m.max_day_gain_30d:.0%}" if m.max_day_gain_30d < 10 else ">+1000%"
         pts += 1; why.append(f"{gain} day in last 30d")
-    return Scored(m.symbol, pts, why, m.funding_apr, m.market_cap_usd)
+    if m.mark and m.low_45d and m.high_45d:
+        off_low, off_high = m.mark / m.low_45d, m.mark / m.high_45d - 1
+        if off_low >= config.SCAM_RAN_OFF_LOW and off_high <= -config.SCAM_RAN_BELOW_HIGH:
+            pts += 1; why.append(f"already ran ({off_low:.1f}x off 45d low,"
+                                 f" {off_high:.0%} off high)")
+    if pumped and longs_paying:
+        pts += 1; why.append("spiked recently and longs still paying: another-leg risk")
+    return Scored(m.symbol, pts, why, fund, m.market_cap_usd)
+
+
+def average_funding_apr(prints: list[dict], interval_h: int, now_ms: float) -> float | None:
+    """Annualised mean of the funding prints settled in the last 24h. Prints are
+    per settlement interval (1h, 4h or 8h on Aster), so the mean print is scaled
+    by settlements per year."""
+    recent = [float(p["fundingRate"]) for p in prints or []
+              if now_ms - int(p.get("fundingTime") or 0) <= DAY_MS]
+    if not recent:
+        return None
+    return sum(recent) / len(recent) * (24 / max(1, interval_h)) * 365
+
+
+def funding_basis(m: Metrics) -> float | None:
+    """The funding the score uses: the 24h average when known (what the replay
+    measured; one hourly print is noisy), else the latest print."""
+    return m.funding_apr_24h if m.funding_apr_24h is not None else m.funding_apr
+
+
+def is_coin_perp(s: dict) -> bool:
+    """A live USDT crypto perpetual. Aster lists stocks, ETFs and commodities as
+    underlyingType COIN too; symbolType 1 marks them. Without this they pad the
+    board with 'no spot volume, no market cap' points they can't help having."""
+    return (s.get("status") == "TRADING" and s.get("contractType") == "PERPETUAL"
+            and s.get("underlyingType", "COIN") == "COIN"
+            and s.get("symbolType", 0) == 0
+            and str(s.get("symbol", "")).endswith("USDT"))
 
 
 def plan_alert(
@@ -223,7 +277,7 @@ class ScamScreen:
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
         self._cg: dict[str, dict] = {}
-        self._day_gain: dict[str, float] = {}
+        self._daily_rows: dict[str, dict[str, float]] = {}
         self._slow_at = 0.0
 
     async def _get(self, url: str, params: dict | None = None,
@@ -267,38 +321,38 @@ class ScamScreen:
             await asyncio.sleep(config.SCAM_COINGECKO_PAGE_PAUSE_SECONDS)
         return out
 
-    async def _day_gains(self, onboard: dict[str, int]) -> dict[str, float]:
-        """Largest one-day gain (high over the prior day's close) in the last
-        30 daily candles, per symbol. The first two days after listing are
-        skipped: the listing candle's 'previous close' is a placeholder price,
-        which turned APM's debut into a +656,059% day."""
-        out: dict[str, float] = {}
+    async def _daily(self, onboard: dict[str, int]) -> dict[str, dict[str, float]]:
+        """Per symbol, from the last 46 daily candles: the largest one-day gain
+        (high over the prior day's close) in the last 30, and the 45-day low and
+        high. The first two days after listing are skipped: the listing candle's
+        'previous close' is a placeholder price, which turned APM's debut into a
+        +656,059% day (and would make every new coin look 'already ran')."""
+        out: dict[str, dict[str, float]] = {}
         for sym, listed_ms in onboard.items():
             try:
                 k = await self._get(f"{ASTER_PUBLIC}/klines",
-                                    {"symbol": sym, "interval": "1d", "limit": "31"})
+                                    {"symbol": sym, "interval": "1d", "limit": "46"})
             except Exception:
                 continue
+            settled = [c for c in k if int(c[0]) >= listed_ms + 2 * DAY_MS]
             best = 0.0
-            for prev, cur in zip(k, k[1:]):
-                if int(prev[0]) < listed_ms + 2 * DAY_MS:
-                    continue
+            last31 = settled[-31:]
+            for prev, cur in zip(last31, last31[1:]):
                 pc, hi = float(prev[4]), float(cur[2])
                 if pc > 0:
                     best = max(best, hi / pc - 1)
-            out[sym] = best
+            row = {"gain": best}
+            if settled:
+                row["low45"] = min(float(c[3]) for c in settled[-45:])
+                row["high45"] = max(float(c[2]) for c in settled[-45:])
+            out[sym] = row
             await asyncio.sleep(0.05)
         return out
 
     async def sweep(self) -> list[Metrics]:
         info = await self._get(f"{ASTER_PUBLIC}/exchangeInfo")
         now = time.time() * 1000
-        perps = {
-            s["symbol"]: s for s in info.get("symbols", [])
-            if s.get("status") == "TRADING" and s.get("contractType") == "PERPETUAL"
-            and s.get("underlyingType", "COIN") == "COIN"
-            and s["symbol"].endswith("USDT")
-        }
+        perps = {s["symbol"]: s for s in info.get("symbols", []) if is_coin_perp(s)}
         premium, ticker, finfo, mexc = await asyncio.gather(
             self._get(f"{ASTER_PUBLIC}/premiumIndex"),
             self._get(f"{ASTER_PUBLIC}/ticker/24hr"),
@@ -319,7 +373,7 @@ class ScamScreen:
             except Exception:
                 log.exception("coingecko refresh failed (keeping %d coins)", len(self._cg))
             try:
-                self._day_gain = await self._day_gains(
+                self._daily_rows = await self._daily(
                     {sym: int(s.get("onboardDate") or 0) for sym, s in perps.items()}
                 )
             except Exception:
@@ -336,12 +390,18 @@ class ScamScreen:
                    if rate not in (None, "") else None)
             base = canonical_base(s.get("baseAsset", sym[:-4]))
             spot_sym = f"{base}USDT" if f"{base}USDT" in mexc_vol else None
-            oi = None
+            oi = apr_24h = None
             depth: dict[str, float] = {}
             async with gate:
                 try:
                     o = await self._get(f"{ASTER_PUBLIC}/openInterest", {"symbol": sym})
                     oi = float(o.get("openInterest") or 0) * mark
+                except Exception:
+                    pass
+                try:
+                    prints = await self._get(f"{ASTER_PUBLIC}/fundingRate",
+                                             {"symbol": sym, "limit": "30"})
+                    apr_24h = average_funding_apr(prints, interval.get(sym, 8), now)
                 except Exception:
                     pass
                 if config.SCAM_LOG_DEPTH:
@@ -370,8 +430,10 @@ class ScamScreen:
                 market_cap_usd=cg.get("market_cap") or None,
                 float_ratio=(circ / total) if circ and total else None,
                 age_days=((now - s["onboardDate"]) / DAY_MS) if s.get("onboardDate") else None,
-                max_day_gain_30d=self._day_gain.get(sym),
-                mark=mark or None, depth=depth,
+                max_day_gain_30d=(self._daily_rows.get(sym) or {}).get("gain"),
+                mark=mark or None, depth=depth, funding_apr_24h=apr_24h,
+                low_45d=(self._daily_rows.get(sym) or {}).get("low45"),
+                high_45d=(self._daily_rows.get(sym) or {}).get("high45"),
             )
 
         return list(await asyncio.gather(*(one(sym, s) for sym, s in perps.items())))
@@ -394,6 +456,7 @@ LOG_COLUMNS = (
     + [f"{v}_{s}_{b * 100:.0f}pct" for v in ("aster", "mexc") for s in ("bid", "ask")
        for b in DEPTH_BANDS]
     + [f"{v}_{s}_reach_pct" for v in ("aster", "mexc") for s in ("bid", "ask")]
+    + ["funding_apr_24h", "low_45d", "high_45d"]      # added later: appended last
 )
 
 
@@ -401,25 +464,36 @@ def log_sweep(metrics: list[Metrics], rows: list[Scored], now_ms: int) -> Path:
     """Append one row per coin perp to output/scam_log_YYYYMMDD.csv: the
     history (open interest, order-book shape, funding) that the venues do not
     serve after the fact, so whether any of it leads a spike can be tested
-    later. Rotated to .gz by scripts/gzip_old_logs.sh like the basis log."""
+    later. Rotated to .gz by scripts/gzip_old_logs.sh like the basis log.
+
+    A file started under an older, narrower header keeps that header for the
+    rest of its day (rows are written to its columns only), so a mid-day
+    deploy never leaves a ragged CSV; new columns begin with the next file."""
     day = time.strftime("%Y%m%d", time.gmtime(now_ms / 1000))
     path = config.OUTPUT_DIR / f"scam_log_{day}.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     scores = {r.symbol: r.score for r in rows}
+    header = LOG_COLUMNS
+    if path.exists() and path.stat().st_size:
+        with open(path, newline="") as f:
+            header = next(csv.reader(f), LOG_COLUMNS) or LOG_COLUMNS
 
     def fmt(v) -> str:
         return "" if v is None else (f"{v:.6g}" if isinstance(v, float) else str(v))
 
     with open(path, "a", newline="") as f:
-        w = csv.writer(f)
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
         if not path.stat().st_size:
-            w.writerow(LOG_COLUMNS)
+            w.writeheader()
         for m in metrics:
-            base = [now_ms, m.symbol, m.mark, m.oi_usd, m.funding_apr, m.perp_volume_usd,
-                    m.spot_volume_usd, m.market_cap_usd, m.float_ratio, m.age_days,
-                    m.max_day_gain_30d, scores.get(m.symbol)]
-            w.writerow([fmt(v) for v in base]
-                       + [fmt(m.depth.get(c)) for c in LOG_COLUMNS[len(base):]])
+            row = {"ts_ms": now_ms, "symbol": m.symbol, "mark": m.mark, "oi_usd": m.oi_usd,
+                   "funding_apr": m.funding_apr, "perp_volume_usd": m.perp_volume_usd,
+                   "spot_volume_usd": m.spot_volume_usd, "market_cap_usd": m.market_cap_usd,
+                   "float_ratio": m.float_ratio, "age_days": m.age_days,
+                   "max_day_gain_30d": m.max_day_gain_30d, "score": scores.get(m.symbol),
+                   "funding_apr_24h": m.funding_apr_24h, "low_45d": m.low_45d,
+                   "high_45d": m.high_45d, **m.depth}
+            w.writerow({k: fmt(row.get(k)) for k in header})
     return path
 
 

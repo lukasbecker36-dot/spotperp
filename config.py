@@ -487,7 +487,7 @@ SCAM_SLOW_REFRESH_SECONDS = float(os.environ.get("SCAM_SLOW_REFRESH_SECONDS", "2
 COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
 SCAM_COINGECKO_PAGES = int(os.environ.get("SCAM_COINGECKO_PAGES", "8"))   # x250 = top 2000
 SCAM_COINGECKO_PAGE_PAUSE_SECONDS = float(os.environ.get("SCAM_COINGECKO_PAGE_PAUSE_SECONDS", "8"))
-# Alert at this score (max 12). On 2026-10-24 the live universe scored: 14 of
+# Alert at this score (max 15). On 2026-10-24 the live universe scored: 14 of
 # 569 coin perps at >=5, 134 at >=4 — 5 keeps it to names worth reading.
 SCAM_ALERT_SCORE = int(os.environ.get("SCAM_ALERT_SCORE", "5"))
 # Funding at or below this (annualised, 1.0 = 100%) alerts on its own: shorts
@@ -508,7 +508,13 @@ SCAM_ALERT_MAX_LINES = int(os.environ.get("SCAM_ALERT_MAX_LINES", "20"))
 # Thresholds (HackerNoon screening heuristics; float + recent-pump added here).
 SCAM_OI_MCAP_WARN, SCAM_OI_MCAP_DANGER = 0.5, 1.0
 SCAM_PERP_SPOT_WARN, SCAM_PERP_SPOT_DANGER = 15.0, 40.0
-SCAM_FUNDING_APR_WARN, SCAM_FUNDING_APR_DANGER = 1.0, 3.0
+SCAM_FUNDING_APR_WARN, SCAM_FUNDING_APR_DANGER = 1.0, 3.0      # negative side
+# Positive funding (longs paying) scores heavier: on the replay a 24h average
+# above +10bp/8h (~+110%/yr) preceded a +50% week 4.7x as often as normal
+# funding, against 2.8x for crowded shorts below -20bp/8h.
+SCAM_FUNDING_POS_WARN, SCAM_FUNDING_POS_DANGER = 1.0, 3.0
+# 'Already ran': price >= 3x its 45-day low and >= 30% below its 45-day high.
+SCAM_RAN_OFF_LOW, SCAM_RAN_BELOW_HIGH = 3.0, 0.30
 SCAM_AGE_WARN_DAYS, SCAM_AGE_DANGER_DAYS = 180.0, 60.0
 SCAM_MCAP_WARN_USD, SCAM_MCAP_DANGER_USD = 100e6, 30e6
 SCAM_FLOAT_WARN = 0.20

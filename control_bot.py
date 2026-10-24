@@ -47,7 +47,7 @@ HELP = """Commands:
 /screen fill [n] — pairs with real perp volume + a persistently workable basis (you can actually get filled)
 /funding [n] — top funding carry (bps per hour)
 /funding all [n] — top 20 names by 24h avg funding, unfiltered (same columns + why /funding hides it)
-/scam [n] | /scam neg | /scam SYMBOL — scam-candidate screen: coins set up like insider squeezes (OI vs mcap, perp vs spot volume, extreme funding, new listing, small mcap, low float, a recent +50% day); 'neg' = strongly negative funding; alerts arrive on their own when a name first qualifies
+/scam [n] | /scam neg | /scam SYMBOL — scam-candidate screen: coins set up like insider squeezes (OI vs mcap, perp vs spot volume, extreme funding — longs paying weighs most, new listing, small mcap, low float, a recent +50% day, already ran, spiked and longs still paying); stocks/ETFs excluded; 'neg' = strongly negative funding; alerts arrive on their own when a name first qualifies
 /alert [fill|funding|spike LEVEL|auto|off] — message when a /screen fill or /funding score reaches LEVEL (no args: status)
 /autoenter [fill|funding|spike NOTIONAL|off] — auto-start a normal entry when that board's /alert fires (needs the alert on; capped)
 /study spike [days] — run the mean-reversion study on the server's own basis logs (default 7 days); the report arrives when done

@@ -50,7 +50,59 @@ def test_warning_tier_scores_one_each():
                              spot_volume_usd=1e6, market_cap_usd=60e6,
                              age_days=100),
                           have_mcap_data=True)
-    assert s.score == 5          # OI/mcap .58, perp/spot 20x, funding, age, mcap
+    # OI/mcap .58 (1), perp/spot 20x (1), longs paying +150% (2), age (1), mcap (1)
+    assert s.score == 6
+
+
+def test_positive_funding_outweighs_negative():
+    pos = scam_screen.score(_m(funding_apr=1.5), have_mcap_data=False)
+    neg = scam_screen.score(_m(funding_apr=-1.5), have_mcap_data=False)
+    assert pos.score == 2 and "longs paying" in pos.reasons[0]
+    assert neg.score == 1
+    assert scam_screen.score(_m(funding_apr=3.5), have_mcap_data=False).score == 3
+    assert scam_screen.score(_m(funding_apr=-3.5), have_mcap_data=False).score == 2
+
+
+def test_score_uses_the_24h_average_funding_over_one_print():
+    # A spiky last print, a calm day: the average decides.
+    s = scam_screen.score(_m(funding_apr=4.0, funding_apr_24h=0.2), have_mcap_data=False)
+    assert s.score == 0 and s.funding_apr == 0.2
+
+
+def test_already_ran_and_another_leg_flags():
+    ran = scam_screen.score(_m(mark=0.042, low_45d=0.0117, high_45d=0.318),
+                            have_mcap_data=False)
+    assert ran.score == 1 and ran.reasons[0].startswith("already ran (3.6x off 45d low")
+    # Near its high is still running, not 'already ran'.
+    assert scam_screen.score(_m(mark=0.3, low_45d=0.0117, high_45d=0.318),
+                             have_mcap_data=False).score == 0
+    # IRYS now: spiked, longs paying +270%/yr -> pump (1) + funding (2) + another leg (1)
+    leg = scam_screen.score(_m(max_day_gain_30d=21.4, funding_apr_24h=2.7),
+                            have_mcap_data=False)
+    assert leg.score == 4
+    assert "spiked recently and longs still paying: another-leg risk" in leg.reasons
+    # Spiked but shorts paying: no another-leg point.
+    assert scam_screen.score(_m(max_day_gain_30d=0.8, funding_apr_24h=-2.0),
+                             have_mcap_data=False).score == 2
+
+
+def test_average_funding_apr_uses_last_24h_and_interval():
+    now = 10 * scam_screen.DAY_MS
+    prints = [{"fundingTime": now - 30 * 3_600_000, "fundingRate": "0.01"},   # too old
+              {"fundingTime": now - 2 * 3_600_000, "fundingRate": "0.0002"},
+              {"fundingTime": now - 1 * 3_600_000, "fundingRate": "0.0004"}]
+    apr = scam_screen.average_funding_apr(prints, 1, now)      # hourly settlement
+    assert abs(apr - 0.0003 * 24 * 365) < 1e-9
+    assert scam_screen.average_funding_apr([], 8, now) is None
+
+
+def test_stock_and_etf_perps_are_not_coins():
+    base = {"status": "TRADING", "contractType": "PERPETUAL", "underlyingType": "COIN",
+            "symbol": "XUSDT"}
+    assert scam_screen.is_coin_perp({**base, "symbolType": 0})
+    assert not scam_screen.is_coin_perp({**base, "symbolType": 1})   # XIAOMI, SOXL...
+    assert scam_screen.is_coin_perp(base)                             # field absent
+    assert not scam_screen.is_coin_perp({**base, "status": "SETTLING", "symbolType": 0})
 
 
 def test_unknown_market_cap_counts_only_when_coingecko_loaded():
@@ -67,21 +119,37 @@ def test_absurd_day_gain_is_capped_in_the_label():
     assert s.reasons == [">+1000% day in last 30d"]
 
 
-async def test_listing_days_are_skipped_in_day_gains():
+async def test_listing_days_are_skipped_in_daily_candles():
     """The listing candle's 'previous close' is a placeholder: skip the first
-    two days after onboarding, keep real moves after that."""
+    two days after onboarding for the day gain AND the 45-day low/high."""
     D = scam_screen.DAY_MS
     listed = 100 * D
-    candles = [[listed, 0, 0, 0, "0.0001"],              # listing day, placeholder close
-               [listed + D, 0, "65.6", 0, "1.0"],        # 'gain' off the placeholder
-               [listed + 2 * D, 0, "1.1", 0, "1.0"],
-               [listed + 3 * D, 0, "1.8", 0, "1.5"]]     # a real +80% day
+    candles = [[listed, 0, "0.5", "0.0001", "0.0001"],   # listing day, placeholder
+               [listed + D, 0, "65.6", "0.9", "1.0"],    # 'gain' off the placeholder
+               [listed + 2 * D, 0, "1.1", "0.95", "1.0"],
+               [listed + 3 * D, 0, "1.8", "1.0", "1.5"]] # a real +80% day
 
     class _S(scam_screen.ScamScreen):
         async def _get(self, url, params=None, headers=None, timeout=20.0):
             return candles
-    out = await _S(session=None)._day_gains({"XUSDT": listed})
-    assert abs(out["XUSDT"] - 0.8) < 1e-9
+    out = (await _S(session=None)._daily({"XUSDT": listed}))["XUSDT"]
+    assert abs(out["gain"] - 0.8) < 1e-9
+    assert out["low45"] == 0.95 and out["high45"] == 1.8
+
+
+def test_log_keeps_an_older_files_header(tmp_path, monkeypatch):
+    """A file started before a column was added keeps its own header all day."""
+    import csv as _csv
+    monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path)
+    t = 1_792_800_000_000
+    day = time.strftime("%Y%m%d", time.gmtime(t / 1000))
+    p = tmp_path / f"scam_log_{day}.csv"
+    p.write_text("ts_ms,symbol,score\n1,OLDUSDT,2\n")
+    scam_screen.log_sweep([_m(symbol="AUSDT", funding_apr_24h=1.0)],
+                          [Scored("AUSDT", 4, [], 1.0, None)], t)
+    got = list(_csv.reader(open(p, newline="")))
+    assert got[0] == ["ts_ms", "symbol", "score"] and got[-1] == [str(t), "AUSDT", "4"]
+    assert all(len(r) == 3 for r in got)
 
 
 def test_depth_bands_sum_usd_per_side_and_reach():
