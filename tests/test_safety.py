@@ -87,6 +87,8 @@ def engine(tmp_path, monkeypatch):
     eng._spot_deficit_since = {}
     eng._stops_orders = {}
     eng._stop_grace = {}
+    eng._spot_stop_close = set()
+    eng._spot_stop_check_at = {}
     eng._hedge_break = {}
     eng._position_risk_ts = 0.0
     eng._position_risk_wall_ms = 0
@@ -504,17 +506,75 @@ async def test_stops_places_reduce_only_perp_stop_and_spot_limit(engine):
     }
     out = await engine._cmd_stops({"symbol": "BTC"})
 
-    # Perp: reduce-only buy STOP_MARKET at 1% below liq (148.5), full size.
+    # Perp: reduce-only buy STOP (stop-limit) triggering on the mark 10% below
+    # liq (135), buying no higher than 3% above the trigger, full size.
     perp = engine.aster.placed[0]
-    assert perp["side"] == "BUY" and perp["type"] == "STOP_MARKET"
+    info = engine.md.aster_info["BTCUSDT"]
+    assert perp["side"] == "BUY" and perp["type"] == "STOP"
     assert perp["reduce_only"] is True and perp["working_type"] == "MARK_PRICE"
-    assert perp["stop_price"] == Decimal("148.5")
+    assert perp["stop_price"] == Decimal("135")
+    assert perp["price"] == info.round_price(Decimal("139.05"), up=False)
+    assert perp["time_in_force"] == "GTC"
     assert perp["quantity"] == Decimal("9.95")
     # Spot: sell LIMIT at the same level, full size.
     spot = engine.mexc.placed[0]
     assert spot["side"] == "SELL" and spot["type"] == "LIMIT"
-    assert spot["price"] == Decimal("148.5") and spot["quantity"] == Decimal("9.95")
+    assert spot["price"] == Decimal("135") and spot["quantity"] == Decimal("9.95")
     assert "below liq 150" in out
+
+
+async def test_stops_past_trigger_buys_back_with_capped_limit(engine):
+    """Armed after the mark is already past the trigger (Aster would reject a
+    STOP that fires at once): buy the perp back now with a reduce-only LIMIT
+    capped 3% above the mark, never above liquidation."""
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _StopClient()
+    engine.mexc = _StopClient()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "140", "liquidationPrice": "150"}
+    }
+    out = await engine._cmd_stops({"symbol": "BTC"})
+    perp = engine.aster.placed[0]
+    info = engine.md.aster_info["BTCUSDT"]
+    assert perp["type"] == "LIMIT" and perp["side"] == "BUY"
+    assert perp["reduce_only"] is True and perp["time_in_force"] == "GTC"
+    assert perp["price"] == info.round_price(Decimal("144.2"), up=False)
+    assert "stop_price" not in perp
+    assert engine.mexc.placed[0]["price"] == Decimal("135")
+    assert "already past trigger" in out
+    assert engine._stops_orders[pid]["aster_id"] == "oid-LIMIT"
+
+
+async def test_rejected_stop_limit_falls_back_to_stop_market(engine):
+    """The old stops are cancelled before the new ones go in, so a rejected
+    stop-limit must not leave the perp unprotected."""
+    from exchange_client import ExchangeError
+
+    class _RejectsStop(_StopClient):
+        async def place_order(self, symbol, side, order_type, **kw):
+            if order_type == "STOP":
+                raise ExchangeError("aster", "order type not supported", -1116)
+            return await super().place_order(symbol, side, order_type, **kw)
+
+    pid = await _make_live_open(engine)
+    engine.paper = False
+    engine.aster = _RejectsStop()
+    engine.mexc = _StopClient()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "150"}
+    }
+    out = await engine._cmd_stops({"symbol": "BTC"})
+    perp = engine.aster.placed[0]
+    assert perp["type"] == "STOP_MARKET" and perp["stop_price"] == Decimal("135")
+    assert perp["reduce_only"] is True and perp["working_type"] == "MARK_PRICE"
+    assert "REJECTED" in out
+    assert engine._stops_orders[pid]["aster_id"] == "oid-STOP_MARKET"
+
+
+async def test_stop_limit_cap_never_exceeds_liquidation(engine):
+    assert engine._stop_limit_cap(Decimal("148"), Decimal("150")) == Decimal("150")
+    assert engine._stop_limit_cap(Decimal("100"), Decimal("150")) == Decimal("103.00")
 
 
 import time as _time
@@ -524,6 +584,7 @@ from types import SimpleNamespace
 def _order(executed="0", avg="0", open_=True):
     return SimpleNamespace(
         executed_qty=Decimal(executed), avg_price=Decimal(avg), is_open=open_,
+        is_filled=not open_ and Decimal(executed) > 0,
     )
 
 
@@ -756,6 +817,129 @@ async def test_partial_adl_rebalances_to_surviving_perp(engine, monkeypatch):
     assert final.spot_qty == Decimal("4.95")    # hedge restored
     assert final.state == pm.OPEN
     assert final.exit_mode is None              # exit request cleared
+
+
+def _arm_spot_first(engine, pid, perp_stop, spot_stop, mark="120"):
+    """Stops armed (A1 perp stop, M1 spot stop-limit) on a live position with
+    a fresh venue snapshot still showing the full perp short."""
+    engine.paper = False
+    engine.aster = _GraceClient(orders={"A1": perp_stop})
+    engine.mexc = _GraceClient(orders={"M1": spot_stop})
+    engine._stops_orders[pid] = {"aster_id": "A1", "mexc_id": "M1",
+                                 "liq": Decimal("150")}
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "positionAmt": "-9.95",
+                    "markPrice": mark, "liquidationPrice": "150"}
+    }
+    engine._position_risk_ts = _time.monotonic()
+    engine._position_risk_wall_ms = int(_time.time() * 1000) + 60_000
+
+
+async def test_spot_stop_filled_first_buys_back_the_perp(engine):
+    """A MEXC-only spike fills the spot stop-limit while the Aster mark never
+    reaches the trigger. The spot sale is booked at its real price, the Aster
+    stop is cancelled, and the perp is bought back with a reduce-only LIMIT
+    capped 3% above the mark — the perp short must not be left naked."""
+    pid = await _make_live_open(engine)
+    _arm_spot_first(engine, pid, _order(open_=True),
+                    _order(executed="9.95", avg="135", open_=False))
+    assert await engine._check_spot_stop_fill(engine.positions.get(pid)) is True
+
+    pos = engine.positions.get(pid)
+    assert pos.spot_qty == 0 and pos.spot_exit_avg == Decimal("135")
+    assert pos.perp_qty == Decimal("9.95")          # buy-back still working
+    assert "A1" in engine.aster.cancelled
+    buy = engine.aster.placed[-1]
+    info = engine.md.aster_info["BTCUSDT"]
+    assert buy["type"] == "LIMIT" and buy["side"] == "BUY" and buy["reduce_only"]
+    assert buy["price"] == info.round_price(Decimal("123.6"), up=False)
+    assert buy["quantity"] == Decimal("9.95")
+    assert pid in engine._spot_stop_close
+    assert engine._stops_orders[pid] == {"aster_id": "oid-LIMIT", "mexc_id": None,
+                                         "liq": Decimal("150")}
+    assert any("sold the spot before the Aster stop" in m
+               for m in engine.notifier.messages)
+    # Taken over: a second sweep does nothing new.
+    assert await engine._check_spot_stop_fill(engine.positions.get(pid)) is True
+    assert len(engine.aster.placed) == 1
+
+
+async def test_spot_first_buyback_fill_closes_the_position(engine, monkeypatch):
+    """The buy-back fills: the hedge guard books the perp at its real price as
+    our own stop and closes the position — without booking the spot twice."""
+    monkeypatch.setattr(config, "HEDGE_BREAK_CONFIRM_SECONDS", 0.0)
+    pid = await _make_live_open(engine)
+    _arm_spot_first(engine, pid, _order(open_=True),
+                    _order(executed="9.95", avg="135", open_=False))
+    await engine._check_spot_stop_fill(engine.positions.get(pid))
+
+    engine.aster._orders["oid-LIMIT"] = _order(executed="9.95", avg="123", open_=False)
+    engine._position_risk["BTCUSDT"]["positionAmt"] = "0"
+    engine._position_risk_ts = _time.monotonic()
+    await engine._check_hedge_integrity(engine.positions.get(pid))   # warn+arm
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
+    await _wait_state(engine, pid, pm.CLOSED)
+    final = engine.positions.get(pid)
+    assert final.perp_qty == 0 and final.spot_qty == 0
+    assert final.perp_exit_avg == Decimal("123")
+    assert final.spot_exit_avg == Decimal("135")
+    assert pid not in engine._spot_stop_close
+
+
+async def test_spot_stop_part_fill_keeps_waiting(engine):
+    """Only a FILLED spot stop triggers the buy-back; a part-fill keeps resting."""
+    pid = await _make_live_open(engine)
+    _arm_spot_first(engine, pid, _order(open_=True),
+                    _order(executed="4", avg="135", open_=True))
+    assert await engine._check_spot_stop_fill(engine.positions.get(pid)) is False
+    assert engine.aster.placed == [] and engine.aster.cancelled == []
+    assert engine.positions.get(pid).spot_qty == Decimal("9.95")
+
+
+async def test_spot_stop_fill_leaves_perp_stop_fire_to_the_guard(engine):
+    """Both legs fired: that is the hedge guard's stop-fire path, not this one."""
+    pid = await _make_live_open(engine)
+    _arm_spot_first(engine, pid, _order(executed="9.95", avg="137", open_=False),
+                    _order(executed="9.95", avg="135", open_=False))
+    assert await engine._check_spot_stop_fill(engine.positions.get(pid)) is False
+    assert engine.aster.placed == [] and engine.aster.cancelled == []
+    assert pid not in engine._spot_stop_close
+
+
+async def test_spot_stop_poll_is_throttled(engine, monkeypatch):
+    pid = await _make_live_open(engine)
+    _arm_spot_first(engine, pid, _order(open_=True), _order(open_=True))
+    engine._spot_stop_check_at[pid] = _time.monotonic()
+    calls = []
+    orig = engine.mexc.get_order
+
+    async def counting(symbol, order_id):
+        calls.append(order_id)
+        return await orig(symbol, order_id)
+    engine.mexc.get_order = counting
+    assert await engine._check_spot_stop_fill(engine.positions.get(pid)) is False
+    assert calls == []
+
+
+async def test_guard_waits_while_stop_limit_part_filled(engine, monkeypatch):
+    """A stop-limit part-filled and still working: the guard waits for it to
+    finish rather than settle a partial (the full-size spot stop would then
+    oversell against the perp left behind) — and doesn't re-alert meanwhile."""
+    monkeypatch.setattr(config, "HEDGE_BREAK_CONFIRM_SECONDS", 0.0)
+    pid = await _make_live_open(engine)
+    _arm_adl(engine, "-4.95")
+    engine.aster = _GraceClient(orders={"A1": _order(executed="5", avg="139", open_=True)})
+    engine.mexc = _GraceClient(orders={"M1": _order(open_=True)})
+    engine._stops_orders[pid] = {"aster_id": "A1", "mexc_id": "M1"}
+    await engine._check_hedge_integrity(engine.positions.get(pid))   # warn+arm
+    alerts = len(engine.notifier.messages)
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
+    assert await engine._check_hedge_integrity(engine.positions.get(pid)) is True
+    pos = engine.positions.get(pid)
+    assert pos.perp_qty == Decimal("9.95")          # nothing settled yet
+    assert pid in engine._hedge_break
+    assert engine.aster.cancelled == []
+    assert len(engine.notifier.messages) == alerts
 
 
 class _RiskClient(_StopClient):
@@ -2434,12 +2618,12 @@ async def test_stops_follow_liquidation_when_margin_is_added(engine, monkeypatch
     all the refresh compared — so the stop stayed at the old, much closer
     level and fired on an ordinary move with the position 64% from liq."""
     pid = await _stops_at_liq(engine, monkeypatch, "150")
-    assert engine.aster.placed[0]["stop_price"] == Decimal("148.5")
+    assert engine.aster.placed[0]["stop_price"] == Decimal("135")
     _set_liq(engine, "200")                       # margin added
     await engine._ensure_stops(engine.positions.get(pid))
     assert len(engine.aster.placed) == 2
-    assert engine.aster.placed[1]["stop_price"] == Decimal("198")   # 1% below
-    assert engine.mexc.placed[1]["price"] == Decimal("198")
+    assert engine.aster.placed[1]["stop_price"] == Decimal("180")   # 10% below
+    assert engine.mexc.placed[1]["price"] == Decimal("180")
     msg = next(m for m in engine.notifier.messages if "refreshed" in m)
     assert "margin added" in msg
 
@@ -2450,7 +2634,7 @@ async def test_stops_follow_liquidation_when_it_moves_closer(engine, monkeypatch
     pid = await _stops_at_liq(engine, monkeypatch, "150")
     _set_liq(engine, "130")
     await engine._ensure_stops(engine.positions.get(pid))
-    assert engine.aster.placed[-1]["stop_price"] == Decimal("128.7")
+    assert engine.aster.placed[-1]["stop_price"] == Decimal("117")
     assert any("BEYOND" in m for m in engine.notifier.messages)
 
 

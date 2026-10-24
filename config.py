@@ -400,9 +400,22 @@ EXIT_OPP_MIN_HOURS = float(os.environ.get("EXIT_OPP_MIN_HOURS", "24"))
 EXIT_SLIPPAGE_BPS = Decimal(os.environ.get("EXIT_SLIPPAGE_BPS", "10"))
 LIQ_ALERT_THROTTLE_SECONDS = float(os.environ.get("LIQ_ALERT_THROTTLE_SECONDS", "1800"))
 # /stops places protective orders this % below the perp liquidation price: a
-# reduce-only buy STOP_MARKET on Aster (triggers on the mark, closing the short
-# before liquidation) and a resting sell LIMIT on MEXC at the same level.
-STOP_LIQ_BUFFER_PCT = Decimal(os.environ.get("STOP_LIQ_BUFFER_PCT", "1"))
+# reduce-only buy STOP (stop-limit) on Aster that triggers on the mark, and a
+# resting sell LIMIT on MEXC at the same level.
+# Why 10% and a limit, not 1% and STOP_MARKET: in a squeeze Aster's thin book
+# spikes far above the mark for seconds, and a market stop buys that wick
+# (IRYS #313 triggered at mark 0.0643 and filled at 0.0709, -$666 on the perp —
+# more than liquidation would have cost). A limit refuses the wick, and 10% of
+# room lets it wait for the pullback before the mark reaches liquidation. On a
+# replay of 275 pumps (spot >= 1.5x its 72h low, Aster 1m mark/last + MEXC 5m)
+# this beat the 1% market stop by ~0.8% of notional per pump; tighter buffers
+# got liquidated waiting (5%: 12 liquidations, 1%: 52).
+STOP_LIQ_BUFFER_PCT = Decimal(os.environ.get("STOP_LIQ_BUFFER_PCT", "10"))
+# The stop-limit's buy price, this % above its trigger: room for normal
+# slippage in an ordinary fast market, while refusing to chase a wick. +1%
+# filled too rarely before liquidation in the replay; above +3% added nothing.
+# Never set above liquidation.
+STOP_LIMIT_HEADROOM_PCT = Decimal(os.environ.get("STOP_LIMIT_HEADROOM_PCT", "3"))
 # Re-place the stops when the liquidation price moves by more than this (%)
 # from the level they were set against. Half the buffer: past that, a stop
 # either fires well short of liquidation (margin added — position 249 was
@@ -448,13 +461,17 @@ SPOT_CHECK_INTERVAL_SECONDS = float(
 )
 ADL_SELL_TRANCHE_PCT = Decimal(os.environ.get("ADL_SELL_TRANCHE_PCT", "10"))
 ADL_SELL_INTERVAL_SECONDS = float(os.environ.get("ADL_SELL_INTERVAL_SECONDS", "10"))
-# When the perp deficit is explained by OUR OWN /stops STOP_MARKET having fired
+# When the perp deficit is explained by OUR OWN /stops stop order having fired
 # (not an ADL), the MEXC sell LIMIT twin is already resting at the chosen stop
 # price — leave it working for this long before cancelling it and falling back
 # to tranche market sells. Aster's stop triggers on the Aster mark; MEXC often
 # reaches the level seconds later, and market-dumping immediately realises the
 # venue price gap at the worst possible moment.
 STOP_SPOT_GRACE_SECONDS = float(os.environ.get("STOP_SPOT_GRACE_SECONDS", "120"))
+# The reverse case: how often to poll each position's MEXC stop-limit for having
+# filled BEFORE the Aster stop (a MEXC-only spike). A filled spot stop leaves
+# the perp short naked, so it is closed at once (_check_spot_stop_fill).
+SPOT_STOP_POLL_SECONDS = float(os.environ.get("SPOT_STOP_POLL_SECONDS", "10"))
 MAX_HOLD_HOURS = 168                     # 1 week max hold
 # Aster perp margin applied to each symbol before its first live entry: 1x
 # isolated keeps the short fully margined (liquidation only on a ~100% move),

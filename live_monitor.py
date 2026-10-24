@@ -205,6 +205,11 @@ class Engine:
         # "floor"} while the resting MEXC sell LIMIT is given time to fill at
         # the stop price before falling back to tranche market sells.
         self._stop_grace: dict[int, dict] = {}
+        # Spot-first: the MEXC stop-limit sold the spot before the Aster stop
+        # fired, and a perp buy-back is working. The hedge guard owns these
+        # until the buy-back fills. Last poll of each MEXC stop-limit (throttle).
+        self._spot_stop_close: set[int] = set()
+        self._spot_stop_check_at: dict[int, float] = {}
         self._position_risk_ts = 0.0        # last SUCCESSFUL refresh (monotonic)
         self._position_risk_wall_ms = 0     # ...and its wall-clock time
 
@@ -246,6 +251,14 @@ class Engine:
                         if row.get("liq_price") else None),
             }
             self._stops_qty[pid] = Decimal(row["perp_qty"] or "0")
+            # A spot-first buy-back in flight: perp order kept, spot already sold.
+            if row["aster_id"] and not row["mexc_id"]:
+                try:
+                    pos = self.positions.get(pid)
+                except KeyError:
+                    continue
+                if pos.spot_qty <= 0 and pos.perp_qty > 0:
+                    self._spot_stop_close.add(pid)
         if stops:
             log.info("recovered /stops orders for %d position(s)", len(stops))
 
@@ -1339,7 +1352,12 @@ class Engine:
         HEDGE_BREAK_CONFIRM_SECONDS before anything is traded."""
         if self.paper or pos.paper or pos.state != pm.OPEN:
             return False
-        if pos.perp_qty <= 0 or pos.spot_qty <= 0:
+        if pos.perp_qty <= 0:
+            return False
+        if pos.spot_qty <= 0 and pos.id not in self._spot_stop_close:
+            # Spot already gone. Normally nothing left to guard — except when
+            # the MEXC stop-limit sold it first and the perp buy-back is
+            # working: its fill arrives here as a deficit like any stop's.
             return False
         if self.executor.has_task(pos.id):
             # An entry/add is working — fills are still being recorded, so a
@@ -1400,7 +1418,7 @@ class Engine:
             book = self.md.aster_books.get(pair.aster_symbol)
             mark = book.bid if book and book.bid > 0 else pos.perp_entry_avg or Decimal(0)
 
-        # Was this OUR OWN /stops STOP_MARKET firing rather than an ADL? If the
+        # Was this OUR OWN /stops order firing rather than an ADL? If the
         # stop order executed, reconcile the perp at its REAL fill price and
         # treat the resting MEXC sell LIMIT as the preferred spot exit.
         stop_ids = dict(self._stops_orders.get(pos.id) or {})
@@ -1430,6 +1448,15 @@ class Engine:
             except ExchangeError:
                 log.exception("stop-order lookup failed for position %s", pos.id)
 
+        if stop_order is not None and stop_order.is_open:
+            # Our stop-limit (or spot-first buy-back) has part-filled and is
+            # still working. Wait for it to finish — it fills, or Aster cancels
+            # it when the rest is liquidated — rather than settle a partial: the
+            # full-size MEXC stop-limit would then oversell the spot against
+            # the perp left behind. Keep the deficit confirmed so the next
+            # sweep re-checks without re-alerting.
+            self._hedge_break[pos.id] = first
+            return True
         if stop_order is not None:
             fill_qty = min(deficit, stop_order.executed_qty)
             price = stop_order.avg_price if stop_order.avg_price > 0 else mark
@@ -1479,6 +1506,7 @@ class Engine:
         )
         self._stops_qty.pop(pos.id, None)
         self._stops_orders.pop(pos.id, None)
+        self._spot_stop_close.discard(pos.id)
         database.clear_stop_orders(self.conn, pos.id)
 
         mexc_info = self.md.mexc_info.get(pair.mexc_symbol)
@@ -1594,6 +1622,111 @@ class Engine:
         await self.executor.start_spot_rebalance(
             self.positions.get(pos.id), floor
         )
+
+    async def _check_spot_stop_fill(self, pos: pm.Position) -> bool:
+        """Close the perp when the MEXC stop-limit sold the spot FIRST.
+
+        The two stop legs trigger on different prices: the perp stop on Aster's
+        mark, the spot limit on MEXC trades. A MEXC-only spike can fill the
+        spot sell while the mark never reaches the trigger, and nothing else
+        reacts to that — spot integrity just books the sale, leaving the perp
+        short naked on a pumping coin. So treat a filled spot stop as the
+        trigger: record the sale, cancel the Aster stop, and buy back the perp
+        with a reduce-only LIMIT capped STOP_LIMIT_HEADROOM_PCT above the mark
+        (marketable in a calm book, refuses a wick). Its fill reaches the hedge
+        guard as this position's own stop order and closes the position out.
+
+        Acts only on a FILLED spot stop; a part-fill keeps resting. Returns
+        True once it has taken the position over."""
+        if self.paper or pos.paper or pos.state != pm.OPEN or pos.perp_qty <= 0:
+            return False
+        if pos.id in self._spot_stop_close:
+            return True
+        stop_ids = self._stops_orders.get(pos.id) or {}
+        if not stop_ids.get("mexc_id"):
+            return False
+        now = time.monotonic()
+        if now - self._spot_stop_check_at.get(pos.id, 0.0) < config.SPOT_STOP_POLL_SECONDS:
+            return False
+        self._spot_stop_check_at[pos.id] = now
+        pair = self.md.pair_maps.get(pos.symbol)
+        aster_info = self.md.aster_info.get(pair.aster_symbol) if pair else None
+        if pair is None or aster_info is None:
+            return False
+        try:
+            spot_order = await self.mexc.get_order(pair.mexc_symbol, stop_ids["mexc_id"])
+        except ExchangeError:
+            log.exception("spot stop poll failed for position %s", pos.id)
+            return False
+        if not spot_order.is_filled:
+            return False
+        if stop_ids.get("aster_id"):
+            try:
+                perp_order = await self.aster.get_order(pair.aster_symbol, stop_ids["aster_id"])
+            except ExchangeError:
+                log.exception("perp stop poll failed for position %s", pos.id)
+                return False
+            if perp_order.executed_qty > 0:
+                return False      # perp stop fired too: the hedge guard's case
+            if perp_order.is_open:
+                try:
+                    await self.aster.cancel_order(pair.aster_symbol, stop_ids["aster_id"])
+                except ExchangeError:
+                    log.exception("perp stop cancel failed for position %s", pos.id)
+                    return False  # can't risk two buy-backs; retry next poll
+
+        # Book the spot sale at its real price, unless spot integrity already
+        # reconciled it at the bid.
+        booked = min(spot_order.executed_qty, pos.spot_qty)
+        if booked > 0:
+            self.positions.record_fill(
+                pos.id, "mexc", "exit", "SELL", booked, spot_order.avg_price,
+                Decimal(0), order_id=stop_ids["mexc_id"],
+            )
+        row = self._position_risk.get(pair.aster_symbol) or {}
+        liq = _dec_or_zero(row.get("liquidationPrice")) or stop_ids.get("liq") or Decimal(0)
+        mark = _dec_or_zero(row.get("markPrice"))
+        if mark <= 0:
+            book = self.md.aster_books.get(pair.aster_symbol)
+            mark = book.ask if book and book.ask > 0 else Decimal(0)
+        qty = aster_info.round_qty(min(
+            pos.perp_qty, spot_order.executed_qty / pair.qty_multiplier
+        ))
+        if mark <= 0 or qty <= 0:
+            return False
+        cap = self._stop_limit_cap(mark, liq) if liq > 0 else mark * (
+            1 + config.STOP_LIMIT_HEADROOM_PCT / Decimal(100))
+        cap = aster_info.round_price(cap, up=False)
+        try:
+            r = await self.aster.place_order(
+                pair.aster_symbol, "BUY", "LIMIT",
+                quantity=qty, price=cap, time_in_force="GTC", reduce_only=True,
+                client_order_id=intents.make_client_order_id(pos.id, "stop"),
+            )
+        except ExchangeError as exc:
+            await self.notifier.alert(
+                f"🚨 position {pos.id} {pos.symbol}: MEXC stop-limit sold the"
+                f" spot but the perp buy-back FAILED ({exc}) — the perp short"
+                f" is naked. Close it by hand."
+            )
+            journal(self.conn, f"position {pos.id}: spot stop filled first;"
+                    f" perp buy-back failed: {exc}", "ERROR")
+            return True
+        self._stops_orders[pos.id] = {"aster_id": r.order_id, "mexc_id": None,
+                                      "liq": stop_ids.get("liq")}
+        database.save_stop_orders(
+            self.conn, pos.id, r.order_id, None, qty, liq_price=stop_ids.get("liq"),
+        )
+        self._spot_stop_close.add(pos.id)
+        journal(self.conn, f"position {pos.id}: spot stop-limit filled first"
+                f" ({spot_order.executed_qty} @ {spot_order.avg_price}) — perp"
+                f" buy-back LIMIT {qty} @ {cap}", "ERROR")
+        await self.notifier.alert(
+            f"🛑 position {pos.id} {pos.symbol}: the MEXC stop-limit sold the"
+            f" spot before the Aster stop fired — buying back the perp"
+            f" ({qty} @ ≤{recon._p(cap)}, mark {recon._p(mark)})."
+        )
+        return True
 
     async def _ensure_stops(self, pos: pm.Position) -> None:
         """Keep liquidation-protection orders in place for a live OPEN position.
@@ -2801,9 +2934,11 @@ class Engine:
 
     async def _cmd_stops(self, args: dict) -> str:
         """Place liquidation-protection orders for one position: a reduce-only
-        buy STOP_MARKET on the Aster perp STOP_LIQ_BUFFER_PCT below the liq
-        price (triggers on the mark, closing the short before liquidation), and
-        a resting sell LIMIT on MEXC spot at the same level (full size on both).
+        buy STOP (stop-limit) on the Aster perp STOP_LIQ_BUFFER_PCT below the liq
+        price (triggers on the mark; buys no higher than STOP_LIMIT_HEADROOM_PCT
+        above the trigger), and a resting sell LIMIT on MEXC spot at the same
+        level (full size on both). If the spot limit fills first, the perp is
+        closed too (_check_spot_stop_fill).
         Re-running refreshes: prior /stops orders are cancelled first. Once
         placed, the safety loop auto-refreshes them if the position is resized."""
         if self.paper:
@@ -2858,24 +2993,58 @@ class Engine:
         buf = config.STOP_LIQ_BUFFER_PCT / Decimal(100)
         stop_ref = liq * (Decimal(1) - buf)          # perp-contract price terms
         perp_stop = aster_info.round_price(stop_ref, up=False)
+        perp_limit = aster_info.round_price(self._stop_limit_cap(stop_ref, liq), up=False)
         spot_price = mexc_info.round_price(stop_ref / pair.qty_multiplier, up=False)
         perp_qty = aster_info.round_qty(pos.perp_qty)
         spot_qty = mexc_info.round_qty(pos.spot_qty)
         if perp_qty <= 0 or spot_qty <= 0:
             return f"{pos.symbol}: position too small to place stops"
+        mark = _dec_or_zero(risk.get("markPrice")) if risk else Decimal(0)
 
         cancelled = await self._cancel_stop_orders(pair)
         lines: list[str] = []
         aster_id = mexc_id = None
         try:
-            r = await self.aster.place_order(
-                pair.aster_symbol, "BUY", "STOP_MARKET",
-                quantity=perp_qty, stop_price=perp_stop, reduce_only=True,
-                working_type="MARK_PRICE",
-                client_order_id=intents.make_client_order_id(pos.id, "stop"),
-            )
+            if mark >= stop_ref:
+                # Already past the trigger (armed late: a restart, a refresh
+                # after a margin change). Aster rejects a STOP that would fire
+                # at once, so do what the stop would have done: buy back now,
+                # capped off the mark so a wick in progress isn't chased.
+                cap = aster_info.round_price(self._stop_limit_cap(mark, liq), up=False)
+                r = await self.aster.place_order(
+                    pair.aster_symbol, "BUY", "LIMIT",
+                    quantity=perp_qty, price=cap, time_in_force="GTC",
+                    reduce_only=True,
+                    client_order_id=intents.make_client_order_id(pos.id, "stop"),
+                )
+                lines.append(f"mark {recon._p(mark)} already past trigger"
+                             f" {recon._p(perp_stop)} — perp buy-back LIMIT"
+                             f" {perp_qty} @ {recon._p(cap)} (id {r.order_id})")
+            else:
+                try:
+                    r = await self.aster.place_order(
+                        pair.aster_symbol, "BUY", "STOP",
+                        quantity=perp_qty, price=perp_limit, stop_price=perp_stop,
+                        time_in_force="GTC", reduce_only=True,
+                        working_type="MARK_PRICE",
+                        client_order_id=intents.make_client_order_id(pos.id, "stop"),
+                    )
+                    lines.append(f"perp STOP buy {perp_qty} trigger {recon._p(perp_stop)}"
+                                 f" limit {recon._p(perp_limit)} (id {r.order_id})")
+                except ExchangeError as exc:
+                    # The old orders are already cancelled: never leave the
+                    # perp unprotected over a rejected stop-limit. A market
+                    # stop at the same trigger pays any wick, but beats none.
+                    r = await self.aster.place_order(
+                        pair.aster_symbol, "BUY", "STOP_MARKET",
+                        quantity=perp_qty, stop_price=perp_stop, reduce_only=True,
+                        working_type="MARK_PRICE",
+                        client_order_id=intents.make_client_order_id(pos.id, "stop"),
+                    )
+                    lines.append(f"perp stop-limit REJECTED ({exc}) — placed"
+                                 f" STOP_MARKET buy {perp_qty} trigger"
+                                 f" {recon._p(perp_stop)} instead (id {r.order_id})")
             aster_id = r.order_id
-            lines.append(f"perp STOP buy {perp_qty} trigger {recon._p(perp_stop)} (id {r.order_id})")
         except ExchangeError as exc:
             lines.append(f"perp stop FAILED: {exc}")
         try:
@@ -2909,6 +3078,13 @@ class Engine:
         if cancelled:
             head += f" (replaced {cancelled} prior)"
         return head + "\n  " + "\n  ".join(lines)
+
+    @staticmethod
+    def _stop_limit_cap(ref: Decimal, liq: Decimal) -> Decimal:
+        """Highest price a protective perp buy-back may pay: STOP_LIMIT_HEADROOM_PCT
+        above its reference, never above liquidation (past that, being
+        liquidated costs less than the fill)."""
+        return min(ref * (1 + config.STOP_LIMIT_HEADROOM_PCT / Decimal(100)), liq)
 
     async def _cancel_stop_orders(
         self, pair: screener.PairMap, prefixes: tuple[str, ...] = ("sp_stop_",)
@@ -3484,6 +3660,12 @@ class Engine:
                         # Liquidation risk exists in any state while the perp short
                         # is open, so check it independently of the basis logic.
                         await self._check_liquidation(pos)
+                        if await self._check_spot_stop_fill(pos):
+                            # Spot sold by its stop first; the perp buy-back
+                            # is working. Only the hedge guard (which books its
+                            # fill and closes out) may act on this position.
+                            await self._check_hedge_integrity(pos)
+                            continue
                         await self._check_spot_integrity(pos)
                         if pos.state == pm.OPEN:
                             if await self._check_hedge_integrity(pos):
@@ -3503,6 +3685,9 @@ class Engine:
                 self._auto_passive &= active_ids
                 for gone in set(self._auto_stops_attempt) - active_ids:
                     self._auto_stops_attempt.pop(gone, None)
+                self._spot_stop_close &= active_ids
+                for gone in set(self._spot_stop_check_at) - active_ids:
+                    self._spot_stop_check_at.pop(gone, None)
                 for gone in set(self._tp_confirm) - active_ids:
                     self._tp_confirm.pop(gone, None)
                 self._liq_protect &= active_ids
