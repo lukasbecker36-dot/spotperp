@@ -84,6 +84,38 @@ async def test_listing_days_are_skipped_in_day_gains():
     assert abs(out["XUSDT"] - 0.8) < 1e-9
 
 
+def test_depth_bands_sum_usd_per_side_and_reach():
+    book = {"bids": [["99", "10"], ["97", "10"], ["94", "10"]],     # mid 100
+            "asks": [["101", "10"], ["104", "10"], ["109", "1"]]}
+    d = scam_screen.depth_bands(book, "mexc")
+    assert d["mexc_bid_2pct"] == 990.0                  # 99 only (>= 98)
+    assert d["mexc_bid_5pct"] == 990.0 + 970.0          # >= 95
+    assert d["mexc_bid_10pct"] == 990.0 + 970.0 + 940.0
+    assert d["mexc_ask_2pct"] == 1010.0                 # <= 102
+    assert d["mexc_ask_5pct"] == 1010.0 + 1040.0        # <= 105
+    assert d["mexc_ask_10pct"] == 1010.0 + 1040.0 + 109.0
+    assert abs(d["mexc_ask_reach_pct"] - 9.0) < 1e-9
+    assert abs(d["mexc_bid_reach_pct"] - 6.0) < 1e-9
+    assert scam_screen.depth_bands({"bids": [], "asks": []}, "x") == {}
+
+
+def test_log_sweep_writes_one_row_per_coin_under_one_header(tmp_path, monkeypatch):
+    import csv as _csv
+    monkeypatch.setattr(config, "OUTPUT_DIR", tmp_path)
+    m = _m(symbol="AUSDT", mark=1.5, oi_usd=2e6, funding_apr=-3.0,
+           depth={"aster_ask_5pct": 1234.0, "mexc_bid_2pct": 50.0})
+    rows = [Scored("AUSDT", 6, [], -3.0, None)]
+    t = 1_792_800_000_000
+    p = scam_screen.log_sweep([m], rows, t)
+    scam_screen.log_sweep([m], rows, t + H)           # same day: append, no 2nd header
+    got = list(_csv.DictReader(open(p, newline="")))
+    assert p.name.startswith("scam_log_") and len(got) == 2
+    r = got[0]
+    assert r["symbol"] == "AUSDT" and r["score"] == "6" and r["oi_usd"] == "2e+06"
+    assert r["aster_ask_5pct"] == "1234" and r["mexc_bid_2pct"] == "50"
+    assert r["mexc_ask_10pct"] == "" and r["market_cap_usd"] == ""
+
+
 def test_alert_once_per_episode_then_rearm(monkeypatch):
     monkeypatch.setattr(config, "SCAM_ALERT_SCORE", 5)
     monkeypatch.setattr(config, "SCAM_ALERT_REARM_HOURS", 24)

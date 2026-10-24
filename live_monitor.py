@@ -836,6 +836,10 @@ class Engine:
                 ))
                 if message:
                     await self.notifier.alert(message)
+                try:
+                    scam_screen.log_sweep(metrics, rows, now)
+                except Exception:
+                    log.exception("scam log write failed")
                 log.info("scam screen: %d coin perps, %d at score>=%d", len(rows),
                          sum(r.score >= config.SCAM_ALERT_SCORE for r in rows),
                          config.SCAM_ALERT_SCORE)

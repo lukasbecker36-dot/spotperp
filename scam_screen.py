@@ -25,10 +25,12 @@ of another one.
 from __future__ import annotations
 
 import asyncio
+import csv
 import logging
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 import aiohttp
 
@@ -54,6 +56,10 @@ class Metrics:
     float_ratio: float | None = None      # circulating / total supply
     age_days: float | None = None
     max_day_gain_30d: float | None = None  # 0.5 = a +50% day
+    mark: float | None = None
+    # Resting USD within +-2/5/10% of mid per side, per venue, and how far the
+    # fetched levels reach (a reach under the band means the band is a floor).
+    depth: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -77,6 +83,29 @@ def _usd(v: float) -> str:
     if v >= 1e6:
         return f"${v / 1e6:.1f}M"
     return f"${v / 1e3:.0f}k"
+
+
+DEPTH_BANDS = (0.02, 0.05, 0.10)
+
+
+def depth_bands(book: dict, prefix: str) -> dict[str, float]:
+    """USD resting within each band of the mid, per side, from a Binance-style
+    {'bids': [[px, qty], ...], 'asks': [...]} book. 'No liquidity above certain
+    prices' is the thin ask side this measures."""
+    bids = [(float(p), float(q)) for p, q, *_ in book.get("bids") or []]
+    asks = [(float(p), float(q)) for p, q, *_ in book.get("asks") or []]
+    if not bids or not asks:
+        return {}
+    mid = (bids[0][0] + asks[0][0]) / 2
+    out: dict[str, float] = {}
+    for side, levels, sign in (("bid", bids, -1), ("ask", asks, 1)):
+        for band in DEPTH_BANDS:
+            edge = mid * (1 + sign * band)
+            out[f"{prefix}_{side}_{band * 100:.0f}pct"] = sum(
+                p * q for p, q in levels if (p >= edge if sign < 0 else p <= edge)
+            )
+        out[f"{prefix}_{side}_reach_pct"] = abs(levels[-1][0] / mid - 1) * 100
+    return out
 
 
 def score(m: Metrics, have_mcap_data: bool) -> Scored:
@@ -297,25 +326,44 @@ class ScamScreen:
                 log.exception("daily candle refresh failed")
             self._slow_at = time.monotonic()
 
-        out: list[Metrics] = []
-        for sym, s in perps.items():
+        gate = asyncio.Semaphore(config.SCAM_FETCH_CONCURRENCY)
+
+        async def one(sym: str, s: dict) -> Metrics:
             p = prem.get(sym) or {}
             mark = float(p.get("markPrice") or 0)
             rate = p.get("lastFundingRate")
             apr = (float(rate) * (24 / interval.get(sym, 8)) * 365
                    if rate not in (None, "") else None)
-            oi = None
-            try:
-                o = await self._get(f"{ASTER_PUBLIC}/openInterest", {"symbol": sym})
-                oi = float(o.get("openInterest") or 0) * mark
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
             base = canonical_base(s.get("baseAsset", sym[:-4]))
+            spot_sym = f"{base}USDT" if f"{base}USDT" in mexc_vol else None
+            oi = None
+            depth: dict[str, float] = {}
+            async with gate:
+                try:
+                    o = await self._get(f"{ASTER_PUBLIC}/openInterest", {"symbol": sym})
+                    oi = float(o.get("openInterest") or 0) * mark
+                except Exception:
+                    pass
+                if config.SCAM_LOG_DEPTH:
+                    try:
+                        depth |= depth_bands(await self._get(
+                            f"{ASTER_PUBLIC}/depth",
+                            {"symbol": sym, "limit": str(config.SCAM_DEPTH_LEVELS)}), "aster")
+                    except Exception:
+                        pass
+                    if spot_sym:
+                        try:
+                            depth |= depth_bands(await self._get(
+                                f"{MEXC_PUBLIC}/depth",
+                                {"symbol": spot_sym, "limit": str(config.SCAM_DEPTH_LEVELS)}),
+                                "mexc")
+                        except Exception:
+                            pass
+                await asyncio.sleep(0.05)
             cg = self._cg.get(base) or {}
             circ = cg.get("circulating_supply") or 0
             total = cg.get("total_supply") or cg.get("max_supply") or 0
-            out.append(Metrics(
+            return Metrics(
                 symbol=sym, base=base, funding_apr=apr, oi_usd=oi,
                 perp_volume_usd=float((tick.get(sym) or {}).get("quoteVolume") or 0),
                 spot_volume_usd=(cg.get("total_volume") or mexc_vol.get(f"{base}USDT")),
@@ -323,8 +371,10 @@ class ScamScreen:
                 float_ratio=(circ / total) if circ and total else None,
                 age_days=((now - s["onboardDate"]) / DAY_MS) if s.get("onboardDate") else None,
                 max_day_gain_30d=self._day_gain.get(sym),
-            ))
-        return out
+                mark=mark or None, depth=depth,
+            )
+
+        return list(await asyncio.gather(*(one(sym, s) for sym, s in perps.items())))
 
     @property
     def have_mcap_data(self) -> bool:
@@ -335,6 +385,42 @@ class _RateLimited(Exception):
     def __init__(self, wait: float) -> None:
         super().__init__(f"rate limited, retry after {wait}s")
         self.wait = wait
+
+
+LOG_COLUMNS = (
+    ["ts_ms", "symbol", "mark", "oi_usd", "funding_apr", "perp_volume_usd",
+     "spot_volume_usd", "market_cap_usd", "float_ratio", "age_days",
+     "max_day_gain_30d", "score"]
+    + [f"{v}_{s}_{b * 100:.0f}pct" for v in ("aster", "mexc") for s in ("bid", "ask")
+       for b in DEPTH_BANDS]
+    + [f"{v}_{s}_reach_pct" for v in ("aster", "mexc") for s in ("bid", "ask")]
+)
+
+
+def log_sweep(metrics: list[Metrics], rows: list[Scored], now_ms: int) -> Path:
+    """Append one row per coin perp to output/scam_log_YYYYMMDD.csv: the
+    history (open interest, order-book shape, funding) that the venues do not
+    serve after the fact, so whether any of it leads a spike can be tested
+    later. Rotated to .gz by scripts/gzip_old_logs.sh like the basis log."""
+    day = time.strftime("%Y%m%d", time.gmtime(now_ms / 1000))
+    path = config.OUTPUT_DIR / f"scam_log_{day}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scores = {r.symbol: r.score for r in rows}
+
+    def fmt(v) -> str:
+        return "" if v is None else (f"{v:.6g}" if isinstance(v, float) else str(v))
+
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if not path.stat().st_size:
+            w.writerow(LOG_COLUMNS)
+        for m in metrics:
+            base = [now_ms, m.symbol, m.mark, m.oi_usd, m.funding_apr, m.perp_volume_usd,
+                    m.spot_volume_usd, m.market_cap_usd, m.float_ratio, m.age_days,
+                    m.max_day_gain_30d, scores.get(m.symbol)]
+            w.writerow([fmt(v) for v in base]
+                       + [fmt(m.depth.get(c)) for c in LOG_COLUMNS[len(base):]])
+    return path
 
 
 def snapshot(rows: list[Scored], alerted: dict[str, int], now_ms: int) -> dict:

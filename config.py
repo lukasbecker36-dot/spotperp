@@ -495,6 +495,15 @@ SCAM_ALERT_SCORE = int(os.environ.get("SCAM_ALERT_SCORE", "5"))
 # -18bps per 8h; 11 names were there on 2026-10-24.
 SCAM_NEG_FUNDING_APR = float(os.environ.get("SCAM_NEG_FUNDING_APR", "-2.0"))
 SCAM_ALERT_REARM_HOURS = float(os.environ.get("SCAM_ALERT_REARM_HOURS", "24"))
+# Each sweep also appends output/scam_log_YYYYMMDD.csv: open interest, funding,
+# volumes and order-book shape (USD within +-2/5/10% of mid on Aster and MEXC)
+# for every coin perp — history neither venue serves later, logged so whether
+# OI build-up or a thin ask side leads a spike can be tested in a few weeks.
+SCAM_LOG_DEPTH = os.environ.get("SCAM_LOG_DEPTH", "1").strip().lower() not in (
+    "0", "false", "no", "off", ""
+)
+SCAM_DEPTH_LEVELS = int(os.environ.get("SCAM_DEPTH_LEVELS", "100"))
+SCAM_FETCH_CONCURRENCY = int(os.environ.get("SCAM_FETCH_CONCURRENCY", "3"))
 SCAM_ALERT_MAX_LINES = int(os.environ.get("SCAM_ALERT_MAX_LINES", "20"))
 # Thresholds (HackerNoon screening heuristics; float + recent-pump added here).
 SCAM_OI_MCAP_WARN, SCAM_OI_MCAP_DANGER = 0.5, 1.0

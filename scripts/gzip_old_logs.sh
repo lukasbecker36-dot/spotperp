@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Gzip basis logs for every UTC day EXCEPT today's, which the engine is still
+# Gzip basis and scam-screen logs for every UTC day EXCEPT today's, which the engine is still
 # appending to. Gzipping the live file would break the plain-CSV writer, so it
 # is always skipped. Safe to run repeatedly (gzip -f overwrites a stale .gz).
 #
@@ -10,11 +10,13 @@
 set -euo pipefail
 
 OUTPUT_DIR="${1:-${OUTPUT_DIR:-/opt/basis-trade/output}}"
-today="basis_log_$(date -u +%Y%m%d).csv"
+day="$(date -u +%Y%m%d)"
 
 shopt -s nullglob
-for f in "$OUTPUT_DIR"/basis_log_*.csv; do
-    [ "$(basename "$f")" = "$today" ] && continue   # live file, leave it
+for f in "$OUTPUT_DIR"/basis_log_*.csv "$OUTPUT_DIR"/scam_log_*.csv; do
+    case "$(basename "$f")" in
+        "basis_log_${day}.csv"|"scam_log_${day}.csv") continue ;;   # live files, leave them
+    esac
     gzip -f "$f"
     echo "gzipped $f"
 done
