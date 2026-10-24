@@ -16,6 +16,7 @@ DB_PATH = DATA_DIR / "positions.db"
 MODE_FILE = DATA_DIR / "mode.env"
 SCREENER_SNAPSHOT_FILE = DATA_DIR / "screener_snapshot.json"
 FUNDING_SNAPSHOT_FILE = DATA_DIR / "funding_snapshot.json"
+SCAM_SNAPSHOT_FILE = DATA_DIR / "scam_snapshot.json"
 HEARTBEAT_FILE = DATA_DIR / "heartbeat.json"
 
 # ── Exchange endpoints ──
@@ -472,6 +473,37 @@ STOP_SPOT_GRACE_SECONDS = float(os.environ.get("STOP_SPOT_GRACE_SECONDS", "120")
 # filled BEFORE the Aster stop (a MEXC-only spike). A filled spot stop leaves
 # the perp short naked, so it is closed at once (_check_spot_stop_fill).
 SPOT_STOP_POLL_SECONDS = float(os.environ.get("SPOT_STOP_POLL_SECONDS", "10"))
+# ── Scam-candidate screen (scam_screen.py; advisory, never trades) ──
+# Scores every Aster coin perp on the insider-squeeze warning signs and alerts
+# on Telegram when a name first reaches SCAM_ALERT_SCORE, or its funding falls
+# to SCAM_NEG_FUNDING_APR (crowded shorts). Set SCAM_SCREEN=0 to switch off.
+SCAM_SCREEN = os.environ.get("SCAM_SCREEN", "1").strip().lower() not in (
+    "0", "false", "no", "off", ""
+)
+SCAM_SCREEN_INTERVAL_SECONDS = float(os.environ.get("SCAM_SCREEN_INTERVAL_SECONDS", "3600"))
+# Market caps (CoinGecko) and daily candles: slow-moving, and CoinGecko's free
+# tier rate-limits hard (~10 calls/min). Optional demo key: COINGECKO_API_KEY.
+SCAM_SLOW_REFRESH_SECONDS = float(os.environ.get("SCAM_SLOW_REFRESH_SECONDS", "21600"))
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
+SCAM_COINGECKO_PAGES = int(os.environ.get("SCAM_COINGECKO_PAGES", "8"))   # x250 = top 2000
+SCAM_COINGECKO_PAGE_PAUSE_SECONDS = float(os.environ.get("SCAM_COINGECKO_PAGE_PAUSE_SECONDS", "8"))
+# Alert at this score (max 12). On 2026-10-24 the live universe scored: 14 of
+# 569 coin perps at >=5, 134 at >=4 — 5 keeps it to names worth reading.
+SCAM_ALERT_SCORE = int(os.environ.get("SCAM_ALERT_SCORE", "5"))
+# Funding at or below this (annualised, 1.0 = 100%) alerts on its own: shorts
+# crowded enough to squeeze (MYX ran -2%/4h before its squeeze). -2.0 = about
+# -18bps per 8h; 11 names were there on 2026-10-24.
+SCAM_NEG_FUNDING_APR = float(os.environ.get("SCAM_NEG_FUNDING_APR", "-2.0"))
+SCAM_ALERT_REARM_HOURS = float(os.environ.get("SCAM_ALERT_REARM_HOURS", "24"))
+SCAM_ALERT_MAX_LINES = int(os.environ.get("SCAM_ALERT_MAX_LINES", "20"))
+# Thresholds (HackerNoon screening heuristics; float + recent-pump added here).
+SCAM_OI_MCAP_WARN, SCAM_OI_MCAP_DANGER = 0.5, 1.0
+SCAM_PERP_SPOT_WARN, SCAM_PERP_SPOT_DANGER = 15.0, 40.0
+SCAM_FUNDING_APR_WARN, SCAM_FUNDING_APR_DANGER = 1.0, 3.0
+SCAM_AGE_WARN_DAYS, SCAM_AGE_DANGER_DAYS = 180.0, 60.0
+SCAM_MCAP_WARN_USD, SCAM_MCAP_DANGER_USD = 100e6, 30e6
+SCAM_FLOAT_WARN = 0.20
+SCAM_PUMP_DAY_GAIN = 0.50
 MAX_HOLD_HOURS = 168                     # 1 week max hold
 # Aster perp margin applied to each symbol before its first live entry: 1x
 # isolated keeps the short fully margined (liquidation only on a ~100% move),

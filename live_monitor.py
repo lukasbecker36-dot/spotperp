@@ -23,6 +23,7 @@ import position_manager as pm
 import book
 import recon
 import recovery
+import scam_screen
 import score_alerts
 import screener
 from screener import BPS
@@ -282,6 +283,7 @@ class Engine:
             self._safety_loop(),
             self._funding_loop(),
             self._depth_loop(),
+            self._scam_loop(),
         )
 
     async def _load_symbol_maps(self, *, initial: bool = False) -> tuple[list[str], list[str]]:
@@ -807,6 +809,39 @@ class Engine:
                 prune_old_rows(self.conn)
             except Exception:
                 log.exception("db prune error")
+
+    async def _scam_loop(self) -> None:
+        """Hourly scam-candidate screen (scam_screen.py): write the /scam board
+        and alert names that newly look like insider-squeeze setups. Public
+        data only; it never trades, and a failure here only skips a sweep."""
+        if not config.SCAM_SCREEN:
+            return
+        screen = scam_screen.ScamScreen(self.session)
+        try:
+            prev = json.loads(config.SCAM_SNAPSHOT_FILE.read_text())
+            alerted = {k: int(v) for k, v in (prev.get("alerted") or {}).items()}
+        except (FileNotFoundError, json.JSONDecodeError, AttributeError):
+            alerted = {}
+        await asyncio.sleep(60)            # let startup settle first
+        while True:
+            try:
+                metrics = await screen.sweep()
+                rows = [scam_screen.score(m, screen.have_mcap_data) for m in metrics]
+                now = int(time.time() * 1000)
+                open_symbols = {p.symbol: p.id for p in self.positions.active()
+                                if not p.paper}
+                message, alerted = scam_screen.plan_alert(rows, alerted, now, open_symbols)
+                config.SCAM_SNAPSHOT_FILE.write_text(json.dumps(
+                    scam_screen.snapshot(rows, alerted, now)
+                ))
+                if message:
+                    await self.notifier.alert(message)
+                log.info("scam screen: %d coin perps, %d at score>=%d", len(rows),
+                         sum(r.score >= config.SCAM_ALERT_SCORE for r in rows),
+                         config.SCAM_ALERT_SCORE)
+            except Exception:
+                log.exception("scam screen sweep failed")
+            await asyncio.sleep(config.SCAM_SCREEN_INTERVAL_SECONDS)
 
     async def _refresh_position_funding(self) -> None:
         """Set each open LIVE position's funding_usd to the actual FUNDING_FEE

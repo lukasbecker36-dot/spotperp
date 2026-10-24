@@ -47,6 +47,7 @@ HELP = """Commands:
 /screen fill [n] — pairs with real perp volume + a persistently workable basis (you can actually get filled)
 /funding [n] — top funding carry (bps per hour)
 /funding all [n] — top 20 names by 24h avg funding, unfiltered (same columns + why /funding hides it)
+/scam [n] | /scam neg | /scam SYMBOL — scam-candidate screen: coins set up like insider squeezes (OI vs mcap, perp vs spot volume, extreme funding, new listing, small mcap, low float, a recent +50% day); 'neg' = strongly negative funding; alerts arrive on their own when a name first qualifies
 /alert [fill|funding|spike LEVEL|auto|off] — message when a /screen fill or /funding score reaches LEVEL (no args: status)
 /autoenter [fill|funding|spike NOTIONAL|off] — auto-start a normal entry when that board's /alert fires (needs the alert on; capped)
 /study spike [days] — run the mean-reversion study on the server's own basis logs (default 7 days); the report arrives when done
@@ -66,7 +67,7 @@ HELP = """Commands:
 /exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins or $500, omit=full
 /exit ID|SYMBOL cancel — stop a working exit, back to OPEN
 /auto [ID|SYMBOL] [off] — arm a one-shot passive exit that starts when the exit-opportunity alert fires (no args: list armed)
-/stops SYMBOL — place liq-protection stop (perp) + sell limit (spot) ~1% below liq price (auto-placed on new positions and re-armed after a size change / part-reduce; AUTO_STOPS=0 to disable)
+/stops SYMBOL — place liq-protection stop-limit (perp, triggers on the mark 10% below liq, buys ≤3% above) + sell limit (spot) at the same level (auto-placed on new positions and re-armed after a size change / part-reduce / margin change; AUTO_STOPS=0 to disable)
 /remove ID|SYMBOL YES — stop tracking a position closed manually on the exchange (DB only)
 /truefill ID|SYMBOL — re-price a mark-booked exit (ADL / lost stop) from Aster's real trades and recompute P&L
 /recompute ID|SYMBOL — re-derive quantities, averages and entry basis from the fill history (DB only)
@@ -90,6 +91,7 @@ BOT_COMMANDS = [
     # monitoring
     {"command": "screen", "description": "Basis opportunities; 'diff' vs 24h avg, 'swing' round-trip"},
     {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
+    {"command": "scam", "description": "Scam-candidate screen: [n] | neg | SYMBOL"},
     {"command": "alert", "description": "Score alert: fill|funding LEVEL|auto|off"},
     {"command": "scores", "description": "Score history: alerts/day per level"},
     {"command": "autoenter", "description": "Auto-enter on alerts: fill|funding|spike NOTIONAL|off"},
@@ -111,7 +113,7 @@ BOT_COMMANDS = [
     {"command": "exit", "description": "Exit: ID|SYMBOL now|passive [bps]"},
     {"command": "cancel", "description": "Cancel working entry or exit: ID|SYMBOL"},
     {"command": "auto", "description": "Auto passive exit on a plunge: [ID|SYMBOL] [off]"},
-    {"command": "stops", "description": "Liq-protection orders 1% below liq: SYMBOL"},
+    {"command": "stops", "description": "Liq-protection orders 10% below liq: SYMBOL"},
     {"command": "flatten", "description": "Close all positions (YES)"},
     # position management
     {"command": "adopt", "description": "Import a venue carry trade: SYMBOL"},
@@ -321,6 +323,8 @@ class ControlBot:
             return self._cmd_screen(args)
         if command == "funding":
             return self._cmd_funding(args)
+        if command == "scam":
+            return self._cmd_scam(args)
         if command == "alert":
             return self._cmd_alert(args)
         if command == "scores":
@@ -376,8 +380,8 @@ class ControlBot:
         if command == "stops":
             if not args:
                 return ("usage: /stops SYMBOL — place liquidation-protection"
-                        " orders (reduce-only buy STOP on Aster + sell LIMIT on"
-                        " MEXC) 1% below the perp liq price, full size")
+                        " orders (reduce-only buy stop-limit on Aster + sell LIMIT"
+                        " on MEXC) 10% below the perp liq price, full size")
             return await self._queue_and_wait("stops", {"symbol": args[0]}, wait=25)
         if command == "remove":
             if not args:
@@ -1139,6 +1143,51 @@ class ControlBot:
             " scripts/dataset_report.py --by fill_score (or carry_score) on"
             " the server."
         )
+        return "\n".join(lines)
+
+    def _cmd_scam(self, args: list[str]) -> str:
+        """The scam-candidate board the engine writes hourly (scam_screen.py)."""
+        try:
+            snap = json.loads(config.SCAM_SNAPSHOT_FILE.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return ("no scam-screen data yet — the engine runs its first sweep"
+                    " ~1min after start (a few minutes while it loads market caps)")
+        age_m = (time.time() * 1000 - snap.get("ts_ms", 0)) / 60_000
+        rows = snap.get("rows") or []
+        arg = args[0] if args else ""
+        if arg and not arg.isdigit() and arg.lower() not in ("neg", "negative"):
+            sym = arg.upper() if arg.upper().endswith("USDT") else arg.upper() + "USDT"
+            r = next((x for x in rows if x["symbol"] == sym), None)
+            if r is None:
+                return f"{sym} isn't on the scam screen (Aster coin perps only)"
+            return (f"{sym}: score {r['score']} (alert at"
+                    f" {config.SCAM_ALERT_SCORE}), {age_m:.0f}min old\n"
+                    + ("\n".join(f"  • {w}" for w in r["reasons"]) or "  no warning signs"))
+
+        def apr(r: dict) -> str:
+            return "" if r.get("funding_apr") is None else f"{r['funding_apr']:+.0%}"
+
+        if arg.lower() in ("neg", "negative"):
+            neg = sorted((r for r in rows if r.get("funding_apr") is not None
+                          and r["funding_apr"] <= config.SCAM_NEG_FUNDING_APR),
+                         key=lambda r: r["funding_apr"])
+            if not neg:
+                return (f"no coin perps with funding ≤{config.SCAM_NEG_FUNDING_APR:.0%}"
+                        f" APR ({age_m:.0f}min old)")
+            lines = [f"strongly negative funding ≤{config.SCAM_NEG_FUNDING_APR:.0%} APR"
+                     f" — crowded shorts, squeeze risk ({age_m:.0f}min old)",
+                     f"{'symbol':<14}{'APR':>8}{'score':>6}"]
+            lines += [f"{r['symbol']:<14}{apr(r):>8}{r['score']:>6}" for r in neg]
+            return "\n".join(lines)
+        n = int(arg) if arg.isdigit() else 15
+        top = [r for r in rows if r["score"] >= 1][:n]
+        if not top:
+            return f"no coin perps show warning signs ({age_m:.0f}min old)"
+        lines = [f"scam-candidate screen — top {len(top)} of {len(rows)} coin perps,"
+                 f" alert at score ≥{config.SCAM_ALERT_SCORE} ({age_m:.0f}min old)"]
+        for r in top:
+            lines.append(f"{r['symbol']} [{r['score']}] {', '.join(r['reasons'])}")
+        lines.append("/scam SYMBOL for one name, /scam neg for negative funding")
         return "\n".join(lines)
 
     def _cmd_funding(self, args: list[str]) -> str:
