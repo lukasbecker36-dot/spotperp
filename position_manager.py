@@ -65,6 +65,7 @@ class Position:
     auto_exit: bool = False  # /auto: passive exit when the opportunity alert fires
     exit_auto: bool = False  # the working exit was started by /auto
     auto_entered: bool = False  # opened by /autoenter off a score alert
+    leverage: int | None = None  # Aster leverage; None = config.ASTER_LEVERAGE
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Position":
@@ -104,6 +105,10 @@ class Position:
             auto_entered=(
                 bool(row["auto_entered"]) if "auto_entered" in row.keys() else False
             ),
+            leverage=(
+                int(row["leverage"])
+                if "leverage" in row.keys() and row["leverage"] is not None else None
+            ),
         )
 
 
@@ -116,16 +121,16 @@ class PositionManager:
     def create(
         self, symbol: str, notional: Decimal, *, paper: bool,
         direction: str = "premium", min_entry_bps: Decimal | None = None,
-        trade_kind: str = "convergence",
+        trade_kind: str = "convergence", leverage: int | None = None,
     ) -> Position:
         now = _now_ms()
         cur = self._conn.execute(
             "INSERT INTO positions (symbol, direction, state, paper, target_notional,"
-            " min_entry_bps, trade_kind, created_ms, updated_ms)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " min_entry_bps, trade_kind, leverage, created_ms, updated_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (symbol, direction, PENDING_ENTRY, int(paper), str(notional),
              str(min_entry_bps) if min_entry_bps is not None else None,
-             trade_kind, now, now),
+             trade_kind, leverage, now, now),
         )
         self._conn.commit()
         return self.get(int(cur.lastrowid))

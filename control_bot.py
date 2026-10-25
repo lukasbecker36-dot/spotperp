@@ -61,7 +61,8 @@ HELP = """Commands:
 /adopt SYMBOL — import an existing venue carry trade as a managed position
 /book SYMBOL — top 5 order book levels on both venues
 /refresh — rebuild the cross-listed coin universe (pick up new listings)
-/enter SYMBOL NOTIONAL [min_bps] [carry] — start maker entry, or size up an already-OPEN position by NOTIONAL (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close)
+/enter SYMBOL NOTIONAL [min_bps] [carry] [lev=N] — start maker entry, or size up an already-OPEN position by NOTIONAL (floor defaults to fee breakeven; 'carry' = funding trade, no auto-close; lev=2 = 2x Aster leverage on a new position: NOTIONAL spot + NOTIONAL/2 perp margin)
+/carry — steady-funding names for leveraged carry when the low-cap boards are quiet: funding now/24h, est. return on capital at 2x/3x, basis vs its 24h range
 /cancel ID|SYMBOL — stop a working entry OR exit, back to OPEN
 /exit ID|SYMBOL now [qty] — aggressive close (taker both legs); qty=coins or $500, omit=full
 /exit ID|SYMBOL passive [target_bps] [qty] — work maker close; qty=coins or $500, omit=full
@@ -92,6 +93,7 @@ BOT_COMMANDS = [
     {"command": "screen", "description": "Basis opportunities; 'diff' vs 24h avg, 'swing' round-trip"},
     {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
     {"command": "scam", "description": "Scam-candidate screen: [n] | neg | SYMBOL"},
+    {"command": "carry", "description": "Steady carry names for leveraged carry (2x/3x)"},
     {"command": "alert", "description": "Score alert: fill|funding LEVEL|auto|off"},
     {"command": "scores", "description": "Score history: alerts/day per level"},
     {"command": "autoenter", "description": "Auto-enter on alerts: fill|funding|spike NOTIONAL|off"},
@@ -325,6 +327,8 @@ class ControlBot:
             return self._cmd_funding(args)
         if command == "scam":
             return self._cmd_scam(args)
+        if command == "carry":
+            return self._cmd_carry()
         if command == "alert":
             return self._cmd_alert(args)
         if command == "scores":
@@ -1145,6 +1149,49 @@ class ControlBot:
         )
         return "\n".join(lines)
 
+    def _cmd_carry(self) -> str:
+        """The carry board the engine writes each slow scan (config.CARRY_NAMES).
+        Return on capital: $C split into C*L/(1+L) of spot and the same notional
+        short on Aster at L x, so funding on notional is earned on L/(1+L) of
+        the capital (2/3 at 2x, 3/4 at 3x), before fees and stop-outs."""
+        try:
+            snap = json.loads(config.CARRY_SNAPSHOT_FILE.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return "no carry data yet (written each slow scan, ~1min after start)"
+        age_s = (time.time() * 1000 - snap.get("ts_ms", 0)) / 1000
+        rows = sorted(snap.get("rows") or [],
+                      key=lambda r: -(r.get("funding_24h_8h_bps") or 0))
+        if not rows:
+            return "no carry names have data yet (check CARRY_NAMES)"
+
+        def apr(bps_8h: float | None) -> float:
+            return (bps_8h or 0.0) * 3 * 365 / 1e4
+
+        def bps(v) -> str:
+            return "   -" if v is None else f"{v:+5.0f}"
+
+        hdr = f"{'name':<6}{'fund24h':>8}{'now':>6}{'2x':>6}{'3x':>6}{'basis':>7}{'24h lo-hi':>11}  note"
+        lines = [f"carry board ({age_s:.0f}s old) — funding %/yr on notional, est."
+                 " %/yr on capital at 2x / 3x (before fees)", hdr, "-" * len(hdr)]
+        for r in rows:
+            f24 = apr(r.get("funding_24h_8h_bps"))
+            notes = []
+            e, hi = r.get("entry_bps"), r.get("entry_p90_24h")
+            if e is not None and hi is not None and e >= hi:
+                notes.append("rich: basis at top of 24h range")
+            if (r.get("funding_now_8h_bps") or 0) < 0:
+                notes.append("funding negative now")
+            if r.get("position_id") is not None:
+                notes.append(f"OPEN #{r['position_id']} {r.get('position_leverage') or 1}x")
+            lines.append(
+                f"{r['symbol'][:-4]:<6}{f24:>+8.0%}{apr(r.get('funding_now_8h_bps')):>+6.0%}"
+                f"{f24 * 2 / 3:>+6.0%}{f24 * 3 / 4:>+6.0%}{bps(e):>7}"
+                f"{bps(r.get('entry_p10_24h')):>6}{bps(hi):>5}  {'; '.join(notes)}"
+            )
+        lines.append("2x: /enter LINK 667 carry lev=2 -> $667 spot + ~$333 Aster margin;"
+                     " stops sit 10% below liq (~+40% at 2x, ~+20% at 3x)")
+        return "\n".join(lines)
+
     def _cmd_scam(self, args: list[str]) -> str:
         """The scam-candidate board the engine writes hourly (scam_screen.py)."""
         try:
@@ -1453,6 +1500,8 @@ class ControlBot:
                 kind_tag += " 🤖auto"
             if p.trade_kind == "spike":
                 kind_tag += " ↩spike"
+            if (p.leverage or 1) > 1:
+                kind_tag += f" {p.leverage}x"
             if p.auto_entered:
                 kind_tag += " ⚡auto-in"
             base = p.symbol[:-4] if p.symbol.endswith("USDT") else p.symbol
@@ -1473,7 +1522,7 @@ class ControlBot:
                 liq = ""
                 if m.get("liq_dist_pct") is not None:
                     d = m["liq_dist_pct"]
-                    warn = " ⚠️" if d < float(config.LIQ_ALERT_PCT) else ""
+                    warn = " ⚠️" if d < config.liq_alert_pct(p.leverage) else ""
                     liq = f" | liq +{d:.0f}%{warn}"
                 notional = m.get("notional_usd")
                 size = f"~${notional:,.0f}" if notional else "~$?"
@@ -1767,11 +1816,13 @@ class ControlBot:
 
     async def _cmd_enter(self, args: list[str]) -> str:
         if len(args) < 2:
-            return ("usage: /enter SYMBOL NOTIONAL [min_bps] [carry]\n"
+            return ("usage: /enter SYMBOL NOTIONAL [min_bps] [carry] [lev=N]\n"
                     "min_bps = basis floor while the entry works"
                     " (default: fee breakeven)\n"
                     "carry = funding-carry trade: no auto-close, /exit only"
                     " (default is a convergence trade that auto-closes)\n"
+                    "lev=N (or Nx) = Aster leverage for a NEW position, 1-3"
+                    " (default 1x): NOTIONAL of spot + NOTIONAL/N perp margin\n"
                     "if a position in SYMBOL is already OPEN, this sizes it up"
                     " by NOTIONAL instead of opening a new one")
         try:
@@ -1779,10 +1830,17 @@ class ControlBot:
         except InvalidOperation:
             return f"bad notional: {args[1]}"
         payload: dict = {"symbol": args[0], "notional": str(notional)}
-        # Trailing args, any order: a number -> min_bps, 'carry'/'conv' -> kind.
+        # Trailing args, any order: a number -> min_bps, 'carry'/'conv' -> kind,
+        # 'lev=2' / '2x' -> leverage.
         for tok in args[2:]:
             low = tok.lower()
-            if low in ("carry", "funding"):
+            lev = (low[4:] if low.startswith("lev=")
+                   else low[:-1] if low.endswith("x") and low[:-1].isdigit() else None)
+            if lev is not None:
+                if not lev.isdigit():
+                    return f"bad leverage: {tok} (use lev=2 or 2x)"
+                payload["leverage"] = int(lev)
+            elif low in ("carry", "funding"):
                 payload["kind"] = "carry"
             elif low in ("spike", "revert"):
                 payload["kind"] = "spike"
@@ -1792,7 +1850,8 @@ class ControlBot:
                 try:
                     payload["min_bps"] = str(Decimal(tok))
                 except InvalidOperation:
-                    return f"unrecognised arg: {tok} (expected min_bps or carry)"
+                    return (f"unrecognised arg: {tok} (expected min_bps, carry"
+                            " or lev=N)")
         return await self._queue_and_wait("enter", payload)
 
     async def _cmd_exit(self, args: list[str]) -> str:

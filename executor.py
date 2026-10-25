@@ -448,7 +448,8 @@ class Executor:
         # exit clips of the CURRENT run; cleared when the run completes.
         self._exit_clip_basis: dict[int, list[float]] = {}
         self._cancel_requested: set[int] = set()
-        self._margin_configured: set[str] = set()  # Aster symbols set to 1x isolated
+        # Aster symbol -> leverage it was last set to (isolated), this process.
+        self._margin_configured: dict[str, int] = {}
 
     # ── public API (called by the live monitor's command poller) ──
 
@@ -933,25 +934,29 @@ class Executor:
     # ── entry ──
 
     async def _ensure_margin(self, position: pm.Position, aster_symbol: str) -> None:
-        """Set 1x isolated on the Aster perp before the first live order on a
-        symbol. Best-effort: alert and proceed on failure (a small entry is
-        not worth blocking, but the operator must know it isn't at 1x)."""
-        if self._paper or aster_symbol in self._margin_configured:
+        """Set isolated margin at the position's leverage (1x unless /enter
+        asked for more) on the Aster perp before its live orders. Re-set when a
+        later position on the symbol wants a different leverage. Best-effort:
+        alert and proceed on failure (a small entry is not worth blocking, but
+        the operator must know it isn't at the intended leverage)."""
+        leverage = position.leverage or config.ASTER_LEVERAGE
+        if self._paper or self._margin_configured.get(aster_symbol) == leverage:
             return
         err = await self._trader.ensure_perp_margin(
-            aster_symbol, config.ASTER_LEVERAGE, config.ASTER_MARGIN_TYPE
+            aster_symbol, leverage, config.ASTER_MARGIN_TYPE
         )
         if err is None:
-            self._margin_configured.add(aster_symbol)
+            self._margin_configured[aster_symbol] = leverage
             journal(
                 self._conn,
                 f"position {position.id}: Aster {aster_symbol} set"
-                f" {config.ASTER_MARGIN_TYPE} {config.ASTER_LEVERAGE}x",
+                f" {config.ASTER_MARGIN_TYPE} {leverage}x",
             )
         else:
+            self._margin_configured.pop(aster_symbol, None)
             await self._notifier.alert(
                 f"⚠️ position {position.id} {position.symbol}: could NOT set"
-                f" {config.ASTER_MARGIN_TYPE} {config.ASTER_LEVERAGE}x on Aster"
+                f" {config.ASTER_MARGIN_TYPE} {leverage}x on Aster"
                 f" ({err}) — check margin/leverage manually before relying on it"
             )
 

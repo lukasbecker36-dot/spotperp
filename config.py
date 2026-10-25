@@ -17,6 +17,7 @@ MODE_FILE = DATA_DIR / "mode.env"
 SCREENER_SNAPSHOT_FILE = DATA_DIR / "screener_snapshot.json"
 FUNDING_SNAPSHOT_FILE = DATA_DIR / "funding_snapshot.json"
 SCAM_SNAPSHOT_FILE = DATA_DIR / "scam_snapshot.json"
+CARRY_SNAPSHOT_FILE = DATA_DIR / "carry_snapshot.json"
 HEARTBEAT_FILE = DATA_DIR / "heartbeat.json"
 
 # ── Exchange endpoints ──
@@ -529,6 +530,22 @@ MAX_HOLD_HOURS = 168                     # 1 week max hold
 ASTER_LEVERAGE = int(os.environ.get("ASTER_LEVERAGE", "1"))
 ASTER_MARGIN_TYPE = os.environ.get("ASTER_MARGIN_TYPE", "ISOLATED")
 MAX_NOTIONAL_PER_LEG_USD = Decimal("5000")
+# Ceiling for a per-position leverage (/enter SYMBOL NOTIONAL carry lev=2).
+# Meant for large, steady carry names: at 3x a 1x-hedged short is liquidated on
+# a ~+30% move, and the 10%-below-liq stop fires around +20% — on the carry
+# names that happened in 20-50% of months (Jun-Oct), 3-17% at 2x.
+MAX_LEVERAGE = int(os.environ.get("MAX_LEVERAGE", "3"))
+
+# ── Carry board (/carry) ──
+# Larger names to hold as leveraged carry while the low-cap boards are quiet.
+# From a Jun-Oct replay of the bot's own basis log + Aster funding: these paid
+# the +0.01%/8h default (~+11%/yr on notional) or more 93-100% of hours with a
+# steady basis. XMR and WLFI averaged +18-21%/yr; ATOM/CRV/KAS add some basis
+# reversion if passive orders fill. BTC/ETH/SOL/XRP/BNB are omitted: their
+# funding sat below the default most of the time (+1-3%/yr on capital).
+CARRY_NAMES = [s.strip().upper() for s in os.environ.get(
+    "CARRY_NAMES", "XMR,WLFI,LINK,LTC,DOT,APT,FIL,ATOM,CRV,KAS,ASTER"
+).split(",") if s.strip()]
 
 # ── Execution ──
 POLL_INTERVAL_SECONDS = 1.0              # fast tick: book refresh + executor step
@@ -680,6 +697,19 @@ ADVISOR_RUN_HOURS = [
 ]
 
 # ── Mode ──
+def liq_alert_pct(leverage: int | None = None) -> float:
+    """How close to liquidation (% of mark) counts as danger for a position at
+    this leverage. LIQ_ALERT_PCT is sized for 1x, where liquidation starts ~80%
+    away; a 3x short starts only ~30% away, so the fixed 30% would alert — and
+    stand its exits down — from the moment it opened. Scale by leverage, but
+    never below 5 points before the liq-protection stop (STOP_LIQ_BUFFER_PCT
+    under liquidation, ~11% of mark at 10%): 1x 30%, 2x and 3x ~16%."""
+    lev = max(leverage or ASTER_LEVERAGE, 1)
+    buf = float(STOP_LIQ_BUFFER_PCT) / 100
+    stop_gap = buf / (1 - buf) * 100
+    return max(float(LIQ_ALERT_PCT) / lev, stop_gap + 5)
+
+
 def paper_mode() -> bool:
     """Read paper/live flag. data/mode.env wins over the environment."""
     if MODE_FILE.exists():

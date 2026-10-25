@@ -420,3 +420,51 @@ def test_funding_with_everything_hidden_says_why(tmp_path, monkeypatch):
     assert "no funding data" not in out
     assert "242 hidden: 200 volume, 30 discount, 12 exit" in out
     assert "4 at $100k-150k" in out and "/funding all" in out
+
+
+def _capture_enter(monkeypatch):
+    bot = _bot()
+    sent = {}
+
+    async def fake_queue(command, args, wait=0):
+        sent.update(command=command, args=args)
+        return "ok"
+    bot._queue_and_wait = fake_queue
+    return bot, sent
+
+
+async def test_enter_parses_leverage_tokens(monkeypatch):
+    bot, sent = _capture_enter(monkeypatch)
+    await control_bot.ControlBot._cmd_enter(bot, ["LINK", "667", "carry", "lev=2"])
+    assert sent["args"] == {"symbol": "LINK", "notional": "667", "kind": "carry",
+                            "leverage": 2}
+    await control_bot.ControlBot._cmd_enter(bot, ["LINK", "750", "3x", "carry"])
+    assert sent["args"]["leverage"] == 3
+    out = await control_bot.ControlBot._cmd_enter(bot, ["LINK", "750", "lev=two"])
+    assert "bad leverage" in out
+
+
+def test_carry_board_shows_returns_on_capital(tmp_path, monkeypatch):
+    import json as _json, time as _time
+    import config as _config
+    p = tmp_path / "carry.json"
+    p.write_text(_json.dumps({"ts_ms": int(_time.time() * 1000), "rows": [
+        {"symbol": "LINKUSDT", "funding_now_8h_bps": 1.0, "funding_24h_8h_bps": 1.0,
+         "entry_bps": 6.0, "close_bps": -4.0, "entry_avg_24h": -3.0,
+         "entry_p10_24h": -8.0, "entry_p90_24h": 5.0, "volume_24h": 1e6,
+         "position_id": 330, "position_leverage": 2},
+        {"symbol": "ETCUSDT", "funding_now_8h_bps": -0.6, "funding_24h_8h_bps": 0.2,
+         "entry_bps": -12.0, "close_bps": -20.0, "entry_avg_24h": -12.0,
+         "entry_p10_24h": -15.0, "entry_p90_24h": -9.0, "volume_24h": 1e5,
+         "position_id": None, "position_leverage": None},
+    ]}))
+    monkeypatch.setattr(_config, "CARRY_SNAPSHOT_FILE", p)
+    out = control_bot.ControlBot._cmd_carry(_bot())
+    lines = out.splitlines()
+    link = next(l for l in lines if l.startswith("LINK"))
+    # 1bp/8h = 10.95%/yr on notional -> 7% at 2x, 8% at 3x on capital
+    assert "+11%" in link and "+7%" in link and "+8%" in link
+    assert "rich: basis at top of 24h range" in link and "OPEN #330 2x" in link
+    etc = next(l for l in lines if l.startswith("ETC"))
+    assert "funding negative now" in etc
+    assert lines.index(link) < lines.index(etc)                     # by 24h funding

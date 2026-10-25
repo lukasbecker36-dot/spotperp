@@ -180,6 +180,9 @@ _MIGRATIONS = [
     # Opened by /autoenter off a score alert rather than by hand — counted
     # against the auto-entry caps and cooldowns.
     "ALTER TABLE positions ADD COLUMN auto_entered INTEGER NOT NULL DEFAULT 0",
+    # Aster leverage chosen for this position (/enter ... lev=2). NULL means
+    # the global ASTER_LEVERAGE — every position before this column existed.
+    "ALTER TABLE positions ADD COLUMN leverage INTEGER",
 ]
 
 

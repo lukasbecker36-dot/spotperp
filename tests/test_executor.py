@@ -1315,3 +1315,24 @@ async def test_cancelled_exit_leaves_spot_dust_without_alerting(env):
     assert not any("sale incomplete" in m for m in notifier.messages)
     logged = [r["message"] for r in conn.execute("SELECT message FROM journal")]
     assert any("spot dust" in m for m in logged)
+
+
+async def test_ensure_margin_uses_position_leverage_and_resets_on_change(env):
+    """A position entered with lev=3 sets 3x; a later 1x position on the same
+    symbol sets it back (Aster leverage is per symbol)."""
+    md, positions, executor, notifier, conn = env
+    executor._paper = False
+    stub = _MarginStub()
+    executor._trader = stub
+    lev3 = positions.create("BTCUSDT", Decimal(750), paper=False, leverage=3)
+    assert positions.get(lev3.id).leverage == 3
+    await executor._ensure_margin(lev3, "BTCUSDT")
+    await executor._ensure_margin(lev3, "BTCUSDT")          # cached at 3x
+    plain = positions.create("BTCUSDT", Decimal(500), paper=False)
+    assert plain.leverage is None
+    await executor._ensure_margin(plain, "BTCUSDT")         # back to the default
+    assert stub.calls == [
+        ("BTCUSDT", 3, config.ASTER_MARGIN_TYPE),
+        ("BTCUSDT", config.ASTER_LEVERAGE, config.ASTER_MARGIN_TYPE),
+    ]
+    assert executor._margin_configured["BTCUSDT"] == config.ASTER_LEVERAGE

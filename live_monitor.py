@@ -408,6 +408,7 @@ class Engine:
         for label, fn in (
             ("screener snapshot", self._write_screener_snapshot),
             ("funding snapshot", self._write_funding_snapshot),
+            ("carry snapshot", self._write_carry_snapshot),
             ("heartbeat", self._write_heartbeat),
             ("score history", self._record_scores),
         ):
@@ -1210,6 +1211,53 @@ class Engine:
         tmp.write_text(json.dumps(payload, indent=1))
         tmp.replace(config.FUNDING_SNAPSHOT_FILE)
 
+    def _write_carry_snapshot(self) -> None:
+        """The /carry board: steady-funding names to hold as leveraged carry
+        while the low-cap boards are quiet (config.CARRY_NAMES). Per name: live
+        and 24h funding, the executable basis now against its own 24h range,
+        and any open position. Read-only; built from data the scan already has."""
+        now = int(time.time() * 1000)
+        open_pos = {p.symbol: p for p in self.positions.active()}
+        rows = []
+        for name in config.CARRY_NAMES:
+            sym = name if name.endswith("USDT") else name + "USDT"
+            pair = self.md.pair_maps.get(sym)
+            stat = self.md.funding_stats.get(sym)
+            if pair is None or stat is None:
+                continue
+            aster = self.md.aster_books.get(pair.aster_symbol)
+            mexc = self.md.mexc_books.get(pair.mexc_symbol)
+            fund_row = self.md.funding.get(sym) or {}
+            screen = None
+            if aster is not None and mexc is not None:
+                screen = screener.compute_row(
+                    pair, aster, mexc, fund_row.get("funding_rate"),
+                    now_ms=now, funding_interval_hours=stat.interval_hours,
+                    index_price=fund_row.get("index_price"),
+                )
+            if screen is not None:
+                self._basis_24h.annotate(screen)
+            pos = open_pos.get(sym)
+            rows.append({
+                "symbol": sym,
+                "funding_now_8h_bps": stat.current_8h_bps,
+                "funding_24h_8h_bps": stat.avg_24h_8h_bps,
+                "entry_bps": screen.entry_bps if screen else None,
+                "close_bps": screen.close_bps if screen else None,
+                "entry_avg_24h": screen.entry_bps_avg_24h if screen else None,
+                "entry_p10_24h": screen.basis_p10_24h if screen else None,
+                "entry_p90_24h": screen.basis_p90_24h if screen else None,
+                "volume_24h": float((self.md.perp_volume.get(pair.aster_symbol) or {})
+                                    .get("quote_volume", 0) or 0),
+                "position_id": pos.id if pos else None,
+                "position_leverage": ((pos.leverage or config.ASTER_LEVERAGE)
+                                      if pos else None),
+            })
+        config.CARRY_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = config.CARRY_SNAPSHOT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"ts_ms": now, "rows": rows}, indent=1))
+        tmp.replace(config.CARRY_SNAPSHOT_FILE)
+
     def _funding_screen_fields(
         self, screen: screener.ScreenerRow, pair, avg_8h: float, current_8h: float,
     ) -> dict:
@@ -2009,15 +2057,16 @@ class Engine:
         await self._ensure_stops(self.positions.get(pos.id))
 
     async def _check_liquidation(self, pos: pm.Position) -> None:
-        """Alert (throttled) when a live perp short's mark is within
-        LIQ_ALERT_PCT of its liquidation price. Re-arms once it recovers."""
+        """Alert (throttled) when a live perp short's mark is within its
+        alert distance of liquidation (_liq_alert_pct). Re-arms once it recovers."""
         if pos.paper or pos.perp_qty <= 0:
             return
         stats = self._liq_stats(pos)
         if stats is None:
             return
         _liq, dist = stats
-        if dist >= float(config.LIQ_ALERT_PCT):
+        threshold = config.liq_alert_pct(pos.leverage)
+        if dist >= threshold:
             self._liq_alerted.pop(pos.id, None)  # recovered -> re-arm
             self._liq_protect.discard(pos.id)    # ...and the stand-down latch
             return
@@ -2035,7 +2084,7 @@ class Engine:
         )
         await self.notifier.alert(
             f"🚨 position {pos.id} {pos.symbol}: perp short is {dist:.1f}% from"
-            f" LIQUIDATION (threshold {float(config.LIQ_ALERT_PCT):.0f}%) —"
+            f" LIQUIDATION (threshold {threshold:.0f}%) —"
             f" add margin or reduce the position"
         )
 
@@ -2139,6 +2188,9 @@ class Engine:
         kind = str(args.get("kind", "")).lower()
         if kind not in ("carry", "spike"):
             kind = "convergence"
+        leverage = int(args["leverage"]) if args.get("leverage") is not None else None
+        if leverage is not None and not 1 <= leverage <= config.MAX_LEVERAGE:
+            return f"leverage must be 1-{config.MAX_LEVERAGE}x"
 
         # Size up an existing position rather than rejecting it.
         existing = [
@@ -2154,6 +2206,12 @@ class Engine:
             if pos.state != pm.OPEN:
                 return (f"{symbol} position #{pos.id} is {pos.state} (still working)"
                         f" — wait for it to settle or /cancel {pos.id} first")
+            current_lev = pos.leverage or config.ASTER_LEVERAGE
+            if leverage is not None and leverage != current_lev:
+                # Aster leverage is per symbol: changing it would re-margin the
+                # whole open position, not just the add.
+                return (f"#{pos.id} {symbol} is open at {current_lev}x — a size-up keeps"
+                        f" that leverage; omit lev= or /exit it first")
             # Cap against the ACTUAL current filled size (perp qty x live price),
             # not target_notional — target_notional must never be pre-bumped by a
             # requested add, or cancelled adds inflate it and later adds size
@@ -2183,10 +2241,13 @@ class Engine:
 
         pos = self.positions.create(
             symbol, notional, paper=self.paper, min_entry_bps=min_bps,
-            trade_kind=kind,
+            trade_kind=kind, leverage=leverage,
         )
         self.executor.start_entry(pos)
         floor = min_bps if min_bps is not None else config.ENTRY_MIN_EDGE_FLOOR_BPS
+        lev = leverage or config.ASTER_LEVERAGE
+        margin = (f", {lev}x: ~${float(notional / lev):,.0f} perp margin +"
+                  f" ${float(notional):,.0f} spot" if lev > 1 else "")
         adverse = (
             "" if config.ADVERSE_WIDEN_STOP_BPS is None
             else f"; adverse-widen stop at +{float(config.ADVERSE_WIDEN_STOP_BPS):.0f}bps"
@@ -2219,7 +2280,7 @@ class Engine:
         )
         return (
             f"entry #{pos.id} started [{kind}]: SELL {symbol} perp (maker) /"
-            f" BUY spot on fill, notional ${notional},"
+            f" BUY spot on fill, notional ${notional}{margin},"
             f" basis floor {float(floor):.1f}bps — {auto}"
         )
 

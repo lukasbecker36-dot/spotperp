@@ -3285,3 +3285,69 @@ async def test_new_pairs_get_funding_stats_and_volume_at_once(engine):
     assert asked == ["NEWUSDT"]
     assert "NEWUSDT" in engine.md.funding_stats
     assert engine.md.perp_volume["NEWUSDT"]["quote_volume"] == 2_000_000
+
+
+async def test_enter_with_leverage_records_it(engine):
+    result = engine._cmd_enter({"symbol": "BTC", "notional": "750", "kind": "carry",
+                                "leverage": 3})
+    pos = engine.positions.latest("BTCUSDT")
+    assert pos.leverage == 3 and pos.trade_kind == "carry"
+    assert "3x: ~$250 perp margin + $750 spot" in result
+
+
+async def test_enter_leverage_over_cap_rejected(engine, monkeypatch):
+    monkeypatch.setattr(config, "MAX_LEVERAGE", 3)
+    out = engine._cmd_enter({"symbol": "BTC", "notional": "500", "leverage": 5})
+    assert out == "leverage must be 1-3x"
+    assert engine.positions.latest("BTCUSDT") is None
+
+
+async def test_size_up_cannot_change_leverage(engine):
+    """Aster leverage is per symbol: a size-up at a different leverage would
+    re-margin the whole open position, so it is refused."""
+    pid = await open_position(engine)
+    out = engine._cmd_enter({"symbol": "BTC", "notional": "100", "leverage": 2})
+    assert "is open at 1x" in out
+    assert not engine.executor.has_task(pid)                         # no add started
+    # Same leverage (or none) still sizes up.
+    assert "sizing up" in engine._cmd_enter({"symbol": "BTC", "notional": "100"})
+
+
+async def test_carry_snapshot_lists_configured_names(engine, tmp_path, monkeypatch):
+    import json as _json
+    from funding import FundingStat
+    monkeypatch.setattr(config, "CARRY_NAMES", ["BTC", "NOPE"])
+    monkeypatch.setattr(config, "CARRY_SNAPSHOT_FILE", tmp_path / "carry.json")
+    set_books(engine.md, "100.1", "100.2", "99.9", "100.0")
+    engine.md.funding_stats["BTCUSDT"] = FundingStat("BTCUSDT", 8, 1.0, 1.2, 3.6, 3)
+    engine._write_carry_snapshot()
+    snap = _json.loads((tmp_path / "carry.json").read_text())
+    assert [r["symbol"] for r in snap["rows"]] == ["BTCUSDT"]      # NOPE not listed
+    r = snap["rows"][0]
+    assert r["funding_24h_8h_bps"] == 1.2 and r["entry_bps"] is not None
+    assert r["position_id"] is None
+
+
+def test_liq_alert_distance_scales_with_leverage(monkeypatch):
+    monkeypatch.setattr(config, "LIQ_ALERT_PCT", Decimal("30"))
+    monkeypatch.setattr(config, "STOP_LIQ_BUFFER_PCT", Decimal("10"))
+    assert config.liq_alert_pct(1) == 30.0
+    assert config.liq_alert_pct(None) == 30.0                       # default 1x
+    assert abs(config.liq_alert_pct(2) - 16.11) < 0.01                # floor: stop gap + 5
+    assert abs(config.liq_alert_pct(3) - 16.11) < 0.01
+
+
+async def test_3x_carry_not_flagged_at_entry_distance(engine):
+    """A fresh 3x short starts ~30% from liquidation: no alert, no stand-down.
+    It alerts once inside its own (scaled) threshold."""
+    pid = await _make_live_open(engine)
+    engine.conn.execute("UPDATE positions SET leverage=3 WHERE id=?", (pid,))
+    engine.conn.commit()
+    engine._position_risk = {
+        "BTCUSDT": {"symbol": "BTCUSDT", "markPrice": "100", "liquidationPrice": "128"}
+    }
+    await engine._check_liquidation(engine.positions.get(pid))
+    assert not any("LIQUIDATION" in m for m in engine.notifier.messages)
+    engine._position_risk["BTCUSDT"]["liquidationPrice"] = "114"     # 14% away
+    await engine._check_liquidation(engine.positions.get(pid))
+    assert any("LIQUIDATION" in m and "threshold 16%" in m for m in engine.notifier.messages)
