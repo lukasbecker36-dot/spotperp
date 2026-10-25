@@ -200,14 +200,26 @@ def test_alert_once_per_episode_then_rearm(monkeypatch):
     assert msg and "AUSDT" in msg
 
 
-def test_negative_funding_alerts_separately_whatever_the_score(monkeypatch):
+def test_negative_funding_alerts_only_with_a_high_score_or_a_held_coin(monkeypatch):
     monkeypatch.setattr(config, "SCAM_NEG_FUNDING_APR", -2.0)
+    monkeypatch.setattr(config, "SCAM_ALERT_SCORE", 9)
     rows = [Scored("NUSDT", 1, ["funding -500% APR"], -5.0, 5e8),
+            Scored("HUSDT", 9, ["funding -500% APR"], -5.0, 5e8),
+            Scored("MINEUSDT", 2, ["funding -300% APR"], -3.0, 5e8),
             Scored("PUSDT", 1, [], -1.0, 5e8)]
-    msg, state = scam_screen.plan_alert(rows, {}, 0, {})
+    msg, state = scam_screen.plan_alert(rows, {}, 0, {"MINEUSDT": 320})
     assert "strongly negative funding" in msg
-    assert "NUSDT" in msg and "PUSDT" not in msg
-    assert set(state) == {"neg:NUSDT"}
+    assert "HUSDT" in msg and "MINEUSDT" in msg
+    assert "NUSDT" not in msg and "PUSDT" not in msg
+    assert {"neg:HUSDT", "neg:MINEUSDT"} <= set(state)
+
+
+def test_default_alert_level_is_above_8(monkeypatch):
+    assert config.SCAM_ALERT_SCORE == 9
+    rows = [Scored("EIGHTUSDT", 8, ["x"], 0.0, 1e6),
+            Scored("NINEUSDT", 9, ["y"], 0.0, 1e6)]
+    msg, _ = scam_screen.plan_alert(rows, {}, 0, {})
+    assert "NINEUSDT" in msg and "EIGHTUSDT" not in msg
 
 
 def test_open_positions_are_marked_and_listed_first(monkeypatch):

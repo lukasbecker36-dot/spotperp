@@ -488,11 +488,14 @@ COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
 SCAM_COINGECKO_PAGES = int(os.environ.get("SCAM_COINGECKO_PAGES", "8"))   # x250 = top 2000
 SCAM_COINGECKO_PAGE_PAUSE_SECONDS = float(os.environ.get("SCAM_COINGECKO_PAGE_PAUSE_SECONDS", "8"))
 # Alert at this score (max 15). On 2026-10-24 the live universe scored: 14 of
-# 569 coin perps at >=5, 134 at >=4 — 5 keeps it to names worth reading.
-SCAM_ALERT_SCORE = int(os.environ.get("SCAM_ALERT_SCORE", "5"))
-# Funding at or below this (annualised, 1.0 = 100%) alerts on its own: shorts
-# crowded enough to squeeze (MYX ran -2%/4h before its squeeze). -2.0 = about
-# -18bps per 8h; 11 names were there on 2026-10-24.
+# 569 coin perps at >=5, 134 at >=4. Raised to 9 (operator: alert only on
+# scores above 8) — the full list stays on /scam.
+SCAM_ALERT_SCORE = int(os.environ.get("SCAM_ALERT_SCORE", "9"))
+# Funding at or below this (annualised, 1.0 = 100%) marks crowded shorts that
+# can squeeze (MYX ran -2%/4h before its squeeze). -2.0 = about -18bps per 8h;
+# 11 names were there on 2026-10-24. It ALERTS only alongside a score at or
+# above SCAM_ALERT_SCORE — or for a coin you hold, where a squeeze hits your
+# own short.
 SCAM_NEG_FUNDING_APR = float(os.environ.get("SCAM_NEG_FUNDING_APR", "-2.0"))
 SCAM_ALERT_REARM_HOURS = float(os.environ.get("SCAM_ALERT_REARM_HOURS", "24"))
 # Each sweep also appends output/scam_log_YYYYMMDD.csv: open interest, funding,

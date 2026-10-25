@@ -229,7 +229,11 @@ def plan_alert(
     for r in rows:
         for key, hit, bucket in (
             (f"score:{r.symbol}", r.score >= level, new_scored),
-            (f"neg:{r.symbol}", r.funding_apr is not None and r.funding_apr <= neg_apr,
+            # Negative funding alone is common; it alerts with a score at the
+            # alert level, or on a coin you hold (a squeeze is your short).
+            (f"neg:{r.symbol}",
+             r.funding_apr is not None and r.funding_apr <= neg_apr
+             and (r.score >= level or r.symbol in open_symbols),
              new_neg),
         ):
             last = alerted.get(key)
