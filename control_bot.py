@@ -48,6 +48,7 @@ HELP = """Commands:
 /funding [n] — top funding carry (bps per hour)
 /funding all [n] — top 20 names by 24h avg funding, unfiltered (same columns + why /funding hides it)
 /scam [n] | /scam neg | /scam SYMBOL — scam-candidate screen: coins set up like insider squeezes (OI vs mcap, perp vs spot volume, extreme funding — longs paying weighs most, new listing, small mcap, low float, a recent +50% day, already ran, spiked and longs still paying); stocks/ETFs excluded; 'neg' = strongly negative funding; alerts arrive on their own when a name first qualifies
+/wake — wake-up watch: old previous spikers with funding climbing and MEXC offers thinning while the price is flat (AIN's pattern before its run); alert-only, each followed 72h, with the running hit rate
 /alert [fill|funding|spike LEVEL|auto|off] — message when a /screen fill or /funding score reaches LEVEL (no args: status)
 /autoenter [fill|funding|spike NOTIONAL|off] — auto-start a normal entry when that board's /alert fires (needs the alert on; capped)
 /study spike [days] — run the mean-reversion study on the server's own basis logs (default 7 days); the report arrives when done
@@ -93,6 +94,7 @@ BOT_COMMANDS = [
     {"command": "screen", "description": "Basis opportunities; 'diff' vs 24h avg, 'swing' round-trip"},
     {"command": "funding", "description": "Top funding carry (now + 24h avg)"},
     {"command": "scam", "description": "Scam-candidate screen: [n] | neg | SYMBOL"},
+    {"command": "wake", "description": "Wake-up watch: coins followed now + hit rate so far"},
     {"command": "carry", "description": "Steady carry names for leveraged carry (2x/3x)"},
     {"command": "alert", "description": "Score alert: fill|funding LEVEL|auto|off"},
     {"command": "scores", "description": "Score history: alerts/day per level"},
@@ -329,6 +331,8 @@ class ControlBot:
             return self._cmd_scam(args)
         if command == "carry":
             return self._cmd_carry()
+        if command == "wake":
+            return self._cmd_wake()
         if command == "alert":
             return self._cmd_alert(args)
         if command == "scores":
@@ -1190,6 +1194,20 @@ class ControlBot:
             )
         lines.append("2x: /enter LINK 667 carry lev=2 -> $667 spot + ~$333 Aster margin;"
                      " stops sit 10% below liq (~+40% at 2x, ~+20% at 3x)")
+        return "\n".join(lines)
+
+    def _cmd_wake(self) -> str:
+        """Wake-up watch (wake_watch.py): coins being followed now, then the tally."""
+        import wake_watch
+        st = wake_watch.load_state()
+        now = time.time() * 1000
+        lines = ["wake-up watch — old spikers with funding climbing, offers thinning, price flat"]
+        for sym, w in sorted(st["active"].items(), key=lambda kv: kv[1]["ts"]):
+            lines.append(f"  {sym}: {(now - w['ts']) / 3_600_000:.0f}h in, {w['entry']:.6g} → {w['last']:.6g} "
+                         f"({w['last'] / w['entry'] - 1:+.0%}, max {w['hi'] / w['entry'] - 1:+.0%})")
+        if not st["active"]:
+            lines.append("  nothing being watched right now")
+        lines.append(wake_watch.stats_line())
         return "\n".join(lines)
 
     def _cmd_scam(self, args: list[str]) -> str:
