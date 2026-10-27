@@ -24,7 +24,6 @@ import book
 import recon
 import recovery
 import scam_screen
-import wake_watch
 import score_alerts
 import screener
 from screener import BPS
@@ -842,13 +841,6 @@ class Engine:
                     scam_screen.log_sweep(metrics, rows, now)
                 except Exception:
                     log.exception("scam log write failed")
-                if config.WAKE_WATCH:
-                    try:
-                        marks = {m.symbol: m.mark for m in metrics if m.mark}
-                        for msg in await asyncio.to_thread(wake_watch.step, now, marks):
-                            await self.notifier.alert(msg)
-                    except Exception:
-                        log.exception("wake-watch step failed")
                 log.info("scam screen: %d coin perps, %d at score>=%d", len(rows),
                          sum(r.score >= config.SCAM_ALERT_SCORE for r in rows),
                          config.SCAM_ALERT_SCORE)

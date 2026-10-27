@@ -499,18 +499,6 @@ SCAM_ALERT_SCORE = int(os.environ.get("SCAM_ALERT_SCORE", "9"))
 # own short.
 SCAM_NEG_FUNDING_APR = float(os.environ.get("SCAM_NEG_FUNDING_APR", "-2.0"))
 SCAM_ALERT_REARM_HOURS = float(os.environ.get("SCAM_ALERT_REARM_HOURS", "24"))
-# Wake-up watch (wake_watch.py): alert-only, on old previous spikers whose funding is
-# climbing while MEXC offers thin out and the price hasn't moved — AIN's pattern in
-# the hours before its 26 Oct run. Each match is followed for 72h and logged, to
-# learn its real hit rate before anything trades it.
-WAKE_WATCH = os.environ.get("WAKE_WATCH", "1").strip().lower() not in ("0", "false", "no", "off", "")
-WAKE_FUND_MIN = 0.30          # funding now above +30%/yr (longs paying)
-WAKE_FUND_RISE = 0.25         # last-4h avg >= 25 points above its 12-36h-ago median
-WAKE_ASK_RATIO = 0.70         # MEXC ask depth within 5% <= 70% of its 24h median
-WAKE_MAX_MOVE = 0.10          # price within +-10% of 6h ago
-WAKE_PRIOR_SPIKE = 0.50       # a +50% day in the last 30 days
-WAKE_MIN_AGE_DAYS = 60.0
-WAKE_REARM_HOURS = 72.0
 # Each sweep also appends output/scam_log_YYYYMMDD.csv: open interest, funding,
 # volumes and order-book shape (USD within +-2/5/10% of mid on Aster and MEXC)
 # for every coin perp — history neither venue serves later, logged so whether
