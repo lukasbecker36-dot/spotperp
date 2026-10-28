@@ -19,36 +19,54 @@ DAY_MS = 86_400_000
 
 
 class AlertState:
-    """One alert per name per episode.
+    """One alert per name per episode, and only for a score that HOLDS.
 
-    A name alerts when its score first reaches the level, then stays quiet
-    while it remains there. It re-arms only after it has been below the level
-    (or off the board) for SCORE_ALERT_REARM_MINUTES, so a score hovering on
-    the line cannot ping every scan.
+    A name alerts once its score has stayed at or above the level for
+    SCORE_ALERT_SUSTAIN_SECONDS without a break — a one-scan flicker cannot
+    alert, or auto-enter. It then stays quiet while it remains there, and
+    re-arms only after it has been below the level (or off the board) for
+    SCORE_ALERT_REARM_MINUTES, so a score hovering on the line cannot ping
+    every scan.
     """
 
-    def __init__(self, rearm_ms: float | None = None) -> None:
+    def __init__(self, rearm_ms: float | None = None,
+                 sustain_ms: float | None = None) -> None:
         self._rearm_ms = (
             config.SCORE_ALERT_REARM_MINUTES * 60_000 if rearm_ms is None
             else rearm_ms
         )
+        self._sustain_ms = (
+            config.SCORE_ALERT_SUSTAIN_SECONDS * 1000 if sustain_ms is None
+            else sustain_ms
+        )
+        # Start of the current unbroken run at/above the level.
+        self._above_since: dict[tuple[str, str], int] = {}
+        # Last time above the level within an episode that has alerted.
         self._last_above: dict[tuple[str, str], int] = {}
 
     def observe(self, ts_ms: int, board: str, symbol: str, score: float,
                 level: float) -> bool:
         """True when this sample should alert."""
-        if score < level:
-            return False
         key = (board, symbol)
+        if score < level:
+            self._above_since.pop(key, None)
+            return False
+        since = self._above_since.setdefault(key, ts_ms)
         prev = self._last_above.get(key)
+        if prev is not None and ts_ms - prev <= self._rearm_ms:
+            self._last_above[key] = ts_ms      # same episode: stay quiet
+            return False
+        if ts_ms - since < self._sustain_ms:
+            return False                       # not held long enough yet
         self._last_above[key] = ts_ms
-        return prev is None or ts_ms - prev > self._rearm_ms
+        return True
 
     def reset(self, board: str) -> None:
         """Forget a board's episodes (alert switched off or level changed), so
-        names already above a new level alert straight away."""
-        for key in [k for k in self._last_above if k[0] == board]:
-            del self._last_above[key]
+        names already above a new level alert once they have held there."""
+        for d in (self._above_since, self._last_above):
+            for key in [k for k in d if k[0] == board]:
+                del d[key]
 
 
 def simulate(history: Iterable, level: float,
@@ -57,10 +75,9 @@ def simulate(history: Iterable, level: float,
     alerts AlertState would have sent at this level."""
     state = AlertState(rearm_ms)
     out = []
-    # Only samples at/above the level can alert, and the rule only compares
-    # each with the previous above-level sample of the same name — so the rest
-    # can be skipped, which keeps a level scan over weeks of history cheap.
-    for ts, sym, score in (r for r in history if float(r[2]) >= level):
+    # Every sample is replayed: a below-level sample breaks the run the
+    # sustain rule needs, so it can't be skipped.
+    for ts, sym, score in history:
         if state.observe(int(ts), "x", sym, float(score), level):
             out.append((int(ts), sym, float(score)))
     return out

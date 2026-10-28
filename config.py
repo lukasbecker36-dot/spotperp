@@ -154,6 +154,10 @@ SCREEN_MIN_EXIT_ROOM_PCT = float(os.environ.get("SCREEN_MIN_EXIT_ROOM_PCT", "10"
 STUDY_TIMEOUT_SECONDS = float(os.environ.get("STUDY_TIMEOUT_SECONDS", "1800"))
 SCORE_HISTORY_SECONDS = float(os.environ.get("SCORE_HISTORY_SECONDS", "120"))
 SCORE_HISTORY_DAYS = int(os.environ.get("SCORE_HISTORY_DAYS", "30"))
+# A score must hold at/above the alert level this long, unbroken, before it
+# alerts — and before /autoenter acts on it — so a one-scan flicker can't.
+# Scans run every SLOW_SCAN_SECONDS (15s): 30s = three scans in a row.
+SCORE_ALERT_SUSTAIN_SECONDS = float(os.environ.get("SCORE_ALERT_SUSTAIN_SECONDS", "30"))
 SCORE_ALERT_REARM_MINUTES = float(os.environ.get("SCORE_ALERT_REARM_MINUTES", "30"))
 SCORE_ALERT_AUTO_PER_DAY = float(os.environ.get("SCORE_ALERT_AUTO_PER_DAY", "3"))
 SCORE_ALERT_LOOKBACK_DAYS = float(os.environ.get("SCORE_ALERT_LOOKBACK_DAYS", "7"))
@@ -173,6 +177,9 @@ SCORE_ALERT_LOOKBACK_DAYS = float(os.environ.get("SCORE_ALERT_LOOKBACK_DAYS", "7
 # Empty/"off" disables the check.
 _aj = os.environ.get("AUTO_ENTER_MAX_JITTER_BPS", "10").strip().lower()
 AUTO_ENTER_MAX_JITTER_BPS = None if _aj in ("", "off", "none") else float(_aj)
+# Arm /auto on each auto-entered position once its entry has finished.
+AUTO_ENTER_ARM_AUTO_EXIT = os.environ.get(
+    "AUTO_ENTER_ARM_AUTO_EXIT", "1").strip().lower() not in ("0", "false", "no", "off")
 AUTO_ENTER_MAX_OPEN = int(os.environ.get("AUTO_ENTER_MAX_OPEN", "3"))
 AUTO_ENTER_MAX_PER_DAY = int(os.environ.get("AUTO_ENTER_MAX_PER_DAY", "6"))
 AUTO_ENTER_SYMBOL_COOLDOWN_HOURS = float(

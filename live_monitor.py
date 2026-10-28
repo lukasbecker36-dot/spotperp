@@ -420,6 +420,48 @@ class Engine:
             await self._check_score_alerts()
         except Exception:
             log.exception("slow scan: score alert check failed")
+        try:
+            await self._arm_pending_auto()
+        except Exception:
+            log.exception("slow scan: arming /auto on auto-entries failed")
+
+    async def _arm_pending_auto(self) -> None:
+        """Arm /auto (the one-shot passive exit on an exit opportunity) on
+        auto-entered positions once their entry has finished: OPEN, holding a
+        position, no entry task running and no exit working. Positions that
+        end without opening (cancelled, failed) are dropped from the list."""
+        pending = database.get_setting(self.conn, "auto_arm_pending", []) or []
+        if not pending:
+            return
+        keep = []
+        for pid in pending:
+            try:
+                pos = self.positions.get(int(pid))
+            except KeyError:
+                continue
+            if pos.state not in pm.ACTIVE_STATES:
+                continue                      # never opened, or already gone
+            if (pos.state != pm.OPEN or self.executor.has_task(pos.id)
+                    or pos.exit_mode is not None or pos.perp_qty <= 0):
+                keep.append(pid)              # still entering: try next scan
+                continue
+            if not config.EXIT_OPP_ALERTS:
+                journal(self.conn, f"position {pos.id}: /auto not armed —"
+                        " exit-opportunity alerts are off (EXIT_OPP_ALERTS=0)")
+                continue
+            if not pos.auto_exit:
+                self.positions.set_auto_exit(pos.id, True)
+                journal(self.conn, f"position {pos.id}: /auto armed after"
+                        " auto-entry finished")
+                await self.notifier.alert(
+                    f"🤖 #{pos.id} {pos.symbol}: entry finished — /auto armed"
+                    " (passive exit when its close basis holds below its"
+                    f" {config.BASELINE_HOURS}h low and beats"
+                    f" {config.EXIT_OPP_CARRY_DAYS:g} days of carry)."
+                    f" /auto {pos.id} off to disarm."
+                )
+        if keep != pending:
+            database.set_setting(self.conn, "auto_arm_pending", keep)
 
     def _record_scores(self) -> None:
         now = time.monotonic()
@@ -632,6 +674,11 @@ class Engine:
             min_entry_bps=floor,
         )
         self.positions.set_auto_entered(pos.id)
+        # Arm /auto once the entry has finished (it only takes an OPEN
+        # position with no exit working) — see _arm_pending_auto.
+        if config.AUTO_ENTER_ARM_AUTO_EXIT:
+            pending = database.get_setting(self.conn, "auto_arm_pending", []) or []
+            database.set_setting(self.conn, "auto_arm_pending", pending + [pos.id])
         self.executor.start_entry(self.positions.get(pos.id))
         journal(self.conn, f"position {pos.id}: AUTO-ENTER {symbol} ${amount}"
                 f" [{kind}] off the {board} score alert")

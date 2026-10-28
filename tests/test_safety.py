@@ -58,6 +58,9 @@ def engine(tmp_path, monkeypatch):
     # instant; default the min-hold off so they behave as before (its own test
     # sets it explicitly).
     monkeypatch.setattr(config, "CONVERGENCE_MIN_HOLD_MINUTES", 0.0)
+    # Alerts fire on the first qualifying scan in these tests; the sustain
+    # rule has its own tests.
+    monkeypatch.setattr(config, "SCORE_ALERT_SUSTAIN_SECONDS", 0.0)
 
     conn = database.init_db(tmp_path / "test.db")
     md = MarketData()
@@ -3232,7 +3235,8 @@ async def test_recon_counts_realised_pnl_on_both_legs_or_neither(engine):
     set_books(engine.md, "60.4", "60.5", "59.9", "60.0")
     pos = engine.positions.create("BTCUSDT", Decimal(1000), paper=False)
     engine.positions.set_state(pos.id, pm.OPEN)
-    opened = engine.positions.get(pos.id).created_ms
+    p0 = engine.positions.get(pos.id)
+    opened = p0.opened_ms or p0.created_ms        # what /recon uses
     now = opened + 3_600_000
 
     class Mexc:
@@ -3351,3 +3355,30 @@ async def test_3x_carry_not_flagged_at_entry_distance(engine):
     engine._position_risk["BTCUSDT"]["liquidationPrice"] = "114"     # 14% away
     await engine._check_liquidation(engine.positions.get(pid))
     assert any("LIQUIDATION" in m and "threshold 16%" in m for m in engine.notifier.messages)
+
+
+async def test_autoentry_arms_auto_exit_once_entry_finishes(engine):
+    set_books(engine.md, "100.4", "100.5", "99.9", "100.0")
+    database.set_setting(engine.conn, "auto_enter", {"fill": 300})
+    engine._auto_enter("fill", "BTCUSDT", {"jitter_bps": 2.0, "lo24_bps": 5.0})
+    pos = engine.positions.active()[0]
+    assert database.get_setting(engine.conn, "auto_arm_pending") == [pos.id]
+    assert not pos.auto_exit                       # not while still entering
+    for _ in range(200):
+        p = engine.positions.get(pos.id)
+        if p.state == pm.OPEN and not engine.executor.has_task(pos.id):
+            break
+        await asyncio.sleep(0.02)
+    await engine._arm_pending_auto()
+    assert engine.positions.get(pos.id).auto_exit
+    assert database.get_setting(engine.conn, "auto_arm_pending") == []
+    assert any("/auto armed" in m for m in engine.notifier.messages)
+
+
+async def test_auto_arm_drops_an_entry_that_never_opened(engine):
+    pos = engine.positions.create("BTCUSDT", Decimal(100), paper=True)
+    engine.positions.set_state(pos.id, pm.CANCELLED)
+    database.set_setting(engine.conn, "auto_arm_pending", [pos.id])
+    await engine._arm_pending_auto()
+    assert database.get_setting(engine.conn, "auto_arm_pending") == []
+    assert not engine.positions.get(pos.id).auto_exit

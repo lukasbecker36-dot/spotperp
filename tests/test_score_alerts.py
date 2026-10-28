@@ -5,7 +5,16 @@ import time
 import config
 import control_bot
 import database
+import pytest
+
 import score_alerts
+
+
+@pytest.fixture(autouse=True)
+def _no_sustain(monkeypatch):
+    """Most tests here are about episodes and re-arming; the sustain rule has
+    its own tests below."""
+    monkeypatch.setattr(config, "SCORE_ALERT_SUSTAIN_SECONDS", 0.0)
 
 MIN = 60_000
 
@@ -170,3 +179,19 @@ def test_spike_alert_shows_each_side_against_its_own_norm():
         "exit_lo24_bps": -30.1, "exit_hi24_bps": -8.4}, 20)
     assert "vs norm entry -4.8 → spike +45.5 (z 6.4)" in msg
     assert "norm exit -22.0 (24h exit range -30.1 to -8.4)" in msg
+
+
+
+def test_a_score_must_hold_before_it_alerts():
+    """A one-scan flicker must not alert (or auto-enter)."""
+    st = score_alerts.AlertState(rearm_ms=30 * MIN, sustain_ms=30_000)
+    S = 1000
+    assert not st.observe(0, "fill", "A", 50.0, 40.0)            # starts the run
+    assert not st.observe(15 * S, "fill", "A", 50.0, 40.0)       # 15s held
+    assert st.observe(30 * S, "fill", "A", 50.0, 40.0)           # 30s held: alert
+    # A flicker: up for one scan, then down — never alerts.
+    assert not st.observe(0, "fill", "B", 50.0, 40.0)
+    assert not st.observe(15 * S, "fill", "B", 10.0, 40.0)       # breaks the run
+    assert not st.observe(30 * S, "fill", "B", 50.0, 40.0)       # run restarts
+    assert not st.observe(45 * S, "fill", "B", 50.0, 40.0)
+    assert st.observe(60 * S, "fill", "B", 50.0, 40.0)
