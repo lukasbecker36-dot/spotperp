@@ -305,6 +305,21 @@ async def review_text(session: aiohttp.ClientSession, conn=None) -> str:
     return f"{header}\n\n{advice}"
 
 
+def _paused() -> bool:
+    """The operator's /advisor off switch, shared with the bot through the DB.
+    Fails OPEN (not paused) if the DB can't be read, so a fault can't silently
+    stop the review."""
+    try:
+        conn = database.init_db()
+        try:
+            return bool(database.get_setting(conn, "advisor_paused", False))
+        finally:
+            conn.close()
+    except Exception:
+        log.exception("could not read the advisor pause flag — running")
+        return False
+
+
 def _in_run_window() -> bool:
     """True when the current time in ADVISOR_TIMEZONE falls on one of the
     configured run hours. The timer wakes hourly; this is the actual schedule
@@ -336,6 +351,9 @@ def main() -> None:
     )
     import sys
     forced = "--force" in sys.argv[1:] or "--now" in sys.argv[1:]
+    if not forced and _paused():
+        log.info("scheduled reviews paused (/advisor on to resume) — skipping")
+        return
     if not forced and not _in_run_window():
         from datetime import datetime
         log.info("outside run window (hours %s %s) — skipping",

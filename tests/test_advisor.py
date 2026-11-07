@@ -166,3 +166,26 @@ async def test_call_uses_sonnet_with_fallbacks_and_handles_refusal(monkeypatch):
     refused = {"stop_reason": "refusal", "stop_details": {"category": "cyber"},
                "content": []}
     assert "refusal: cyber" in await advisor._call_claude(Session(refused), {})
+
+
+def test_advisor_pause_switch(tmp_path, monkeypatch):
+    import control_bot
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "t.db")
+    bot = control_bot.ControlBot.__new__(control_bot.ControlBot)
+    bot._conn = database.init_db()
+    assert advisor._paused() is False
+    assert "PAUSED" in bot._cmd_advisor(["off"])
+    assert advisor._paused() is True
+    assert "PAUSED" in bot._cmd_advisor([])
+    bot._cmd_advisor(["on"])
+    assert advisor._paused() is False
+
+
+def test_scheduled_run_skips_while_paused(monkeypatch):
+    called = []
+    monkeypatch.setattr(advisor, "_paused", lambda: True)
+    monkeypatch.setattr(advisor, "_in_run_window", lambda: True)
+    monkeypatch.setattr(advisor, "_run", lambda: called.append(1))
+    monkeypatch.setattr("sys.argv", ["advisor.py"])
+    advisor.main()
+    assert called == []

@@ -54,6 +54,7 @@ HELP = """Commands:
 /scores [fill|funding] [days] — recorded score history: how many alerts a day each level would have sent
 /status — engine heartbeat + open positions
 /review — AI review of positions + opportunities (advisory only, never trades)
+/advisor [on|off] — pause or resume the scheduled AI reviews (/review still works)
 /positions — active positions detail (bot DB)
 /orders — working entries/exits: level waited for, level now, 24h range (stops excluded)
 /balance — USDT balance on each venue (Aster perp + MEXC spot)
@@ -105,6 +106,7 @@ BOT_COMMANDS = [
     {"command": "book", "description": "Order book both venues: SYMBOL"},
     {"command": "status", "description": "Engine status and heartbeat"},
     {"command": "review", "description": "AI review of book + opportunities (advisory)"},
+    {"command": "advisor", "description": "Pause/resume scheduled AI reviews: on|off"},
     {"command": "pnl", "description": "Realised P&L summary (closed trades)"},
     {"command": "equity", "description": "Total account value, daily change + chart"},
     {"command": "trades", "description": "Recent closed trades"},
@@ -337,6 +339,8 @@ class ControlBot:
             return self._cmd_autoenter(args)
         if command == "study":
             return self._cmd_study(args)
+        if command == "advisor":
+            return self._cmd_advisor(args)
         if command == "status":
             return await self._cmd_status()
         if command == "review":
@@ -879,6 +883,22 @@ class ControlBot:
             lines.append(f"  {score_alerts.BOARD_LABEL[board]}: {state}")
         lines.append(usage)
         return "\n".join(lines)
+
+    def _cmd_advisor(self, args: list[str]) -> str:
+        """Pause or resume the scheduled AI review (the advisor timer). /review
+        still runs on demand either way."""
+        hours = ", ".join(f"{h:02d}" for h in config.ADVISOR_RUN_HOURS)
+        sched = f"{hours} {config.ADVISOR_TIMEZONE}"
+        if args and args[0].lower() in ("off", "pause", "stop"):
+            database.set_setting(self._conn, "advisor_paused", True)
+            return ("🧠 scheduled AI reviews PAUSED — /review still works on"
+                    " demand. /advisor on to resume.")
+        if args and args[0].lower() in ("on", "resume", "start"):
+            database.set_setting(self._conn, "advisor_paused", False)
+            return f"🧠 scheduled AI reviews ON ({sched})"
+        paused = bool(database.get_setting(self._conn, "advisor_paused", False))
+        return (f"scheduled AI reviews: {'PAUSED' if paused else 'ON'} ({sched})."
+                " /advisor off | /advisor on. /review runs one now.")
 
     def _cmd_study(self, args: list[str]) -> str:
         """Run the spike (mean-reversion) study on this server's basis logs in
