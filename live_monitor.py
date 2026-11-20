@@ -30,7 +30,7 @@ from screener import BPS
 from auth import (
     load_aster_credentials,
     load_env,
-    load_mexc_credentials,
+    load_spot_credentials,
 )
 from database import (
     abandon_running_commands,
@@ -40,7 +40,7 @@ from database import (
     prune_old_rows,
     resolve_command,
 )
-from exchange_client import AsterClient, ExchangeError, MexcClient
+from exchange_client import AsterClient, ExchangeError, spot_client
 from executor import Executor, LiveTrader, MarketData, PaperTrader
 from notify import Notifier
 
@@ -120,14 +120,16 @@ class Engine:
                 raise
             log.warning("paper mode without Aster creds: %s", exc)
         try:
-            mexc_creds = load_mexc_credentials()
+            mexc_creds = load_spot_credentials(config.SPOT_VENUE)
         except RuntimeError as exc:
             if not self.paper:
                 raise
-            log.warning("paper mode without MEXC creds: %s", exc)
+            log.warning("paper mode without %s creds: %s", config.SPOT_NAME, exc)
 
         self.aster = AsterClient(session, aster_creds)
-        self.mexc = MexcClient(session, mexc_creds)
+        # The spot leg (KuCoin since Nov 2026, MEXC before): still called self.mexc throughout.
+        self.mexc = spot_client(session, mexc_creds)
+        log.info("spot leg: %s", config.SPOT_NAME)
         trader = (
             PaperTrader(self.md)
             if self.paper

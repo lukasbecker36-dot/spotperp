@@ -24,12 +24,19 @@ HEARTBEAT_FILE = DATA_DIR / "heartbeat.json"
 ASTER_BASE = os.environ.get("ASTER_BASE", "https://fapi.asterdex.com")
 ASTER_WS_BASE = os.environ.get("ASTER_WS_BASE", "wss://fstream.asterdex.com")
 MEXC_BASE = os.environ.get("MEXC_BASE", "https://api.mexc.com")
+KUCOIN_BASE = os.environ.get("KUCOIN_BASE", "https://api.kucoin.com")
+# The spot leg's venue. MEXC was the original; KuCoin replaced it in Nov 2026 (MEXC no longer usable).
+# The code keeps its "mexc" names (self.mexc, pair.mexc_symbol, MEXC_*_FEE) for whichever venue this is.
+SPOT_VENUE = os.environ.get("SPOT_VENUE", "kucoin").lower()
+SPOT_NAME = {"kucoin": "KuCoin", "mexc": "MEXC"}.get(SPOT_VENUE, SPOT_VENUE)
 
 # ── Fee schedule (fractions, not bps; verify against live commission endpoints) ──
 ASTER_MAKER_FEE = Decimal(os.environ.get("ASTER_MAKER_FEE", "0.0"))
 ASTER_TAKER_FEE = Decimal(os.environ.get("ASTER_TAKER_FEE", "0.0009"))
-MEXC_MAKER_FEE = Decimal(os.environ.get("MEXC_MAKER_FEE", "0.0"))
-MEXC_TAKER_FEE = Decimal(os.environ.get("MEXC_TAKER_FEE", "0.0005"))
+# Spot leg: MEXC 0% maker / 0.05% taker; KuCoin VIP0 0.1% / 0.1% (0.08% paying fees in KCS).
+_SPOT_FEES = {"kucoin": ("0.001", "0.001"), "mexc": ("0.0", "0.0005")}.get(SPOT_VENUE, ("0.001", "0.001"))
+MEXC_MAKER_FEE = Decimal(os.environ.get("SPOT_MAKER_FEE", os.environ.get("MEXC_MAKER_FEE", _SPOT_FEES[0])))
+MEXC_TAKER_FEE = Decimal(os.environ.get("SPOT_TAKER_FEE", os.environ.get("MEXC_TAKER_FEE", _SPOT_FEES[1])))
 
 # Entry: Aster maker + MEXC taker. Exit (aggressive): Aster taker + MEXC taker.
 # Exit (passive): Aster maker + MEXC taker.

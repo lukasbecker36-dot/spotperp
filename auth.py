@@ -6,9 +6,13 @@
   server time. Spec: asterdex/api-docs V3 futures.
 - MEXC spot V3: HMAC-SHA256 of the urlencoded query/body string keyed with the
   API secret, plus X-MEXC-APIKEY header and a millisecond `timestamp` param.
+- KuCoin spot: base64 HMAC-SHA256 of timestamp + METHOD + endpoint (with its
+  query string) + JSON body, keyed with the API secret, in KC-API-* headers.
+  Key version 2+ also sends the passphrase HMAC'd with the secret.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import os
@@ -77,6 +81,14 @@ class MexcCredentials:
 
 
 @dataclass(frozen=True)
+class KucoinCredentials:
+    api_key: str
+    api_secret: str
+    passphrase: str
+    key_version: str = "2"
+
+
+@dataclass(frozen=True)
 class TelegramCredentials:
     bot_token: str
     alert_chat_id: str
@@ -102,6 +114,21 @@ def load_mexc_credentials() -> MexcCredentials:
     if not api_key or not api_secret:
         raise RuntimeError("MEXC_API_KEY / MEXC_API_SECRET not set")
     return MexcCredentials(api_key=api_key, api_secret=api_secret)
+
+
+def load_kucoin_credentials() -> KucoinCredentials:
+    api_key = os.environ.get("KUCOIN_API_KEY", "")
+    api_secret = os.environ.get("KUCOIN_API_SECRET", "")
+    passphrase = os.environ.get("KUCOIN_API_PASSPHRASE", "")
+    if not api_key or not api_secret or not passphrase:
+        raise RuntimeError("KUCOIN_API_KEY / KUCOIN_API_SECRET / KUCOIN_API_PASSPHRASE not set")
+    return KucoinCredentials(api_key=api_key, api_secret=api_secret, passphrase=passphrase,
+                             key_version=os.environ.get("KUCOIN_API_KEY_VERSION", "2"))
+
+
+def load_spot_credentials(venue: str):
+    """Credentials for the configured spot venue ('kucoin' or 'mexc')."""
+    return load_kucoin_credentials() if venue == "kucoin" else load_mexc_credentials()
 
 
 def load_telegram_credentials() -> TelegramCredentials:
@@ -149,6 +176,26 @@ def aster_sign(params: dict[str, str], creds: AsterCredentials) -> dict[str, str
         sig = "0x" + sig
     signed_params["signature"] = sig
     return signed_params
+
+
+def kucoin_headers(creds: KucoinCredentials, ts_ms: int, method: str, endpoint: str,
+                   body: str = "") -> dict[str, str]:
+    """KC-API-* headers for one request. `endpoint` is the path plus its query string exactly as
+    sent (e.g. "/api/v1/orders?status=active&symbol=BTC-USDT"); `body` the exact JSON sent ("" if none)."""
+    def b64hmac(msg: str) -> str:
+        return base64.b64encode(hmac.new(creds.api_secret.encode(), msg.encode(),
+                                         hashlib.sha256).digest()).decode()
+
+    ts = str(int(ts_ms))
+    passphrase = b64hmac(creds.passphrase) if creds.key_version != "1" else creds.passphrase
+    return {
+        "KC-API-KEY": creds.api_key,
+        "KC-API-SIGN": b64hmac(ts + method.upper() + endpoint + body),
+        "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase,
+        "KC-API-KEY-VERSION": creds.key_version,
+        "Content-Type": "application/json",
+    }
 
 
 def mexc_sign(params: dict[str, str], creds: MexcCredentials) -> str:
